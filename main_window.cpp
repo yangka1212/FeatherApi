@@ -179,7 +179,11 @@ LRESULT drawTreeItem(const NMTVCUSTOMDRAW* draw) {
     auto ref=(NodeRef*)info.lParam;if(!ref)return CDRF_DODEFAULT;
     RECT itemRect{};if(!TreeView_GetItemRect(gTree,item,&itemRect,FALSE))return CDRF_DODEFAULT;
     RECT client{};GetClientRect(gTree,&client);RECT paintRow{client.left,itemRect.top,client.right,itemRect.bottom};RECT row{px(2),itemRect.top+px(1),client.right-px(2),itemRect.bottom-px(1)};
-    int savedDc=SaveDC(draw->nmcd.hdc);SelectClipRgn(draw->nmcd.hdc,nullptr);IntersectClipRect(draw->nmcd.hdc,paintRow.left,paintRow.top,paintRow.right,paintRow.bottom);
+    // Keep the update-region clip installed by the tree view.  Clearing it
+    // here allowed a row repaint during live resize to draw outside the part
+    // Windows was currently updating, leaving copies of the rounded selection
+    // edge behind as the control grew and shrank.
+    int savedDc=SaveDC(draw->nmcd.hdc);IntersectClipRect(draw->nmcd.hdc,paintRow.left,paintRow.top,paintRow.right,paintRow.bottom);
     bool folder=ref->kind==NodeRef::Kind::Folder;bool selected=(draw->nmcd.uItemState&CDIS_SELECTED)!=0;bool hot=(draw->nmcd.uItemState&CDIS_HOT)!=0;
     FillRect(draw->nmcd.hdc,&paintRow,gSidebarBrush);
     if(!folder&&(selected||hot)){
@@ -668,6 +672,7 @@ LRESULT CALLBACK kvListProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD
         // cell editor.  Creating it from NM_CLICK can make the list reclaim the
         // focus immediately, so the editor disappears before text can be typed.
         LVHITTESTINFO hit{};hit.pt={(short)LOWORD(l),(short)HIWORD(l)};ListView_SubItemHitTest(h,&hit);if(hit.iItem>=0&&hit.iSubItem==0)return 0;
+        if(hit.iItem>=0&&hit.iSubItem==3){deleteEntryRow(hit.iItem);return 0;}
         LRESULT result=DefSubclassProc(h,message,w,l);
         if(hit.iItem>=0&&(hit.iSubItem==1||hit.iSubItem==2))PostMessageW(gWindow,WM_EDIT_ENTRY_CELL,(WPARAM)hit.iItem,(LPARAM)hit.iSubItem);
         return result;
@@ -762,10 +767,30 @@ void createControls() {
 }
 
 void layout(int width,int height) {
-    width=dip(width);height=dip(height);auto move=[](HWND control,int x,int y,int w,int h){MoveWindow(control,px(x),px(y),px(w),px(h),TRUE);};
-    int sidebar=std::clamp(gData.sidebarWidth,180,std::min(420,width-660));int workspaceX=sidebar+5;int workspaceW=width-workspaceX;
-    constexpr int contentInset=14;int contentX=workspaceX+contentInset;int contentW=workspaceW-contentInset*2;
-    move(gSearch,12,12,sidebar-64,32);updateSearchFormatting();move(gAddFolder,sidebar-44,12,32,32);move(gSidebarDivider,0,55,sidebar,1);move(gTree,8,64,sidebar-16,height-72);
+    width=dip(width);height=dip(height);
+    RECT oldTreeBounds{};
+    if(gResizeSidebar&&gTree){GetWindowRect(gTree,&oldTreeBounds);MapWindowPoints(nullptr,gWindow,(POINT*)&oldTreeBounds,2);}
+    bool freezeLists=gResizeSidebar&&gKvList;
+    if(freezeLists){
+        SendMessageW(gKvList,WM_SETREDRAW,FALSE,0);
+        SendMessageW(gResponseHeaders,WM_SETREDRAW,FALSE,0);
+    }
+    // Moving each child with MoveWindow(..., TRUE) makes every control erase and
+    // repaint independently.  While a splitter is being dragged that exposes
+    // intermediate child surfaces (most noticeably the tree view) as trails.
+    // Commit the whole layout as one window-position batch instead.
+    HDWP deferred=BeginDeferWindowPos(32);
+    auto move=[&](HWND control,int x,int y,int w,int h){
+        UINT flags=SWP_NOZORDER|SWP_NOACTIVATE;
+        // Only the custom-drawn tree needs copy-bits disabled. Applying this to
+        // every child makes owner-drawn buttons erase and repaint on each drag
+        // frame, which is visible as flashing.
+        if(control==gTree)flags|=SWP_NOCOPYBITS;
+        if(deferred)deferred=DeferWindowPos(deferred,control,nullptr,px(x),px(y),px(w),px(h),flags);
+    };
+    int sidebar=std::clamp(gData.sidebarWidth,180,std::min(420,width-660));int workspaceX=sidebar;int workspaceW=width-workspaceX;
+    constexpr int contentInset=10;int contentX=workspaceX+contentInset;int contentW=workspaceW-contentInset*2;
+    move(gSearch,12,12,sidebar-64,32);if(!gResizeSidebar)updateSearchFormatting();move(gAddFolder,sidebar-44,12,32,32);move(gSidebarDivider,0,55,sidebar,1);move(gTree,8,64,sidebar-16,height-72);
     move(gRequestTabs,contentX,0,contentW,36);
     int y=50;constexpr int rowHeight=30;constexpr int commandGap=8;constexpr int saveWidth=72;constexpr int saveMoreWidth=28;constexpr int sendWidth=82;
     int sendX=contentX+contentW-sendWidth;int saveMoreX=sendX-commandGap-saveMoreWidth;int saveX=saveMoreX-saveWidth;int urlX=contentX+112;int urlWidth=saveX-commandGap-urlX;
@@ -781,7 +806,38 @@ void layout(int width,int height) {
     int responseTop=editorTop+editorHeight;move(gSummary,contentX,responseTop+4,contentW,28);
     move(gResponseTabs,contentX,responseTop+34,contentW,36);move(gResponseBody,contentX,responseTop+68,contentW,height-responseTop-78);move(gResponseHeaders,contentX,responseTop+68,contentW,height-responseTop-78);
     move(gEmptyTitle,workspaceX+(workspaceW-360)/2,height/2-45,360,34);move(gEmptyHelp,workspaceX+(workspaceW-500)/2,height/2,500,28);
+    if(deferred)EndDeferWindowPos(deferred);
+    if(gResizeSidebar){
+        // Repaint the parent surface exposed by all right-side children moving.
+        // WS_CLIPCHILDREN keeps this operation off the controls themselves, so
+        // it clears stale background pixels without making their contents flash.
+        RECT client{};GetClientRect(gWindow,&client);
+        int oldWorkspaceLeft=oldTreeBounds.right+px(8);
+        RECT workspaceDirty{std::min(oldWorkspaceLeft,px(workspaceX)),0,client.right,client.bottom};
+        RedrawWindow(gWindow,&workspaceDirty,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_NOCHILDREN|RDW_UPDATENOW);
+        // Let the edit control coalesce multiple mouse moves into one paint and
+        // preserve its already-painted background while refreshing the text.
+        RedrawWindow(gUrl,nullptr,nullptr,RDW_INVALIDATE|RDW_NOERASE);
+        RedrawWindow(gUrlFrame,nullptr,nullptr,RDW_INVALIDATE|RDW_NOERASE);
+    }
     resizeEntryColumns(gKvList,true);resizeEntryColumns(gResponseHeaders,false);
+    if(freezeLists){
+        SendMessageW(gKvList,WM_SETREDRAW,TRUE,0);
+        SendMessageW(gResponseHeaders,WM_SETREDRAW,TRUE,0);
+        RedrawWindow(gKvList,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_UPDATENOW);
+        RedrawWindow(gResponseHeaders,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_UPDATENOW);
+    }
+    if(gResizeSidebar){
+        // A TreeView owns its vertical scrollbar as non-client pixels. During
+        // live resizing the common control otherwise redraws only the newly
+        // exposed client strip, so old scrollbar/thumb pixels can be retained.
+        // First erase the area uncovered in the parent, then repaint both the
+        // complete tree client and its non-client scrollbar in the same frame.
+        RECT newTreeBounds{};GetWindowRect(gTree,&newTreeBounds);MapWindowPoints(nullptr,gWindow,(POINT*)&newTreeBounds,2);
+        RECT dirty{};UnionRect(&dirty,&oldTreeBounds,&newTreeBounds);
+        RedrawWindow(gWindow,&dirty,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW);
+        RedrawWindow(gTree,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_UPDATENOW);
+    }
 }
 
 LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
@@ -836,7 +892,17 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(header->idFrom==IDC_TREE&&header->code==NM_CUSTOMDRAW)return drawTreeItem((NMTVCUSTOMDRAW*)l);
         if((header->idFrom==IDC_KV_LIST||header->idFrom==IDC_RESPONSE_HEADERS)&&header->code==NM_CUSTOMDRAW){
             auto draw=(NMLVCUSTOMDRAW*)l;
-            if(draw->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
+            if(header->idFrom==IDC_KV_LIST&&draw->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW|CDRF_NOTIFYPOSTPAINT;
+            if(header->idFrom==IDC_RESPONSE_HEADERS&&draw->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
+            if(header->idFrom==IDC_KV_LIST&&draw->nmcd.dwDrawStage==CDDS_POSTPAINT){
+                RECT client{};GetClientRect(gKvList,&client);int count=ListView_GetItemCount(gKvList);if(count>0){
+                    HPEN pen=CreatePen(PS_SOLID,px(1),COLOR_BORDER);auto oldPen=SelectObject(draw->nmcd.hdc,pen);
+                    int columnOne=ListView_GetColumnWidth(gKvList,0),columnTwo=columnOne+ListView_GetColumnWidth(gKvList,1),columnThree=columnTwo+ListView_GetColumnWidth(gKvList,2);int firstTop=-1,lastBottom=-1;
+                    for(int row=0;row<count;++row){RECT bounds{};if(!ListView_GetItemRect(gKvList,row,&bounds,LVIR_BOUNDS)||bounds.bottom<=0||bounds.top>=client.bottom)continue;int top=std::max(0,(int)bounds.top),bottom=std::min((int)client.bottom-1,(int)bounds.bottom-1);if(firstTop<0)firstTop=top;lastBottom=bottom;MoveToEx(draw->nmcd.hdc,0,bottom,nullptr);LineTo(draw->nmcd.hdc,client.right,bottom);}
+                    if(firstTop>=0){MoveToEx(draw->nmcd.hdc,0,firstTop,nullptr);LineTo(draw->nmcd.hdc,client.right,firstTop);for(int x:{columnOne,columnTwo,columnThree}){MoveToEx(draw->nmcd.hdc,x,firstTop,nullptr);LineTo(draw->nmcd.hdc,x,lastBottom);}}
+                    SelectObject(draw->nmcd.hdc,oldPen);DeleteObject(pen);
+                }return CDRF_DODEFAULT;
+            }
             if(draw->nmcd.dwDrawStage==CDDS_ITEMPREPAINT){
                 draw->nmcd.uItemState&=~(CDIS_SELECTED|CDIS_FOCUS);
                 draw->clrTextBk=(draw->nmcd.uItemState&CDIS_HOT)?COLOR_HOVER:RGB(255,255,255);draw->clrText=COLOR_PRIMARY;
@@ -891,15 +957,15 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     }
     case WM_EDIT_ENTRY_CELL:{auto tab=selectedTab();bool listPage=tab&&(gEditorPage<2||(gEditorPage==2&&(tab->caseSnapshot?tab->caseSnapshot->bodyType:tab->request->bodyType)=="Form URL Encoded"));int row=(int)w,column=(int)l;if(listPage&&IsWindowVisible(gKvList)&&row>=0&&row<ListView_GetItemCount(gKvList)&&(column==1||column==2))editListCell(row,column);return 0;}
     case WM_MOUSEMOVE:
-        if(gResizeSidebar){RECT client{};GetClientRect(h,&client);gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::min(420,dip((int)client.right)-660));layout((int)client.right,(int)client.bottom);return 0;}
-        if(gResizePanels){RECT client{};GetClientRect(h,&client);int editorTop=96;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));layout((int)client.right,(int)client.bottom);return 0;}
+        if(gResizeSidebar){RECT client{};GetClientRect(h,&client);gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::min(420,dip((int)client.right)-660));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return 0;}
+        if(gResizePanels){RECT client{};GetClientRect(h,&client);int editorTop=96;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZENS));return 0;}
         if(gDragRequest){
             POINT point{(short)LOWORD(l),(short)HIWORD(l)};MapWindowPoints(h,gTree,&point,1);TVHITTESTINFO hit{};hit.pt=point;TreeView_HitTest(gTree,&hit);
             gDragTarget=nullptr;if(hit.hItem){TVITEMW item{};item.mask=TVIF_PARAM;item.hItem=hit.hItem;TreeView_GetItem(gTree,&item);auto ref=(NodeRef*)item.lParam;if(ref&&ref->kind==NodeRef::Kind::Folder)gDragTarget=(ApiFolder*)ref->value;else if(ref&&ref->kind==NodeRef::Kind::Request)gDragTarget=ref->ownerFolder;}
             if(hit.hItem!=gDragHover){TreeView_SelectDropTarget(gTree,hit.hItem);gDragHover=hit.hItem;}SetCursor(LoadCursorW(nullptr,gDragTarget&&gDragTarget!=findFolderForRequest(gDragRequest)?IDC_SIZEALL:IDC_NO));return 0;
         }break;
     case WM_LBUTTONUP:
-        if(gResizeSidebar||gResizePanels){gResizeSidebar=gResizePanels=false;ReleaseCapture();setSaveStatus(L"未保存");SetCursor(LoadCursorW(nullptr,IDC_ARROW));return 0;}
+        if(gResizeSidebar||gResizePanels){RECT client{};GetClientRect(h,&client);if(gResizeSidebar)gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::min(420,dip((int)client.right)-660));if(gResizePanels){int editorTop=96;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));}gResizeSidebar=gResizePanels=false;ReleaseCapture();layout((int)client.right,(int)client.bottom);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);setSaveStatus(L"未保存");SetCursor(LoadCursorW(nullptr,IDC_ARROW));return 0;}
         if(gDragRequest){ReleaseCapture();TreeView_SelectDropTarget(gTree,nullptr);auto request=gDragRequest;auto target=gDragTarget;gDragRequest=nullptr;gDragTarget=nullptr;gDragHover=nullptr;if(target)moveRequestDirect(request,target);return 0;}break;
     case WM_LBUTTONDOWN: {
         POINT point{dip((short)LOWORD(l)),dip((short)HIWORD(l))};RECT client{};GetClientRect(h,&client);client.right=dip(client.right);client.bottom=dip(client.bottom);
