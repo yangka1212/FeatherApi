@@ -4,7 +4,7 @@
 
 FeatherApi 是一款面向 Windows 的极致轻量级 API 调试工具
 
-![image-20260801222138326](C:\Users\user\AppData\Roaming\Typora\typora-user-images\image-20260801222138326.png)
+![FeatherApi overview](docs/images/featherapi-overview.png)
 
 ## 为什么是 FeatherApi？
 
@@ -51,4 +51,3 @@ ctest --test-dir build -C Release --output-on-failure
 ## 许可证
 
 许可证文件将在首次公开发布前补充。若你准备直接 fork 或分发，请先确认项目许可证状态。
-
