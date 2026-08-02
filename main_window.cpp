@@ -314,6 +314,20 @@ void insertFolder(ApiFolder& folder,HTREEITEM parent,const wstring& query,bool p
     }
     if(folder.expanded||!query.empty())TreeView_Expand(gTree,item,TVE_EXPAND);
 }
+void syncFolderExpansionState() {
+    if(!gTree)return;
+    std::function<void(HTREEITEM)> sync=[&](HTREEITEM parent){
+        for(HTREEITEM item=TreeView_GetChild(gTree,parent);item;item=TreeView_GetNextSibling(gTree,item)){
+            TVITEMW info{};info.hItem=item;info.mask=TVIF_PARAM|TVIF_STATE;info.stateMask=TVIS_EXPANDED;
+            if(TreeView_GetItem(gTree,&info)){
+                auto ref=(NodeRef*)info.lParam;
+                if(ref&&ref->kind==NodeRef::Kind::Folder)((ApiFolder*)ref->value)->expanded=(info.state&TVIS_EXPANDED)!=0;
+            }
+            sync(item);
+        }
+    };
+    sync(TVI_ROOT);
+}
 void rebuildTree() {
     NodeRef::Kind preserveKind=NodeRef::Kind::Folder;void* preserveValue=nullptr;
     if(gTreeSelection){preserveKind=gTreeSelection->kind;preserveValue=gTreeSelection->value;}
@@ -478,7 +492,7 @@ void saveEditor(bool updateBodyType=true) {
     if(previousMethod!=r.method)refreshRequestTabs();
 }
 bool saveNow() {
-    if(gCellEditor)commitCellEditor();saveEditor();if(saveAppData(gData)){setSaveStatus(L"已保存");return true;}setSaveStatus(L"保存失败");if(auto tab=selectedTab()){tab->validation=L"保存失败：无法写入本地数据文件。";setValidationText(tab->validation);}return false;
+    if(gCellEditor)commitCellEditor();saveEditor();syncFolderExpansionState();if(saveAppData(gData)){setSaveStatus(L"已保存");return true;}setSaveStatus(L"保存失败");if(auto tab=selectedTab()){tab->validation=L"保存失败：无法写入本地数据文件。";setValidationText(tab->validation);}return false;
 }
 void scheduleSave() {
     auto tab=selectedTab();if(!tab||!tab->requestCase)setSaveStatus(L"未保存");
@@ -1010,7 +1024,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         wstring result=L"导入完成。\r\n新增："+std::to_wstring(summary.added)+L"\r\n覆盖："+std::to_wstring(summary.overwritten)+L"\r\n跳过冲突："+std::to_wstring(summary.skipped)+L"\r\n无法导入："+std::to_wstring(summary.skippedOperations);
         MessageBoxW(gWindow,result.c_str(),L"导入 OpenAPI/Swagger",MB_OK|MB_ICONINFORMATION);return 0;
     }
-    case WM_CLOSE:gImportCancel=true;{HINTERNET handle=gImportRequest.exchange(nullptr);if(handle)WinHttpCloseHandle(handle);}if(gImportWorker.joinable())gImportWorker.join();for(auto& tab:gTabs)tab->cancelNow();for(auto& tab:gTabs)if(tab->worker.joinable())tab->worker.join();DestroyWindow(h);return 0;
+    case WM_CLOSE:gImportCancel=true;{HINTERNET handle=gImportRequest.exchange(nullptr);if(handle)WinHttpCloseHandle(handle);}if(gImportWorker.joinable())gImportWorker.join();for(auto& tab:gTabs)tab->cancelNow();for(auto& tab:gTabs)if(tab->worker.joinable())tab->worker.join();saveNow();DestroyWindow(h);return 0;
     case WM_DESTROY:DeleteObject(gUiFont);DeleteObject(gCodeFont);DeleteObject(gTitleFont);DeleteObject(gTreeFolderFont);DeleteObject(gTreeMethodFont);DeleteObject(gSidebarBrush);DeleteObject(gWhiteBrush);DeleteObject(gAccentBrush);DeleteObject(gSelectedBrush);DeleteObject(gHoverBrush);DeleteObject(gBorderBrush);PostQuitMessage(0);return 0;
     }return DefWindowProcW(h,message,w,l);
 }
