@@ -60,6 +60,7 @@ int main() {
     original.id=newId();original.name="用户详情";original.method="POST";original.url="https://example.test/users";
     original.query.push_back({true,"名字","张三"});
     original.headers.push_back({true,"Authorization","Bearer token"});
+    original.query[0].type="string";original.query[0].description="user name";
     original.bodyType="JSON";original.body=R"({"name":"张三"})";
     auto requestCase=std::make_unique<ApiRequestCase>();requestCase->id=newId();requestCase->name="成功";original.cases.push_back(std::move(requestCase));
     auto copy=cloneRequest(original);
@@ -67,6 +68,7 @@ int main() {
     check(copy->name=="用户详情 - 副本","clone uses WPF-compatible copy suffix");
     check(copy->query.size()==1&&copy->query[0].value=="张三","clone preserves Unicode params");
     check(copy->cases.size()==1&&copy->cases[0]->id!=original.cases[0]->id,"clone gives cases new ids");
+    check(copy->query[0].type=="string"&&copy->query[0].description=="user name","clone preserves parameter metadata");
     check(tabSelectionAfterClose(2,0,4)==1,"closing a tab before the selection preserves the selected tab");
     check(tabSelectionAfterClose(1,3,4)==1,"closing a tab after the selection preserves the selected tab");
     check(tabSelectionAfterClose(1,1,4)==1,"closing the selected tab selects the tab now at its position");
@@ -107,7 +109,7 @@ int main() {
       "paths":{
         "/users":{
           "get":{"summary":"用户列表","tags":["用户"],"parameters":[
-            {"in":"query","name":"page"},{"in":"header","name":"X-Tenant"}
+            {"in":"query","name":"page","description":"page number","schema":{"type":"integer","format":"int32"}},{"in":"query","name":"attachment","description":"attachment file","schema":{"type":"string","format":"binary"}},{"in":"header","name":"X-Tenant","description":"tenant","schema":{"type":"string"}}
           ]},
           "post":{"operationId":"createUser","tags":["用户"],"requestBody":{"content":{"application/json":{"schema":{"type":"object","properties":{"name":{"type":"string"}}}}}}}
         }
@@ -118,9 +120,16 @@ int main() {
     check(importOpenApiJson(target,openApi,false,first,error),"OpenAPI 3 document imports");
     check(first.skippedOperations==0,"OpenAPI reports skipped-operation count");
     check(first.added==2&&target.children.size()==1&&target.children[0]->requests.size()==2,"OpenAPI tags create child folder");
-    check(target.children[0]->requests[0]->query.size()==1&&target.children[0]->requests[0]->headers.size()==1,"OpenAPI parameters import");
+    check(target.children[0]->requests[0]->query.size()==2&&target.children[0]->requests[0]->headers.size()==1,"OpenAPI parameters import");
+    check(target.children[0]->requests[0]->query[0].type=="number"&&target.children[0]->requests[0]->query[0].description=="page number","OpenAPI parameter metadata imports");
+    check(target.children[0]->requests[0]->query[1].type=="file","OpenAPI binary parameter imports as file");
     check(target.children[0]->requests[1]->bodyType=="JSON","OpenAPI JSON body imports");
     check(target.children[0]->requests[1]->body.find("\"name\"")!=std::string::npos,"OpenAPI schema creates JSON sample");
+    const std::string multipart=R"({"openapi":"3.0.4","paths":{"/api/Reconciliation/import":{"post":{"summary":"导入账单","requestBody":{"content":{"multipart/form-data":{"schema":{"type":"object","properties":{"File":{"type":"string","format":"binary","description":"账单文件"},"SourceName":{"type":"string","description":"渠道名称"},"Cycle":{"type":"string","format":"date-time"},"OrderWeek":{"type":"integer","format":"int32"}}}}}}}}}})";
+    ApiFolder multipartTarget;multipartTarget.id=newId();OpenApiImportSummary multipartSummary;
+    check(importOpenApiJson(multipartTarget,multipart,false,multipartSummary,error),"OpenAPI multipart document imports");
+    check(multipartTarget.requests.size()==1&&multipartTarget.requests[0]->bodyType=="Multipart Form Data"&&multipartTarget.requests[0]->formFields.size()==4,"multipart request imports as form fields");
+    check(multipartTarget.requests[0]->formFields[0].type=="file"&&multipartTarget.requests[0]->formFields[1].type=="string"&&multipartTarget.requests[0]->formFields[3].type=="number","multipart field types import");
     OpenApiImportSummary skipped;
     check(importOpenApiJson(target,openApi,false,skipped,error)&&skipped.skipped==2,"OpenAPI conflicts can skip");
     OpenApiImportSummary overwritten;
@@ -153,12 +162,13 @@ int main() {
     const std::string swagger=R"({
       "swagger":"2.0","schemes":["https"],"host":"legacy.example.com","basePath":"/v1",
       "paths":{"/search":{"post":{"summary":"搜索","parameters":[
-        {"in":"formData","name":"keyword"},{"in":"body","name":"payload"}
+        {"in":"query","name":"keyword","type":"string","description":"search keyword"},{"in":"formData","name":"formKeyword"},{"in":"body","name":"payload"}
       ]}}}
     })";
     ApiFolder legacy;legacy.id=newId();legacy.name="旧接口";OpenApiImportSummary legacySummary;
     check(importOpenApiJson(legacy,swagger,false,legacySummary,error),"Swagger 2 document imports");
     check(legacy.requests.size()==1&&legacy.requests[0]->url=="https://legacy.example.com/v1/search","Swagger base URL resolves");
+    check(legacy.requests[0]->query[0].type=="string"&&legacy.requests[0]->query[0].description=="search keyword","Swagger URL parameter metadata imports");
     check(legacy.requests[0]->formFields.empty()&&legacy.requests[0]->bodyType=="JSON","Swagger formData handling matches WPF");
 
     const std::string swaggerDefaults=R"({
@@ -213,6 +223,8 @@ int main() {
     queryUrl.url="https://example.test/items?sort=asc&";check(buildRequestUrl(queryUrl)=="https://example.test/items?sort=asc&page=1","HTTP query avoids an extra separator after ampersand");
     std::vector<KeyValueEntry> formFields={{true," user name ","测试 空格"},{true,"symbol","a+b&c"},{false,"ignored","x"}};
     check(buildFormBody(formFields)=="user+name=%E6%B5%8B%E8%AF%95+%E7%A9%BA%E6%A0%BC&symbol=a%2Bb%26c","form URL encoding matches WPF");
+    auto multipartFile=std::filesystem::temp_directory_path()/L"feather-api-multipart-test.txt";{std::ofstream file(multipartFile,std::ios::binary);file<<"file-content";}std::string multipartBody;std::wstring multipartError;
+    check(buildMultipartFormBody({{true,"File",toUtf8(multipartFile.wstring()),"file",""},{true,"SourceName","渠道 A","string",""},{true,"OrderWeek","2","number",""}},"test-boundary",multipartBody,multipartError)&&multipartBody.find("filename=\"feather-api-multipart-test.txt\"")!=std::string::npos&&multipartBody.find("file-content")!=std::string::npos&&multipartBody.find("name=\"SourceName\"")!=std::string::npos,"multipart body includes files and text fields");std::filesystem::remove(multipartFile);
     RequestSnapshot missingScheme;missingScheme.method="GET";missingScheme.url="example.test/users";
     auto missingSchemeResult=executeHttp(missingScheme,cancel);
     check(!missingSchemeResult.transportSuccess&&missingSchemeResult.errorCode==ERROR_WINHTTP_INVALID_URL&&missingSchemeResult.rawBody==toUtf8(missingSchemeResult.errorMessage)&&missingSchemeResult.prettyBody==missingSchemeResult.rawBody,"HTTP rejects URL without scheme like WPF");

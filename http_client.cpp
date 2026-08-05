@@ -4,6 +4,8 @@
 #include <cctype>
 #include <sstream>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 
 using std::string;
 using std::wstring;
@@ -118,6 +120,15 @@ string buildRequestUrl(const RequestSnapshot& input) {
 string buildFormBody(const std::vector<KeyValueEntry>& fields) {
     string body;for(const auto& entry:fields)if(entry.enabled&&!trimAscii(entry.key).empty()){if(!body.empty())body+='&';body+=formEncode(trimAscii(entry.key))+"="+formEncode(entry.value);}return body;
 }
+bool buildMultipartFormBody(const std::vector<KeyValueEntry>& fields,const string& boundary,string& body,wstring& error) {
+    body.clear();error.clear();auto quoted=[](string value){size_t at=0;while((at=value.find_first_of("\\\"\r\n",at))!=string::npos){if(value[at]=='\r'||value[at]=='\n')value.erase(at,1);else{value.insert(at,"\\");at+=2;}}return value;};
+    for(const auto& entry:fields)if(entry.enabled&&!trimAscii(entry.key).empty()){
+        string name=quoted(trimAscii(entry.key));body+="--"+boundary+"\r\nContent-Disposition: form-data; name=\""+name+"\"";
+        if(_stricmp(entry.type.c_str(),"file")==0){std::filesystem::path path=std::filesystem::u8path(entry.value);std::ifstream input(path,std::ios::binary);if(!input){error=L"无法读取表单文件："+path.wstring();body.clear();return false;}std::error_code ec;auto size=std::filesystem::file_size(path,ec);if(ec||size>100ull*1024*1024){error=L"表单文件无效或超过 100 MB："+path.wstring();body.clear();return false;}string bytes((std::istreambuf_iterator<char>(input)),{});string filename=quoted(toUtf8(path.filename().wstring()));body+="; filename=\""+filename+"\"\r\nContent-Type: application/octet-stream\r\n\r\n";body+=bytes;body+="\r\n";}
+        else {body+="\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"+entry.value+"\r\n";}
+    }
+    body+="--"+boundary+"--\r\n";return true;
+}
 
 string prettyJson(const string& value, bool compact) {
     if(!isValidJson(value))return value;
@@ -158,9 +169,11 @@ HttpResult executeHttp(const RequestSnapshot& input,std::atomic<bool>& cancel,st
     wstring object=path[0]?path:L"/";wstring suffix=extra;
     auto fragmentAt=suffix.find(L'#');if(fragmentAt!=wstring::npos)suffix.resize(fragmentAt);
     object+=suffix;
-    string body=input.body;
+    string body=input.body;string multipartBoundary;
     if(input.bodyType=="Form URL Encoded") {
         body=buildFormBody(input.formFields);
+    } else if(input.bodyType=="Multipart Form Data") {
+        multipartBoundary="----FeatherApi"+newId();wstring multipartError;if(!buildMultipartFormBody(input.formFields,multipartBoundary,body,multipartError)){result.errorCode=ERROR_FILE_NOT_FOUND;setFailureBody(multipartError);result.durationMs=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();return result;}
     } else if(input.bodyType=="None") body.clear();
     wstring headers;
     bool hasContentType=false;
@@ -170,6 +183,7 @@ HttpResult executeHttp(const RequestSnapshot& input,std::atomic<bool>& cancel,st
     }
     if(!hasContentType&&input.bodyType=="JSON")headers+=L"Content-Type: application/json; charset=utf-8\r\n";
     if(!hasContentType&&input.bodyType=="Form URL Encoded")headers+=L"Content-Type: application/x-www-form-urlencoded\r\n";
+    if(!hasContentType&&input.bodyType=="Multipart Form Data")headers+=L"Content-Type: multipart/form-data; boundary="+toWide(multipartBoundary)+L"\r\n";
     if(!hasContentType&&input.bodyType=="Raw")headers+=L"Content-Type: text/plain; charset=utf-8\r\n";
 
     HINTERNET session=WinHttpOpen(L"",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,

@@ -2,6 +2,7 @@
 #include "resources.h"
 
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shlwapi.h>
 #include <algorithm>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <unordered_set>
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -582,35 +584,35 @@ void addListColumns(HWND list,bool enabled) {
     auto insertColumn=[&](int index,const wchar_t* text,int width,int format=LVCFMT_LEFT){
         LVCOLUMNW column{};column.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM|LVCF_FMT;column.iSubItem=index;column.pszText=(LPWSTR)text;column.cx=width;column.fmt=format;ListView_InsertColumn(list,index,&column);
     };
-    if(enabled){insertColumn(0,L"",px(38),LVCFMT_CENTER);insertColumn(1,L"Key",px(210));insertColumn(2,L"Value",px(420));insertColumn(3,L"",px(42),LVCFMT_CENTER);int order[]{0,1,2,3};ListView_SetColumnOrderArray(list,4,order);}
+    if(enabled){insertColumn(0,L"",px(38),LVCFMT_CENTER);insertColumn(1,L"名称",px(170));insertColumn(2,L"值",px(220));insertColumn(3,L"类型",px(130));insertColumn(4,L"说明",px(260));insertColumn(5,L"",px(42),LVCFMT_CENTER);int order[]{0,1,2,3,4,5};ListView_SetColumnOrderArray(list,6,order);}
     else {insertColumn(0,L"Key",px(210));insertColumn(1,L"Value",px(420));int order[]{0,1};ListView_SetColumnOrderArray(list,2,order);}
 }
 void resizeEntryColumns(HWND list,bool enabled) {
     RECT client{};GetClientRect(list,&client);int contentWidth=std::max(px(120),(int)client.right-px(2));
-    if(enabled){int checkWidth=px(38),deleteWidth=px(42),available=std::max(px(90),contentWidth-checkWidth-deleteWidth);ListView_SetColumnWidth(list,0,checkWidth);ListView_SetColumnWidth(list,1,available/2);ListView_SetColumnWidth(list,2,available-available/2);ListView_SetColumnWidth(list,3,deleteWidth);}
+    if(enabled){int checkWidth=px(38),deleteWidth=px(42),available=std::max(px(320),contentWidth-checkWidth-deleteWidth);int keyWidth=available*22/100,valueWidth=available*25/100,typeWidth=available*17/100;ListView_SetColumnWidth(list,0,checkWidth);ListView_SetColumnWidth(list,1,keyWidth);ListView_SetColumnWidth(list,2,valueWidth);ListView_SetColumnWidth(list,3,typeWidth);ListView_SetColumnWidth(list,4,available-keyWidth-valueWidth-typeWidth);ListView_SetColumnWidth(list,5,deleteWidth);}
     else {int available=std::max(px(90),contentWidth);ListView_SetColumnWidth(list,0,available/2);ListView_SetColumnWidth(list,1,available-available/2);}
 }
 void fillEntryList(HWND list,const std::vector<KeyValueEntry>& entries,bool enabled=true) {
     bool previousLoading=gLoadingEntryList;gLoadingEntryList=true;
     ListView_DeleteAllItems(list);
     int row=0;
-    for(const auto& entry:entries){if(enabled&&entry.key.empty()&&entry.value.empty())continue;wstring key=toWide(entry.key),value=toWide(entry.value);LVITEMW item{};item.mask=LVIF_TEXT;item.iItem=row;item.pszText=(LPWSTR)(enabled?L"":key.c_str());ListView_InsertItem(list,&item);
-        int offset=enabled?1:0;if(enabled){ListView_SetCheckState(list,row,entry.enabled);ListView_SetItemText(list,row,offset,(LPWSTR)key.c_str());}ListView_SetItemText(list,row,offset+1,(LPWSTR)value.c_str());++row;}
+    for(const auto& entry:entries){if(enabled&&entry.key.empty()&&entry.value.empty()&&entry.type.empty()&&entry.description.empty())continue;wstring key=toWide(entry.key),value=toWide(entry.value),type=toWide(entry.type),description=toWide(entry.description);LVITEMW item{};item.mask=LVIF_TEXT;item.iItem=row;item.pszText=(LPWSTR)(enabled?L"":key.c_str());ListView_InsertItem(list,&item);
+        int offset=enabled?1:0;if(enabled){ListView_SetCheckState(list,row,entry.enabled);ListView_SetItemText(list,row,offset,(LPWSTR)key.c_str());}ListView_SetItemText(list,row,offset+1,(LPWSTR)value.c_str());if(enabled){ListView_SetItemText(list,row,3,(LPWSTR)type.c_str());ListView_SetItemText(list,row,4,(LPWSTR)description.c_str());}++row;}
     if(enabled){LVITEMW item{};item.mask=LVIF_TEXT;item.iItem=row;item.pszText=(LPWSTR)L"";ListView_InsertItem(list,&item);ListView_SetCheckState(list,row,TRUE);}
     gLoadingEntryList=previousLoading;
 }
 std::vector<KeyValueEntry> readEntryList(HWND list,bool enabled=true) {
     std::vector<KeyValueEntry> result;int count=ListView_GetItemCount(list);wchar_t buffer[4096];
     for(int i=0;i<count;++i){KeyValueEntry entry;entry.enabled=true;int offset=enabled?1:0;if(enabled)entry.enabled=ListView_GetCheckState(list,i)!=FALSE;
-        ListView_GetItemText(list,i,offset,buffer,4096);entry.key=toUtf8(buffer);ListView_GetItemText(list,i,offset+1,buffer,4096);entry.value=toUtf8(buffer);if(!enabled||!entry.key.empty()||!entry.value.empty())result.push_back(std::move(entry));}
+        ListView_GetItemText(list,i,offset,buffer,4096);entry.key=toUtf8(buffer);ListView_GetItemText(list,i,offset+1,buffer,4096);entry.value=toUtf8(buffer);if(enabled){ListView_GetItemText(list,i,3,buffer,4096);entry.type=toUtf8(buffer);ListView_GetItemText(list,i,4,buffer,4096);entry.description=toUtf8(buffer);}if(!enabled||!entry.key.empty()||!entry.value.empty()||!entry.type.empty()||!entry.description.empty())result.push_back(std::move(entry));}
     return result;
 }
 
 void saveEditor(bool updateBodyType=true) {
     if(gLoadingEditor)return;auto tab=selectedTab();if(!tab)return;auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
     string previousMethod=r.method;wstring method=trimWide(textOf(gMethod));if(!method.empty())r.method=toUtf8(method);
-    r.url=toUtf8(textOf(gUrl));if(updateBodyType){int bodyType=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Raw"};if(bodyType>=0&&bodyType<4)r.bodyType=types[bodyType];}r.body=toUtf8(textOf(gBody));
-    if(gEditorPage==0)r.query=readEntryList(gKvList);else if(gEditorPage==1)r.headers=readEntryList(gKvList);else if(gEditorPage==2&&r.bodyType=="Form URL Encoded")r.formFields=readEntryList(gKvList);
+    r.url=toUtf8(textOf(gUrl));if(updateBodyType){int bodyType=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(bodyType>=0&&bodyType<5)r.bodyType=types[bodyType];}r.body=toUtf8(textOf(gBody));
+    if(gEditorPage==0)r.query=readEntryList(gKvList);else if(gEditorPage==1)r.headers=readEntryList(gKvList);else if(gEditorPage==2&&(r.bodyType=="Form URL Encoded"||r.bodyType=="Multipart Form Data"))r.formFields=readEntryList(gKvList);
     if(previousMethod!=r.method)refreshRequestTabs();
 }
 bool saveNow(bool feedback=false) {
@@ -621,12 +623,12 @@ void scheduleSave() {
 }
 void markCatalogUnsaved(){setSaveStatus(L"未保存");}
 void showEditorPage() {
-    auto tab=selectedTab();if(!tab)return;auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;bool listPage=gEditorPage<2||(gEditorPage==2&&r.bodyType=="Form URL Encoded");
+    auto tab=selectedTab();if(!tab)return;auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;bool formBody=r.bodyType=="Form URL Encoded"||r.bodyType=="Multipart Form Data";bool listPage=gEditorPage<2||(gEditorPage==2&&formBody);
     if(!listPage&&gCellEditor)commitCellEditor();
     setVisible(gKvList,listPage);
-    bool bodyText=gEditorPage==2&&r.bodyType!="None"&&r.bodyType!="Form URL Encoded";
+    bool bodyText=gEditorPage==2&&r.bodyType!="None"&&!formBody;
     bool jsonBody=gEditorPage==2&&r.bodyType=="JSON";setVisible(gBodyType,gEditorPage==2);setVisible(gFormat,jsonBody);setVisible(gCompress,jsonBody);setVisible(gBody,bodyText);setVisible(gBodyNone,gEditorPage==2&&r.bodyType=="None");
-    if(gEditorPage==0)fillEntryList(gKvList,r.query);else if(gEditorPage==1)fillEntryList(gKvList,r.headers);else if(r.bodyType=="Form URL Encoded")fillEntryList(gKvList,r.formFields);
+    if(gEditorPage==0)fillEntryList(gKvList,r.query);else if(gEditorPage==1)fillEntryList(gKvList,r.headers);else if(formBody)fillEntryList(gKvList,r.formFields);
     if(listPage)ListView_SetItemState(gKvList,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
     RECT client{};GetClientRect(gWindow,&client);layout((int)client.right,(int)client.bottom);
 }
@@ -641,7 +643,7 @@ void loadEditor() {
     for(HWND control:{gMethod,gUrlFrame,gUrl,gSave,gSaveMore,gEditorTabs,gKvList,gBodyType,gFormat,gCompress,gBody,gValidation,gSummary,gResponseTabs,gResponseBody,gResponseHeaders,gBodyNone})setVisible(control,active);
     if(!active){setVisible(gSend,false);setVisible(gCancel,false);setText(gUrl,L"");setText(gResponseBody,L"");gLoadingEditor=false;return;}
     auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;setText(gMethod,toWide(r.method));InvalidateRect(gMethod,nullptr,TRUE);setText(gUrl,toWide(r.url));
-    int type=0;const char* types[]={"None","JSON","Form URL Encoded","Raw"};for(int i=0;i<4;++i)if(r.bodyType==types[i])type=i;SendMessageW(gBodyType,CB_SETCURSEL,type,0);setText(gBody,toWide(r.body));
+    int type=0;const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};for(int i=0;i<5;++i)if(r.bodyType==types[i])type=i;SendMessageW(gBodyType,CB_SETCURSEL,type,0);setText(gBody,toWide(r.body));
     setText(gSummary,tab->summary);setValidationText(tab->validation);setVisible(gSend,!tab->sending);setVisible(gCancel,tab->sending);
     showEditorPage();showResponsePage();gLoadingEditor=false;
 }
@@ -760,18 +762,35 @@ void importOpenApi(ApiFolder* folder) {
 
 void editListCell(int row,int column);
 void toggleEntry(int row);
+void ensureTrailingEntryRow();
+wstring entryCellText(int row,int column) {
+    wchar_t buffer[4096]{};ListView_GetItemText(gKvList,row,column,buffer,4096);return buffer;
+}
+void selectEntryType(int row) {
+    HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,1,L"number");AppendMenuW(menu,MF_STRING,2,L"string");AppendMenuW(menu,MF_STRING,3,L"file");
+    RECT cell{};ListView_GetSubItemRect(gKvList,row,3,LVIR_BOUNDS,&cell);POINT point{cell.left,cell.bottom};MapWindowPoints(gKvList,HWND_DESKTOP,&point,1);
+    int selected=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_LEFTALIGN|TPM_TOPALIGN,point.x,point.y,0,gWindow,nullptr);DestroyMenu(menu);
+    if(!selected)return;wstring type=selected==1?L"number":selected==2?L"string":L"file";ListView_SetItemText(gKvList,row,3,(LPWSTR)type.c_str());
+    if(type==L"file")ListView_SetItemText(gKvList,row,2,(LPWSTR)L"");ensureTrailingEntryRow();saveEditor();scheduleSave();
+}
+void selectEntryFile(int row) {
+    wchar_t path[32768]{};wstring current=entryCellText(row,2);if(current.size()<std::size(path))wcscpy_s(path,current.c_str());
+    OPENFILENAMEW dialog{sizeof(dialog)};dialog.hwndOwner=gWindow;dialog.lpstrFile=path;dialog.nMaxFile=(DWORD)std::size(path);dialog.lpstrFilter=L"All files\0*.*\0\0";dialog.nFilterIndex=1;dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR|OFN_EXPLORER;
+    if(!GetOpenFileNameW(&dialog))return;ListView_SetItemText(gKvList,row,2,path);ensureTrailingEntryRow();saveEditor();scheduleSave();
+}
 void copySelectedListRow(HWND list,bool enabled) {
     int row=ListView_GetNextItem(list,-1,LVNI_SELECTED);if(row<0)return;wchar_t buffer[4096]{};wstring text;
     if(enabled)text=ListView_GetCheckState(list,row)?L"True\t":L"False\t";
     int offset=enabled?1:0;ListView_GetItemText(list,row,offset,buffer,4096);text+=buffer;text+=L'\t';ListView_GetItemText(list,row,offset+1,buffer,4096);text+=buffer;
+    if(enabled){for(int column=3;column<=4;++column){text+=L'\t';ListView_GetItemText(list,row,column,buffer,4096);text+=buffer;}}
     if(!OpenClipboard(gWindow))return;EmptyClipboard();size_t bytes=(text.size()+1)*sizeof(wchar_t);HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
     if(memory){void* target=GlobalLock(memory);if(target){memcpy(target,text.c_str(),bytes);GlobalUnlock(memory);if(!SetClipboardData(CF_UNICODETEXT,memory))GlobalFree(memory);}else GlobalFree(memory);}CloseClipboard();
 }
 void addEntryRow() {
-    int index=ListView_GetItemCount(gKvList);LVITEMW item{};item.mask=LVIF_TEXT;item.iItem=index;item.pszText=(LPWSTR)L"";bool previousLoading=gLoadingEntryList;gLoadingEntryList=true;ListView_InsertItem(gKvList,&item);ListView_SetCheckState(gKvList,index,TRUE);gLoadingEntryList=previousLoading;ListView_SetItemText(gKvList,index,1,(LPWSTR)L"");ListView_SetItemText(gKvList,index,2,(LPWSTR)L"");ListView_SetItemState(gKvList,index,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+    int index=ListView_GetItemCount(gKvList);LVITEMW item{};item.mask=LVIF_TEXT;item.iItem=index;item.pszText=(LPWSTR)L"";bool previousLoading=gLoadingEntryList;gLoadingEntryList=true;ListView_InsertItem(gKvList,&item);ListView_SetCheckState(gKvList,index,TRUE);gLoadingEntryList=previousLoading;for(int column=1;column<=4;++column)ListView_SetItemText(gKvList,index,column,(LPWSTR)L"");ListView_SetItemState(gKvList,index,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
 }
 bool entryRowHasText(int row) {
-    wchar_t buffer[4096]{};ListView_GetItemText(gKvList,row,1,buffer,4096);if(buffer[0])return true;ListView_GetItemText(gKvList,row,2,buffer,4096);return buffer[0]!=L'\0';
+    wchar_t buffer[4096]{};for(int column=1;column<=4;++column){ListView_GetItemText(gKvList,row,column,buffer,4096);if(buffer[0])return true;}return false;
 }
 void ensureTrailingEntryRow() {
     int count=ListView_GetItemCount(gKvList);if(count==0||entryRowHasText(count-1))addEntryRow();
@@ -781,7 +800,7 @@ void commitCellEditor(bool save) {
     if(!gCellEditor)return;HWND editor=gCellEditor;gCellEditor=nullptr;
     if(save&&gEditRow>=0&&gEditColumn>=0){wstring value=textOf(editor);ListView_SetItemText(gKvList,gEditRow,gEditColumn,(LPWSTR)value.c_str());}
     int editedRow=gEditRow;DestroyWindow(editor);gEditRow=gEditColumn=-1;
-    if(save&&editedRow>=0){int count=ListView_GetItemCount(gKvList);if(editedRow<count-1&&!entryRowHasText(editedRow))ListView_DeleteItem(gKvList,editedRow);ensureTrailingEntryRow();}
+    if(save&&editedRow>=0){if(entryCellText(editedRow,3).empty()&&(!entryCellText(editedRow,1).empty()||!entryCellText(editedRow,2).empty()))ListView_SetItemText(gKvList,editedRow,3,(LPWSTR)L"string");int count=ListView_GetItemCount(gKvList);if(editedRow<count-1&&!entryRowHasText(editedRow))ListView_DeleteItem(gKvList,editedRow);ensureTrailingEntryRow();}
     saveEditor();if(save)scheduleSave();
 }
 LRESULT CALLBACK cellEditorProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
@@ -808,9 +827,9 @@ LRESULT CALLBACK kvListProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD
         // cell editor.  Creating it from NM_CLICK can make the list reclaim the
         // focus immediately, so the editor disappears before text can be typed.
         LVHITTESTINFO hit{};hit.pt={(short)LOWORD(l),(short)HIWORD(l)};ListView_SubItemHitTest(h,&hit);if(hit.iItem>=0&&hit.iSubItem==0)return 0;
-        if(hit.iItem>=0&&hit.iSubItem==3){deleteEntryRow(hit.iItem);return 0;}
+        if(hit.iItem>=0&&hit.iSubItem==5){deleteEntryRow(hit.iItem);return 0;}
         LRESULT result=DefSubclassProc(h,message,w,l);
-        if(hit.iItem>=0&&(hit.iSubItem==1||hit.iSubItem==2))PostMessageW(gWindow,WM_EDIT_ENTRY_CELL,(WPARAM)hit.iItem,(LPARAM)hit.iSubItem);
+        if(hit.iItem>=0&&hit.iSubItem>=1&&hit.iSubItem<=4)PostMessageW(gWindow,WM_EDIT_ENTRY_CELL,(WPARAM)hit.iItem,(LPARAM)hit.iSubItem);
         return result;
     }
     return DefSubclassProc(h,message,w,l);
@@ -827,7 +846,7 @@ LRESULT CALLBACK responseBodyProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR
     return DefSubclassProc(h,message,w,l);
 }
 void editListCell(int row,int column) {
-    if(column<=0||column>=3)return;commitCellEditor();RECT bounds{};if(!ListView_GetSubItemRect(gKvList,row,column,LVIR_BOUNDS,&bounds))return;MapWindowPoints(gKvList,gWindow,(POINT*)&bounds,2);
+    if(column<=0||column>=5)return;commitCellEditor();if(column==3){selectEntryType(row);return;}if(column==2&&_wcsicmp(entryCellText(row,3).c_str(),L"file")==0){selectEntryFile(row);return;}RECT bounds{};if(!ListView_GetSubItemRect(gKvList,row,column,LVIR_BOUNDS,&bounds))return;MapWindowPoints(gKvList,gWindow,(POINT*)&bounds,2);
     wchar_t current[4096];ListView_GetItemText(gKvList,row,column,current,4096);
     gCellEditor=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",current,WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,gWindow,nullptr,gInstance,nullptr);
     if(!gCellEditor)return;applyFont(gCellEditor);gEditRow=row;gEditColumn=column;SetWindowSubclass(gCellEditor,cellEditorProc,1,0);SetWindowPos(gCellEditor,HWND_TOP,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_SHOWWINDOW);SetFocus(gCellEditor);SendMessageW(gCellEditor,EM_SETSEL,0,-1);
@@ -909,7 +928,7 @@ void createControls() {
     gEditorTabs=child(WC_TABCONTROLW,L"",TCS_TABS,IDC_EDITOR_TABS);SendMessageW(gEditorTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(30)));SendMessageW(gEditorTabs,TCM_SETPADDING,0,MAKELPARAM(px(12),px(4)));for(auto label:{L"Params",L"Headers",L"Body"}){TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label;TabCtrl_InsertItem(gEditorTabs,TabCtrl_GetItemCount(gEditorTabs),&item);}
     gKvList=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL,IDC_KV_LIST,WS_EX_CLIENTEDGE);ListView_SetExtendedListViewStyle(gKvList,LVS_EX_DOUBLEBUFFER|LVS_EX_CHECKBOXES);addListColumns(gKvList,true);
     SetWindowSubclass(gKvList,kvListProc,2,0);
-    gBodyType=child(L"COMBOBOX",L"",CBS_DROPDOWNLIST,IDC_BODY_TYPE);for(auto type:{L"None",L"JSON",L"Form URL Encoded",L"Raw"})SendMessageW(gBodyType,CB_ADDSTRING,0,(LPARAM)type);
+    gBodyType=child(L"COMBOBOX",L"",CBS_DROPDOWNLIST,IDC_BODY_TYPE);for(auto type:{L"None",L"JSON",L"Form URL Encoded",L"Multipart Form Data",L"Raw"})SendMessageW(gBodyType,CB_ADDSTRING,0,(LPARAM)type);
     gFormat=child(L"BUTTON",L"格式化",BS_OWNERDRAW,IDC_FORMAT);gCompress=child(L"BUTTON",L"压缩",BS_OWNERDRAW,IDC_COMPRESS);
     gBody=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL,IDC_BODY,WS_EX_CLIENTEDGE);applyFont(gBody,gCodeFont);SendMessageW(gBody,EM_SETLIMITTEXT,2*1024*1024,0);
     gBodyNone=child(L"STATIC",L"当前请求不发送请求体。",SS_CENTER,IDC_BODY_NONE);
@@ -1031,7 +1050,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDC_ADD_FOLDER:addFolder(nullptr);break;case IDC_SAVE:if(notification==BN_CLICKED)saveNow(true);break;
         case IDC_METHOD:if(notification==BN_CLICKED&&selectedTab())showMethodMenu();break;
         case IDC_SEND:sendCurrent();break;case IDC_CANCEL:if(auto tab=selectedTab())tab->cancelNow();break;
-        case IDC_BODY_TYPE:if(notification==CBN_SELCHANGE&&!gLoadingEditor){saveEditor(false);auto tab=selectedTab();if(tab){auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;int selected=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Raw"};if(selected>=0&&selected<4)request.bodyType=types[selected];}showEditorPage();scheduleSave();}break;
+        case IDC_BODY_TYPE:if(notification==CBN_SELCHANGE&&!gLoadingEditor){saveEditor(false);auto tab=selectedTab();if(tab){auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;int selected=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(selected>=0&&selected<5)request.bodyType=types[selected];}showEditorPage();scheduleSave();}break;
         case IDC_FORMAT:if(notification==BN_CLICKED)formatCurrentJson(false);break;
         case IDC_COMPRESS:if(notification==BN_CLICKED)formatCurrentJson(true);break;
         case IDC_SAVE_MORE:{HMENU menu=CreatePopupMenu();auto tab=selectedTab();AppendMenuW(menu,tab&&!tab->requestCase?MF_STRING:MF_GRAYED,IDM_SAVE_CASE,L"保存用例");RECT r{};GetWindowRect(gSaveMore,&r);TrackPopupMenu(menu,TPM_RIGHTBUTTON,r.left,r.bottom,0,h,nullptr);DestroyMenu(menu);break;}
@@ -1060,9 +1079,9 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
             if(header->idFrom==IDC_KV_LIST&&draw->nmcd.dwDrawStage==CDDS_POSTPAINT){
                 RECT client{};GetClientRect(gKvList,&client);int count=ListView_GetItemCount(gKvList);if(count>0){
                     HPEN pen=CreatePen(PS_SOLID,px(1),COLOR_BORDER);auto oldPen=SelectObject(draw->nmcd.hdc,pen);
-                    int columnOne=ListView_GetColumnWidth(gKvList,0),columnTwo=columnOne+ListView_GetColumnWidth(gKvList,1),columnThree=columnTwo+ListView_GetColumnWidth(gKvList,2);int firstTop=-1,lastBottom=-1;
+                    int columnOne=ListView_GetColumnWidth(gKvList,0),columnTwo=columnOne+ListView_GetColumnWidth(gKvList,1),columnThree=columnTwo+ListView_GetColumnWidth(gKvList,2),columnFour=columnThree+ListView_GetColumnWidth(gKvList,3),columnFive=columnFour+ListView_GetColumnWidth(gKvList,4);int firstTop=-1,lastBottom=-1;
                     for(int row=0;row<count;++row){RECT bounds{};if(!ListView_GetItemRect(gKvList,row,&bounds,LVIR_BOUNDS)||bounds.bottom<=0||bounds.top>=client.bottom)continue;int top=std::max(0,(int)bounds.top),bottom=std::min((int)client.bottom-1,(int)bounds.bottom-1);if(firstTop<0)firstTop=top;lastBottom=bottom;MoveToEx(draw->nmcd.hdc,0,bottom,nullptr);LineTo(draw->nmcd.hdc,client.right,bottom);}
-                    if(firstTop>=0){MoveToEx(draw->nmcd.hdc,0,firstTop,nullptr);LineTo(draw->nmcd.hdc,client.right,firstTop);for(int x:{columnOne,columnTwo,columnThree}){MoveToEx(draw->nmcd.hdc,x,firstTop,nullptr);LineTo(draw->nmcd.hdc,x,lastBottom);}}
+                    if(firstTop>=0){MoveToEx(draw->nmcd.hdc,0,firstTop,nullptr);LineTo(draw->nmcd.hdc,client.right,firstTop);for(int x:{columnOne,columnTwo,columnThree,columnFour,columnFive}){MoveToEx(draw->nmcd.hdc,x,firstTop,nullptr);LineTo(draw->nmcd.hdc,x,lastBottom);}}
                     SelectObject(draw->nmcd.hdc,oldPen);DeleteObject(pen);
                 }return CDRF_DODEFAULT;
             }
@@ -1080,8 +1099,8 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
                 HBRUSH boxBrush=CreateSolidBrush(checked?COLOR_ACCENT:RGB(255,255,255));FillRect(draw->nmcd.hdc,&box,boxBrush);DeleteObject(boxBrush);HPEN borderPen=CreatePen(PS_SOLID,px(1),checked?COLOR_ACCENT:RGB(156,163,175));auto oldPen=SelectObject(draw->nmcd.hdc,borderPen);auto oldBrush=SelectObject(draw->nmcd.hdc,GetStockObject(NULL_BRUSH));Rectangle(draw->nmcd.hdc,box.left,box.top,box.right,box.bottom);SelectObject(draw->nmcd.hdc,oldBrush);SelectObject(draw->nmcd.hdc,oldPen);DeleteObject(borderPen);
                 if(checked){HPEN checkPen=CreatePen(PS_SOLID,px(2),RGB(255,255,255));oldPen=SelectObject(draw->nmcd.hdc,checkPen);MoveToEx(draw->nmcd.hdc,left+px(3),top+px(7),nullptr);LineTo(draw->nmcd.hdc,left+px(6),top+px(10));LineTo(draw->nmcd.hdc,left+px(11),top+px(4));SelectObject(draw->nmcd.hdc,oldPen);DeleteObject(checkPen);}return CDRF_SKIPDEFAULT;
             }
-            if(header->idFrom==IDC_KV_LIST&&draw->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)&&draw->iSubItem==3){
-                RECT cell{};ListView_GetSubItemRect(gKvList,(int)draw->nmcd.dwItemSpec,3,LVIR_BOUNDS,&cell);int cx=(cell.left+cell.right)/2,cy=(cell.top+cell.bottom)/2,r=px(4);
+            if(header->idFrom==IDC_KV_LIST&&draw->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)&&draw->iSubItem==5){
+                RECT cell{};ListView_GetSubItemRect(gKvList,(int)draw->nmcd.dwItemSpec,5,LVIR_BOUNDS,&cell);int cx=(cell.left+cell.right)/2,cy=(cell.top+cell.bottom)/2,r=px(4);
                 COLORREF background=(draw->nmcd.uItemState&CDIS_HOT)?COLOR_HOVER:RGB(255,255,255);HBRUSH brush=CreateSolidBrush(background);FillRect(draw->nmcd.hdc,&cell,brush);DeleteObject(brush);
                 HPEN pen=CreatePen(PS_SOLID,px(2),RGB(107,114,128));auto oldPen=SelectObject(draw->nmcd.hdc,pen);MoveToEx(draw->nmcd.hdc,cx-r,cy-r,nullptr);LineTo(draw->nmcd.hdc,cx+r,cy+r);MoveToEx(draw->nmcd.hdc,cx+r,cy-r,nullptr);LineTo(draw->nmcd.hdc,cx-r,cy+r);SelectObject(draw->nmcd.hdc,oldPen);DeleteObject(pen);return CDRF_SKIPDEFAULT;
             }
@@ -1114,11 +1133,11 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(header->idFrom==IDC_EDITOR_TABS&&header->code==TCN_SELCHANGE){saveEditor();gEditorPage=TabCtrl_GetCurSel(gEditorTabs);showEditorPage();return 0;}
         if(header->idFrom==IDC_RESPONSE_TABS&&header->code==TCN_SELCHANGE){gResponsePage=TabCtrl_GetCurSel(gResponseTabs);showResponsePage();return 0;}
         if(header->idFrom==IDC_KV_LIST&&header->code==LVN_ITEMCHANGED){auto changed=(NMLISTVIEW*)l;if(!gLoadingEntryList){gSelectedEntryRows[gEditorPage]=-1;if(changed->iItem>=0&&listCheckboxStateChanged(changed->uOldState,changed->uNewState)){saveEditor();scheduleSave();}}return 0;}
-        if(header->idFrom==IDC_KV_LIST&&header->code==NM_CLICK){auto click=(NMITEMACTIVATE*)l;if(click->iItem>=0&&click->iSubItem==3)deleteEntryRow(click->iItem);return 0;}
-        if(header->idFrom==IDC_KV_LIST&&header->code==NM_DBLCLK){auto click=(NMITEMACTIVATE*)l;if(click->iItem>=0&&click->iSubItem>0&&click->iSubItem<3)editListCell(click->iItem,click->iSubItem);return 0;}
+        if(header->idFrom==IDC_KV_LIST&&header->code==NM_CLICK){auto click=(NMITEMACTIVATE*)l;if(click->iItem>=0&&click->iSubItem==5)deleteEntryRow(click->iItem);return 0;}
+        if(header->idFrom==IDC_KV_LIST&&header->code==NM_DBLCLK){auto click=(NMITEMACTIVATE*)l;if(click->iItem>=0&&click->iSubItem>0&&click->iSubItem<5)editListCell(click->iItem,click->iSubItem);return 0;}
         return 0;
     }
-    case WM_EDIT_ENTRY_CELL:{auto tab=selectedTab();bool listPage=tab&&(gEditorPage<2||(gEditorPage==2&&(tab->caseSnapshot?tab->caseSnapshot->bodyType:tab->request->bodyType)=="Form URL Encoded"));int row=(int)w,column=(int)l;if(listPage&&IsWindowVisible(gKvList)&&row>=0&&row<ListView_GetItemCount(gKvList)&&(column==1||column==2))editListCell(row,column);return 0;}
+    case WM_EDIT_ENTRY_CELL:{auto tab=selectedTab();string bodyType=tab?(tab->caseSnapshot?tab->caseSnapshot->bodyType:tab->request->bodyType):string();bool listPage=tab&&(gEditorPage<2||(gEditorPage==2&&(bodyType=="Form URL Encoded"||bodyType=="Multipart Form Data")));int row=(int)w,column=(int)l;if(listPage&&IsWindowVisible(gKvList)&&row>=0&&row<ListView_GetItemCount(gKvList)&&column>=1&&column<=4)editListCell(row,column);return 0;}
     case WM_MOUSEMOVE:
         if(gResizeSidebar){RECT client{};GetClientRect(h,&client);gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::min(420,dip((int)client.right)-660));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return 0;}
         if(gResizePanels){RECT client{};GetClientRect(h,&client);int editorTop=96;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZENS));return 0;}

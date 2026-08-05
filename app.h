@@ -24,6 +24,8 @@ struct KeyValueEntry {
     bool enabled = true;
     std::string key;
     std::string value;
+    std::string type;
+    std::string description;
 };
 
 struct ApiRequestCase {
@@ -114,6 +116,8 @@ HttpResult executeHttp(const RequestSnapshot& request, std::atomic<bool>& cancel
                        std::atomic<HINTERNET>* activeRequest = nullptr);
 std::string buildRequestUrl(const RequestSnapshot& request);
 std::string buildFormBody(const std::vector<KeyValueEntry>& fields);
+bool buildMultipartFormBody(const std::vector<KeyValueEntry>& fields, const std::string& boundary,
+                            std::string& body, std::wstring& error);
 std::string prettyJson(const std::string& value, bool compact = false);
 bool isValidJson(const std::string& value);
 std::wstring jsonValidationMessage(const std::string& value, bool includeColumn = true);

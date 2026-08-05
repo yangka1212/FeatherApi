@@ -28,7 +28,7 @@ if errorlevel 1 goto :failed
 rc.exe /nologo /fo"%BUILD_DIR%\resources.res" resources.rc
 if errorlevel 1 goto :failed
 
-link.exe /nologo /OUT:"%OUTPUT_DIR%\%OUTPUT_NAME%" /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /MANIFEST:EMBED /MANIFESTINPUT:app.manifest "%BUILD_DIR%\main.obj" "%BUILD_DIR%\main_window.obj" "%BUILD_DIR%\storage.obj" "%BUILD_DIR%\http_client.obj" "%BUILD_DIR%\resources.res" comctl32.lib winhttp.lib shlwapi.lib shell32.lib ole32.lib user32.lib gdi32.lib advapi32.lib
+link.exe /nologo /OUT:"%OUTPUT_DIR%\%OUTPUT_NAME%" /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /MANIFEST:EMBED /MANIFESTINPUT:app.manifest "%BUILD_DIR%\main.obj" "%BUILD_DIR%\main_window.obj" "%BUILD_DIR%\storage.obj" "%BUILD_DIR%\http_client.obj" "%BUILD_DIR%\resources.res" comctl32.lib comdlg32.lib winhttp.lib shlwapi.lib shell32.lib ole32.lib user32.lib gdi32.lib advapi32.lib
 if errorlevel 1 goto :failed
 
 popd

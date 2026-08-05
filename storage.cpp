@@ -149,10 +149,11 @@ string resolveImportBase(string baseUrl,const string& sourceUrl){
 string normalizedId(string value){return trimText(value).empty()?newId():value;}
 string normalizedName(string value,const string& fallback){value=trimText(value);return value.empty()?fallback:value;}
 string normalizedMethod(string value){value=trimText(value);if(value.empty())return "GET";for(char& c:value)c=(char)std::toupper((unsigned char)c);return value;}
+string normalizedParameterType(string value){value=trimText(value);if(equalsIgnoreCase(value,"file")||containsIgnoreCase(value,"binary"))return "file";if(equalsIgnoreCase(value,"number")||equalsIgnoreCase(value,"int")||equalsIgnoreCase(value,"integer")||containsIgnoreCase(value,"int32")||containsIgnoreCase(value,"int64")||equalsIgnoreCase(value,"float")||equalsIgnoreCase(value,"double")||equalsIgnoreCase(value,"decimal"))return "number";return "string";}
 
 std::vector<KeyValueEntry> readEntries(const Json* json) {
     std::vector<KeyValueEntry> result; if(!json||!json->array())return result;
-    for(const auto& item:*json->array()) result.push_back({getStoredBool(item,"IsEnabled",getStoredBool(item,"Enabled",true)),getStoredText(item,"Key"),getStoredText(item,"Value")});
+    for(const auto& item:*json->array()) result.push_back({getStoredBool(item,"IsEnabled",getStoredBool(item,"Enabled",true)),getStoredText(item,"Key"),getStoredText(item,"Value"),normalizedParameterType(getStoredText(item,"Type")),getStoredText(item,"Description")});
     return result;
 }
 
@@ -175,7 +176,7 @@ std::unique_ptr<ApiFolder> readFolder(const Json& json) {
 }
 
 void escape(std::ostream& out,const string& value){out<<'"';for(unsigned char c:value){switch(c){case '"':out<<"\\\"";break;case '\\':out<<"\\\\";break;case '\b':out<<"\\b";break;case '\f':out<<"\\f";break;case '\n':out<<"\\n";break;case '\r':out<<"\\r";break;case '\t':out<<"\\t";break;default:if(c<0x20)out<<"\\u"<<std::hex<<std::setw(4)<<std::setfill('0')<<(int)c<<std::dec;else out<<(char)c;}}out<<'"';}
-void writeEntries(std::ostream& out,const std::vector<KeyValueEntry>& values){out<<'[';for(size_t i=0;i<values.size();++i){if(i)out<<',';out<<"{\"IsEnabled\":"<<(values[i].enabled?"true":"false")<<",\"Key\":";escape(out,values[i].key);out<<",\"Value\":";escape(out,values[i].value);out<<'}';}out<<']';}
+void writeEntries(std::ostream& out,const std::vector<KeyValueEntry>& values){out<<'[';for(size_t i=0;i<values.size();++i){if(i)out<<',';out<<"{\"IsEnabled\":"<<(values[i].enabled?"true":"false")<<",\"Key\":";escape(out,values[i].key);out<<",\"Value\":";escape(out,values[i].value);out<<",\"Type\":";escape(out,values[i].type);out<<",\"Description\":";escape(out,values[i].description);out<<'}';}out<<']';}
 void writeCase(std::ostream& out,const ApiRequestCase& c){out<<"{\"Id\":";escape(out,c.id);out<<",\"Name\":";escape(out,c.name);out<<",\"Method\":";escape(out,c.method);out<<",\"Url\":";escape(out,c.url);out<<",\"QueryParams\":";writeEntries(out,c.query);out<<",\"Headers\":";writeEntries(out,c.headers);out<<",\"BodyType\":";escape(out,c.bodyType);out<<",\"BodyContent\":";escape(out,c.body);out<<",\"FormFields\":";writeEntries(out,c.formFields);out<<",\"ResponseSummary\":";escape(out,c.responseSummary);out<<",\"ResponseRawBody\":";escape(out,c.responseRaw);out<<",\"ResponsePrettyBody\":";escape(out,c.responsePretty);out<<",\"ResponseHeaders\":";writeEntries(out,c.responseHeaders);out<<'}';}
 void writeRequest(std::ostream& out,const ApiRequest& r){out<<"{\"Id\":";escape(out,r.id);out<<",\"Name\":";escape(out,r.name);out<<",\"Method\":";escape(out,r.method);out<<",\"Url\":";escape(out,r.url);out<<",\"QueryParams\":";writeEntries(out,r.query);out<<",\"Headers\":";writeEntries(out,r.headers);out<<",\"BodyType\":";escape(out,r.bodyType);out<<",\"BodyContent\":";escape(out,r.body);out<<",\"FormFields\":";writeEntries(out,r.formFields);out<<",\"Cases\":[";for(size_t i=0;i<r.cases.size();++i){if(i)out<<',';writeCase(out,*r.cases[i]);}out<<"]}";}
 void writeFolder(std::ostream& out,const ApiFolder& f){out<<"{\"Id\":";escape(out,f.id);out<<",\"Name\":";escape(out,f.name);out<<",\"IsExpanded\":"<<(f.expanded?"true":"false")<<",\"Children\":[";for(size_t i=0;i<f.children.size();++i){if(i)out<<',';writeFolder(out,*f.children[i]);}out<<"],\"Requests\":[";for(size_t i=0;i<f.requests.size();++i){if(i)out<<',';writeRequest(out,*f.requests[i]);}out<<"]}";}
@@ -221,6 +222,22 @@ string parameterValue(const Json& root,const Json& parameter) {
     if(auto value=parameter.get("default"))return scalarText(value);
     if(auto schema=resolveRef(root,parameter.get("schema")))if(auto value=schema->get("default"))return scalarText(value);
     return {};
+}
+
+string parameterType(const Json& root,const Json& parameter) {
+    const Json* schema=resolveRef(root,parameter.get("schema"));string type=schema?getText(*schema,"type"):getText(parameter,"type");
+    string format=schema?getText(*schema,"format"):getText(parameter,"format");
+    if(equalsIgnoreCase(type,"integer")||equalsIgnoreCase(type,"int")||equalsIgnoreCase(type,"number"))return "number";
+    if(equalsIgnoreCase(type,"file")||(equalsIgnoreCase(type,"string")&&equalsIgnoreCase(format,"binary")))return "file";
+    return "string";
+}
+string parameterDescription(const Json& root,const Json& parameter) {
+    string description=getText(parameter,"description");if(!description.empty())return description;
+    if(const Json* schema=resolveRef(root,parameter.get("schema")))return getText(*schema,"description");return {};
+}
+void appendSchemaFields(const Json& root,const Json* unresolved,std::vector<KeyValueEntry>& fields) {
+    const Json* schema=resolveRef(root,unresolved);if(!schema)return;const auto* properties=schema->get("properties");if(!properties||!properties->object())return;
+    for(const auto& property:*properties->object()){const Json* resolved=resolveRef(root,&property.second);if(!resolved)continue;string type=getText(*resolved,"type"),format=getText(*resolved,"format");string mapped=(equalsIgnoreCase(type,"file")||(equalsIgnoreCase(type,"string")&&equalsIgnoreCase(format,"binary")))?"file":(equalsIgnoreCase(type,"integer")||equalsIgnoreCase(type,"number"))?"number":"string";string value;if(auto example=resolved->get("example"))value=scalarText(example);else if(auto defaultValue=resolved->get("default"))value=scalarText(defaultValue);fields.push_back({true,property.first,value,mapped,getText(*resolved,"description")});}
 }
 
 bool bodySample(const Json& root,const Json* media,string& output) {
@@ -320,16 +337,17 @@ bool importOpenApiJson(ApiFolder& target,const string& document,bool overwrite,O
                 auto applyParameters=[&](const Json* parameters){
                     if(!parameters||!parameters->array())return;
                     for(const auto& unresolved:*parameters->array()){
-                        const Json* resolved=resolveRef(root,&unresolved);if(!resolved)continue;string where=getText(*resolved,"in"),key=getText(*resolved,"name");if(key.empty())continue;string value=parameterValue(root,*resolved);
-                        if(equalsIgnoreCase(where,"query"))result->query.push_back({true,key,value});
-                        else if(equalsIgnoreCase(where,"header"))result->headers.push_back({true,key,value});
+                        const Json* resolved=resolveRef(root,&unresolved);if(!resolved)continue;string where=getText(*resolved,"in"),key=getText(*resolved,"name");if(key.empty())continue;string value=parameterValue(root,*resolved),type=parameterType(root,*resolved),description=parameterDescription(root,*resolved);
+                        if(equalsIgnoreCase(where,"query"))result->query.push_back({true,key,value,type,description});
+                        else if(equalsIgnoreCase(where,"header"))result->headers.push_back({true,key,value,type,description});
                         else if(equalsIgnoreCase(where,"body")){result->bodyType="JSON";string sample;if(auto example=resolved->get("example"))sample=jsonText(*example);else if(auto schema=resolved->get("schema"))sample=jsonText(sampleFromSchema(root,schema));result->body=sample.empty()?"{}":sample;}
                     }
                 };
                 auto pathParameters=std::find_if(pathObject->begin(),pathObject->end(),[](const auto& entry){return entry.first=="parameters";});if(pathParameters!=pathObject->end())applyParameters(&pathParameters->second);applyParameters(operation.get("parameters"));
                 if(openApi)if(auto requestBody=resolveRef(root,operation.get("requestBody")))if(auto content=requestBody->get("content");content&&content->object()&&!content->object()->empty()){
-                    const Json* media=nullptr;for(const auto& candidate:*content->object())if(containsIgnoreCase(candidate.first,"application/json")){media=&candidate.second;break;}if(!media)media=&content->object()->begin()->second;
-                    string sample;if(bodySample(root,media,sample)){result->bodyType="JSON";result->body=sample;}
+                    const Json* formMedia=nullptr;const Json* jsonMedia=nullptr;for(const auto& candidate:*content->object()){if(containsIgnoreCase(candidate.first,"multipart/form-data"))formMedia=&candidate.second;else if(!jsonMedia&&containsIgnoreCase(candidate.first,"application/json"))jsonMedia=&candidate.second;}
+                    if(formMedia){result->bodyType="Multipart Form Data";if(const Json* media=resolveRef(root,formMedia))appendSchemaFields(root,media->get("schema"),result->formFields);}
+                    else {const Json* media=jsonMedia?jsonMedia:&content->object()->begin()->second;string sample;if(bodySample(root,media,sample)){result->bodyType="JSON";result->body=sample;}}
                 }
                 return result;
             };
