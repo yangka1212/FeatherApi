@@ -88,6 +88,8 @@ std::atomic<HINTERNET> gImportRequest=nullptr;
 bool gSelectingTree=false;
 bool gRebuildingTree=false;
 bool gSearchExpandedFolder=false;
+bool gDraggingRequestTabScroll=false;
+int gRequestTabScrollDragOffset=0;
 UINT gDpi=96;
 std::unordered_set<string> gExpandedRequests;
 
@@ -117,6 +119,14 @@ void recreateFonts() {
     gTitleFont=CreateFontW(-px(21),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     gTreeFolderFont=CreateFontW(-px(13),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     gTreeMethodFont=CreateFontW(-px(10),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+}
+int fontTextHeight(HWND control,HFONT font) {
+    HDC dc=GetDC(control);HGDIOBJ oldFont=SelectObject(dc,font);TEXTMETRICW metrics{};GetTextMetricsW(dc,&metrics);SelectObject(dc,oldFont);ReleaseDC(control,dc);return (int)metrics.tmHeight;
+}
+void updateUrlFormatting() {
+    if(!gUrl)return;
+    RECT client{};GetClientRect(gUrl,&client);int textHeight=fontTextHeight(gUrl,gCodeFont)+px(1);int top=std::max(0,((int)client.bottom-textHeight)/2);
+    RECT formatting{0,top,(int)client.right,std::min((int)client.bottom,top+textHeight)};SendMessageW(gUrl,EM_SETRECTNP,0,(LPARAM)&formatting);InvalidateRect(gUrl,nullptr,FALSE);
 }
 void setSaveStatus(const wstring& value) {
     gSaveStatus=value;if(!gSaveTooltip||!gSave)return;TOOLINFOW tool{sizeof(tool)};tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tool.hwnd=gWindow;tool.uId=(UINT_PTR)gSave;tool.lpszText=(LPWSTR)gSaveStatus.c_str();SendMessageW(gSaveTooltip,TTM_UPDATETIPTEXTW,0,(LPARAM)&tool);
@@ -458,6 +468,7 @@ void refreshRequestTabs() {
 }
 
 HWND requestTabsUpDown() { return FindWindowExW(gRequestTabs,nullptr,UPDOWN_CLASSW,nullptr); }
+RECT requestTabScrollThumbRect(HWND scroll);
 void updateRequestTabScroll() {
     if(!gRequestTabs||!gRequestTabScroll)return;
     HWND upDown=requestTabsUpDown();
@@ -481,20 +492,84 @@ void scrollRequestTabs(WPARAM value) {
     switch(LOWORD(value)){
     case SB_LINELEFT:--position;break;case SB_LINERIGHT:++position;break;
     case SB_PAGELEFT:position-=(int)info.nPage;break;case SB_PAGERIGHT:position+=(int)info.nPage;break;
-    case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;default:return;
+    case SB_THUMBPOSITION:position=(int)(short)HIWORD(value);break;
+    case SB_THUMBTRACK:position=info.nTrackPos;break;default:return;
     }
     int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);position=std::clamp(position,info.nMin,maximum);
     int current=(int)SendMessageW(upDown,UDM_GETPOS32,0,0);
-    if(position!=current){
-        SendMessageW(upDown,UDM_SETPOS32,0,position);
-        SendMessageW(gRequestTabs,WM_HSCROLL,MAKEWPARAM(SB_THUMBPOSITION,position),(LPARAM)upDown);
-    }
+    if(position==current&&position==info.nPos)return;
+    SendMessageW(gRequestTabs,WM_SETREDRAW,FALSE,0);
+    SendMessageW(upDown,UDM_SETPOS32,0,position);
+    SendMessageW(gRequestTabs,WM_HSCROLL,MAKEWPARAM(SB_THUMBPOSITION,position),(LPARAM)upDown);
+    SendMessageW(gRequestTabs,WM_SETREDRAW,TRUE,0);
     int actual=(int)SendMessageW(upDown,UDM_GETPOS32,0,0);
-    info.fMask=SIF_POS;info.nPos=actual;SetScrollInfo(gRequestTabScroll,SB_CTL,&info,TRUE);
-    ShowWindow(upDown,SW_HIDE);InvalidateRect(gRequestTabs,nullptr,TRUE);
+    info.fMask=SIF_POS;info.nPos=actual;SetScrollInfo(gRequestTabScroll,SB_CTL,&info,FALSE);
+    ShowWindow(upDown,SW_HIDE);InvalidateRect(gRequestTabScroll,nullptr,FALSE);RedrawWindow(gRequestTabs,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);
+}
+
+RECT requestTabScrollThumbRect(HWND scroll) {
+    RECT client{};GetClientRect(scroll,&client);
+    SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(scroll,SB_CTL,&info);
+    int width=std::max(0,(int)client.right-(int)client.left);
+    int range=std::max(1,info.nMax-info.nMin+1);
+    int minimumThumbWidth=std::min(px(28),width);
+    int thumbWidth=std::clamp(MulDiv(width,(int)info.nPage,range),minimumThumbWidth,width);
+    int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);
+    int travel=std::max(0,width-thumbWidth);
+    int positionRange=std::max(1,maximum-info.nMin);
+    int left=client.left+(maximum==info.nMin?0:MulDiv(info.nPos-info.nMin,travel,positionRange));
+    int thumbHeight=std::min(px(5),std::max(1,(int)client.bottom-(int)client.top));
+    int top=client.top+((int)client.bottom-(int)client.top-thumbHeight)/2;
+    return {left,top,left+thumbWidth,top+thumbHeight};
+}
+
+void setRequestTabScrollFromThumb(HWND scroll,int thumbLeft) {
+    RECT client{};GetClientRect(scroll,&client);
+    SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(scroll,SB_CTL,&info);
+    RECT thumb=requestTabScrollThumbRect(scroll);
+    int travel=std::max(0,(int)client.right-(int)client.left-((int)thumb.right-(int)thumb.left));
+    int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);
+    int position=travel==0?info.nMin:info.nMin+MulDiv(std::clamp(thumbLeft,(int)client.left,(int)client.left+travel)-(int)client.left,maximum-info.nMin,travel);
+    scrollRequestTabs(MAKEWPARAM(SB_THUMBPOSITION,position));
+}
+
+LRESULT CALLBACK requestTabScrollProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
+    switch(message){
+    case WM_ERASEBKGND:return 1;
+    case WM_PAINT:{
+        PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT client{};GetClientRect(h,&client);FillRect(dc,&client,gSidebarBrush);
+        RECT thumb=requestTabScrollThumbRect(h);fillRoundRect(dc,thumb,RGB(156,163,175),px(4));EndPaint(h,&paint);return 0;
+    }
+    case WM_LBUTTONDOWN:{
+        SetFocus(gRequestTabs);RECT thumb=requestTabScrollThumbRect(h);int x=(short)LOWORD(l);
+        if(x>=thumb.left&&x<thumb.right){gDraggingRequestTabScroll=true;gRequestTabScrollDragOffset=x-thumb.left;SetCapture(h);}
+        else setRequestTabScrollFromThumb(h,x-(thumb.right-thumb.left)/2);
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if(gDraggingRequestTabScroll&&(w&MK_LBUTTON)){setRequestTabScrollFromThumb(h,(short)LOWORD(l)-gRequestTabScrollDragOffset);return 0;}
+        break;
+    case WM_LBUTTONUP:
+        if(gDraggingRequestTabScroll){gDraggingRequestTabScroll=false;ReleaseCapture();return 0;}
+        break;
+    case WM_CAPTURECHANGED:gDraggingRequestTabScroll=false;break;
+    }
+    return DefSubclassProc(h,message,w,l);
 }
 
 LRESULT CALLBACK requestTabsProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT){
+        PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT client{};GetClientRect(h,&client);
+        int width=client.right-client.left,height=client.bottom-client.top;
+        if(width>0&&height>0){
+            HDC buffer=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);HGDIOBJ oldBitmap=SelectObject(buffer,bitmap);
+            DefSubclassProc(h,WM_PRINTCLIENT,(WPARAM)buffer,PRF_CLIENT);
+            BitBlt(dc,paint.rcPaint.left,paint.rcPaint.top,paint.rcPaint.right-paint.rcPaint.left,paint.rcPaint.bottom-paint.rcPaint.top,buffer,paint.rcPaint.left,paint.rcPaint.top,SRCCOPY);
+            SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);
+        }
+        EndPaint(h,&paint);return 0;
+    }
     if(message==WM_LBUTTONDOWN){
         TCHITTESTINFO hit{};hit.pt={(short)LOWORD(l),(short)HIWORD(l)};int index=TabCtrl_HitTest(h,&hit);
         if(index>=0){RECT tabRect{};TabCtrl_GetItemRect(h,index,&tabRect);if(hit.pt.x>=tabRect.right-px(28)){closeTab(index);return 0;}}
@@ -801,8 +876,14 @@ LRESULT CALLBACK searchProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD
     return result;
 }
 LRESULT CALLBACK urlProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
-    if(message==WM_SETFOCUS||message==WM_KILLFOCUS)InvalidateRect(gUrlFrame,nullptr,TRUE);
-    return DefSubclassProc(h,message,w,l);
+    if(message==WM_CHAR&&w==VK_RETURN)return 0;
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS){InvalidateRect(gUrlFrame,nullptr,TRUE);InvalidateRect(h,nullptr,FALSE);}
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if(message==WM_PAINT&&GetFocus()!=h&&GetWindowTextLengthW(h)==0){
+        HDC dc=GetDC(h);RECT textRect{};SendMessageW(h,EM_GETRECT,0,(LPARAM)&textRect);HGDIOBJ oldFont=SelectObject(dc,gCodeFont);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(156,163,175));
+        DrawTextW(dc,L"https://api.example.com",-1,&textRect,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,oldFont);ReleaseDC(h,dc);
+    }
+    return result;
 }
 void showMethodMenu() {
     static const wchar_t* methods[]={L"GET",L"POST",L"PUT",L"PATCH",L"DELETE",L"HEAD",L"OPTIONS"};
@@ -817,10 +898,10 @@ void createControls() {
     gSidebarDivider=child(L"STATIC",L"",SS_LEFT,IDC_SIDEBAR_DIVIDER);
     gTree=child(WC_TREEVIEWW,L"",TVS_SHOWSELALWAYS|TVS_FULLROWSELECT|TVS_TRACKSELECT|TVS_NOHSCROLL,IDC_TREE,0);TreeView_SetExtendedStyle(gTree,TVS_EX_DOUBLEBUFFER,TVS_EX_DOUBLEBUFFER);
     gRequestTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE,IDC_REQUEST_TABS);SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(30)));SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(12),px(4)));SetWindowSubclass(gRequestTabs,requestTabsProc,3,0);
-    gRequestTabScroll=child(L"SCROLLBAR",L"",SBS_HORZ,IDC_REQUEST_TAB_SCROLL);ShowWindow(gRequestTabScroll,SW_HIDE);
+    gRequestTabScroll=child(L"SCROLLBAR",L"",SBS_HORZ,IDC_REQUEST_TAB_SCROLL);SetWindowSubclass(gRequestTabScroll,requestTabScrollProc,8,0);ShowWindow(gRequestTabScroll,SW_HIDE);
     gMethod=child(L"BUTTON",L"GET",BS_OWNERDRAW,IDC_METHOD);
     gUrlFrame=child(L"STATIC",L"",SS_OWNERDRAW,IDC_URL_FRAME);
-    gUrl=child(L"EDIT",L"",ES_AUTOHSCROLL,IDC_URL);applyFont(gUrl,gCodeFont);SendMessageW(gUrl,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(0,0));SendMessageW(gUrl,EM_SETCUEBANNER,TRUE,(LPARAM)L"https://api.example.com");SetWindowSubclass(gUrl,urlProc,6,0);
+    gUrl=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOHSCROLL,IDC_URL);applyFont(gUrl,gCodeFont);SendMessageW(gUrl,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(0,0));SetWindowSubclass(gUrl,urlProc,6,0);
     gSave=child(L"BUTTON",L"保存",BS_OWNERDRAW,IDC_SAVE);gSaveMore=child(L"BUTTON",L"▾",BS_OWNERDRAW,IDC_SAVE_MORE);
     gSaveTooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,gWindow,nullptr,gInstance,nullptr);
     TOOLINFOW saveTool{sizeof(saveTool)};saveTool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;saveTool.hwnd=gWindow;saveTool.uId=(UINT_PTR)gSave;saveTool.lpszText=(LPWSTR)gSaveStatus.c_str();SendMessageW(gSaveTooltip,TTM_ADDTOOLW,0,(LPARAM)&saveTool);
@@ -866,11 +947,11 @@ void layout(int width,int height) {
     int sidebar=std::clamp(gData.sidebarWidth,180,std::min(420,width-660));int workspaceX=sidebar;int workspaceW=width-workspaceX;
     constexpr int contentInset=10;int contentX=workspaceX+contentInset;int contentW=workspaceW-contentInset*2;
     move(gSearch,12,12,sidebar-64,32);if(!gResizeSidebar)updateSearchFormatting();move(gAddFolder,sidebar-44,12,32,32);move(gSidebarDivider,0,55,sidebar,1);move(gTree,8,64,sidebar-16,height-72);
-    move(gRequestTabs,contentX,0,contentW,48);move(gRequestTabScroll,contentX,33,contentW,14);
-    int y=50;constexpr int rowHeight=30;constexpr int commandGap=8;constexpr int saveWidth=72;constexpr int saveMoreWidth=28;constexpr int sendWidth=82;
+    move(gRequestTabs,contentX,0,contentW,48);move(gRequestTabScroll,contentX,35,contentW,10);
+    constexpr int requestRowTop=57;constexpr int rowHeight=30;constexpr int commandGap=8;constexpr int saveWidth=72;constexpr int saveMoreWidth=28;constexpr int sendWidth=82;
     int sendX=contentX+contentW-sendWidth;int saveMoreX=sendX-commandGap-saveMoreWidth;int saveX=saveMoreX-saveWidth;int urlX=contentX+112;int urlWidth=saveX-commandGap-urlX;
-    move(gMethod,contentX,y,104,rowHeight);move(gUrlFrame,urlX,y,urlWidth,rowHeight);move(gUrl,urlX+10,y+5,urlWidth-20,20);
-    move(gSave,saveX,y,saveWidth,rowHeight);move(gSaveMore,saveMoreX,y,saveMoreWidth,rowHeight);move(gSend,sendX,y,sendWidth,rowHeight);move(gCancel,sendX,y,sendWidth,rowHeight);
+    move(gMethod,contentX,requestRowTop,104,rowHeight);move(gUrlFrame,urlX,requestRowTop,urlWidth,rowHeight);move(gUrl,urlX+10,requestRowTop+2,urlWidth-20,rowHeight-4);
+    move(gSave,saveX,requestRowTop,saveWidth,rowHeight);move(gSaveMore,saveMoreX,requestRowTop,saveMoreWidth,rowHeight);move(gSend,sendX,requestRowTop,sendWidth,rowHeight);move(gCancel,sendX,requestRowTop,sendWidth,rowHeight);
     int editorTop=96;int editorHeight=std::clamp(gData.requestPanelHeight,200,std::max(200,height-350));move(gEditorTabs,contentX,editorTop,contentW,36);
     const int bodyToolbarTop=editorTop+39;
     // A native drop-down list uses its font-defined closed height and ignores
@@ -885,7 +966,7 @@ void layout(int width,int height) {
     int responseTop=editorTop+editorHeight;move(gSummary,contentX,responseTop+4,contentW,28);
     move(gResponseTabs,contentX,responseTop+34,contentW,36);move(gResponseBody,contentX,responseTop+68,contentW,height-responseTop-78);move(gResponseHeaders,contentX,responseTop+68,contentW,height-responseTop-78);
     move(gEmptyTitle,workspaceX+(workspaceW-360)/2,height/2-45,360,34);move(gEmptyHelp,workspaceX+(workspaceW-500)/2,height/2,500,28);
-    if(deferred)EndDeferWindowPos(deferred);
+    if(deferred)EndDeferWindowPos(deferred);updateUrlFormatting();
     PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);
     if(gResizeSidebar){
         // Repaint the parent surface exposed by all right-side children moving.
