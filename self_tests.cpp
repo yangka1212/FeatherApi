@@ -22,6 +22,7 @@ struct LoopbackExchange {
     unsigned short port=0;
     std::string request;
     std::string responseBody=R"({"ok":true})";
+    std::string responseContentType="application/json; charset=utf-8";
     std::string responseHeaders="X-FeatherApi-Test: loopback\r\nX-Order: first\r\nX-Order: second\r\n";
     bool served=false;
     std::thread worker;
@@ -43,7 +44,7 @@ struct LoopbackExchange {
                     if(request.size()>=expected)break;
                 }
             }
-            const std::string response="HTTP/1.1 201 Created\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: "+std::to_string(responseBody.size())+"\r\n"+responseHeaders+"Connection: close\r\n\r\n"+responseBody;
+            const std::string response="HTTP/1.1 201 Created\r\nContent-Type: "+responseContentType+"\r\nContent-Length: "+std::to_string(responseBody.size())+"\r\n"+responseHeaders+"Connection: close\r\n\r\n"+responseBody;
             size_t sent=0;while(sent<response.size()){int count=send(client,response.data()+sent,(int)(response.size()-sent),0);if(count<=0)break;sent+=(size_t)count;}
             served=sent==response.size();shutdown(client,SD_BOTH);closesocket(client);
         });return true;
@@ -252,6 +253,16 @@ int main() {
         check(orderedHeaders==std::vector<std::string>({"first","second"}),"HTTP preserves repeated response header order like WPF");
         closesocket(loopback.listener);loopback.listener=INVALID_SOCKET;
     }
+
+    LoopbackExchange jsonSuffix;jsonSuffix.responseContentType="Application/Problem+JSON; Charset=UTF-8";
+    check(winsockReady&&jsonSuffix.start(),"HTTP JSON-suffix response loopback starts");
+    if(jsonSuffix.port!=0){RequestSnapshot request;request.method="GET";request.url="http://127.0.0.1:"+std::to_string(jsonSuffix.port)+"/problem";auto result=executeHttp(request,cancel);if(jsonSuffix.worker.joinable())jsonSuffix.worker.join();
+        check(result.transportSuccess&&result.prettyBody.find('\n')!=std::string::npos,"HTTP formats structured-suffix JSON based on Content-Type");closesocket(jsonSuffix.listener);jsonSuffix.listener=INVALID_SOCKET;}
+
+    LoopbackExchange plainJson;plainJson.responseContentType="text/plain";
+    check(winsockReady&&plainJson.start(),"HTTP plain-text response loopback starts");
+    if(plainJson.port!=0){RequestSnapshot request;request.method="GET";request.url="http://127.0.0.1:"+std::to_string(plainJson.port)+"/plain";auto result=executeHttp(request,cancel);if(plainJson.worker.joinable())plainJson.worker.join();
+        check(result.transportSuccess&&result.prettyBody==plainJson.responseBody,"HTTP does not format JSON-looking text without a JSON Content-Type");closesocket(plainJson.listener);plainJson.listener=INVALID_SOCKET;}
 
     LoopbackExchange oversized;oversized.responseBody.assign(20*1024*1024+1,'x');oversized.responseHeaders.clear();
     check(winsockReady&&oversized.start(),"HTTP oversized-response loopback starts");

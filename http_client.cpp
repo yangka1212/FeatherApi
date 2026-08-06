@@ -71,11 +71,17 @@ string headerValue(const std::vector<KeyValueEntry>& headers,const string& key) 
     return {};
 }
 
+bool isJsonContentType(string contentType) {
+    auto parameter=contentType.find(';');if(parameter!=string::npos)contentType.resize(parameter);
+    contentType=trimAscii(contentType);for(char& c:contentType)c=(char)std::tolower((unsigned char)c);
+    auto slash=contentType.find('/');if(slash==string::npos)return false;
+    string subtype=trimAscii(contentType.substr(slash+1));
+    return subtype=="json"||(subtype.size()>5&&subtype.compare(subtype.size()-5,5,"+json")==0);
+}
+
 string formatResponseBody(const string& body,const std::vector<KeyValueEntry>& headers) {
-    if(body.empty())return {};string contentType=headerValue(headers,"Content-Type");bool declaredJson=false;
-    for(size_t i=0;i+4<=contentType.size();++i)if(_strnicmp(contentType.c_str()+i,"json",4)==0){declaredJson=true;break;}
-    auto first=std::find_if_not(body.begin(),body.end(),[](unsigned char c){return std::isspace(c)!=0;});bool looksJson=first!=body.end()&&(*first=='{'||*first=='[');
-    return declaredJson||looksJson?prettyJson(body):body;
+    if(body.empty())return {};
+    return isJsonContentType(headerValue(headers,"Content-Type"))?prettyJson(body):body;
 }
 
 wstring decodeBody(const string& bytes,const std::vector<KeyValueEntry>& headers) {

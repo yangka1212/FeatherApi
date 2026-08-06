@@ -92,6 +92,8 @@ bool gRebuildingTree=false;
 bool gSearchExpandedFolder=false;
 bool gDraggingRequestTabScroll=false;
 int gRequestTabScrollDragOffset=0;
+int gRequestTabScrollOffset=0,gRequestTabContentWidth=0,gRequestTabViewportX=0,gRequestTabViewportWidth=0;
+bool gEnsureSelectedRequestTabVisible=false;
 UINT gDpi=96;
 std::unordered_set<string> gExpandedRequests;
 
@@ -466,47 +468,61 @@ void refreshRequestTabs() {
     TabCtrl_DeleteAllItems(gRequestTabs);
     for(auto& tab:gTabs){auto& shown=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;wstring label=toWide(shown.method)+L"  "+toWide(shown.name)+L"   ×";TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label.c_str();TabCtrl_InsertItem(gRequestTabs,TabCtrl_GetItemCount(gRequestTabs),&item);}
     if(gSelectedTab>=0)TabCtrl_SetCurSel(gRequestTabs,gSelectedTab);
+    gEnsureSelectedRequestTabVisible=true;
     PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);
 }
 
-HWND requestTabsUpDown() { return FindWindowExW(gRequestTabs,nullptr,UPDOWN_CLASSW,nullptr); }
 RECT requestTabScrollThumbRect(HWND scroll);
+void positionRequestTabs() {
+    if(!gRequestTabs||gRequestTabViewportWidth<=0)return;
+    gRequestTabScrollOffset=std::clamp(gRequestTabScrollOffset,0,std::max(0,gRequestTabContentWidth-gRequestTabViewportWidth));
+    // Moving and repainting are coordinated by setRequestTabScrollOffset().
+    SetWindowPos(gRequestTabs,nullptr,gRequestTabViewportX-gRequestTabScrollOffset,0,gRequestTabContentWidth,px(35),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOCOPYBITS);
+    HRGN clip=CreateRectRgn(gRequestTabScrollOffset,0,gRequestTabScrollOffset+gRequestTabViewportWidth,px(35));if(!SetWindowRgn(gRequestTabs,clip,FALSE))DeleteObject(clip);
+}
 void updateRequestTabScroll() {
     if(!gRequestTabs||!gRequestTabScroll)return;
-    HWND upDown=requestTabsUpDown();
-    if(!upDown){ShowWindow(gRequestTabScroll,SW_HIDE);return;}
-    int minimum=0,maximum=0;SendMessageW(upDown,UDM_GETRANGE32,(WPARAM)&minimum,(LPARAM)&maximum);
-    int position=(int)SendMessageW(upDown,UDM_GETPOS32,0,0);
-    ShowWindow(upDown,SW_HIDE);
-    int count=TabCtrl_GetItemCount(gRequestTabs);
-    bool overflow=count>1&&maximum>minimum;
+    HDC dc=GetDC(gRequestTabs);HFONT oldFont=dc?(HFONT)SelectObject(dc,gUiFont):nullptr;int contentWidth=0;
+    for(int index=0;index<TabCtrl_GetItemCount(gRequestTabs);++index){TCITEMW item{};wchar_t text[512]{};item.mask=TCIF_TEXT;item.pszText=text;item.cchTextMax=512;TabCtrl_GetItem(gRequestTabs,index,&item);SIZE size{};if(dc)GetTextExtentPoint32W(dc,text,(int)wcslen(text),&size);contentWidth+=size.cx+px(32);}
+    if(dc){SelectObject(dc,oldFont);ReleaseDC(gRequestTabs,dc);}
+    gRequestTabContentWidth=std::max(gRequestTabViewportWidth,contentWidth+px(4));
+    positionRequestTabs();
+    int count=TabCtrl_GetItemCount(gRequestTabs);if(count>0){RECT last{};if(TabCtrl_GetItemRect(gRequestTabs,count-1,&last)){gRequestTabContentWidth=std::max(gRequestTabViewportWidth,(int)last.right+px(4));positionRequestTabs();}}
+    if(HWND upDown=FindWindowExW(gRequestTabs,nullptr,UPDOWN_CLASSW,nullptr))ShowWindow(upDown,SW_HIDE);
+    if(gEnsureSelectedRequestTabVisible&&gSelectedTab>=0){
+        RECT selected{};TabCtrl_GetItemRect(gRequestTabs,gSelectedTab,&selected);
+        if(selected.left<gRequestTabScrollOffset)gRequestTabScrollOffset=selected.left;else if(selected.right>gRequestTabScrollOffset+gRequestTabViewportWidth)gRequestTabScrollOffset=selected.right-gRequestTabViewportWidth;
+        gEnsureSelectedRequestTabVisible=false;
+    }
+    bool overflow=gRequestTabContentWidth>gRequestTabViewportWidth;
     ShowWindow(gRequestTabScroll,overflow?SW_SHOW:SW_HIDE);
+    if(!overflow)gRequestTabScrollOffset=0;
+    positionRequestTabs();
     if(!overflow)return;
     SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};
-    info.nMin=minimum;info.nMax=std::max(minimum,count-1);
-    info.nPage=(UINT)std::max(1,count-maximum);info.nPos=std::clamp(position,minimum,maximum);
+    info.nMin=0;info.nMax=std::max(0,gRequestTabContentWidth-1);
+    info.nPage=(UINT)gRequestTabViewportWidth;info.nPos=gRequestTabScrollOffset;
     SetScrollInfo(gRequestTabScroll,SB_CTL,&info,TRUE);
 }
-void scrollRequestTabs(WPARAM value) {
-    HWND upDown=requestTabsUpDown();if(!upDown)return;
+void setRequestTabScrollOffset(int position) {
     SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(gRequestTabScroll,SB_CTL,&info);
-    int position=info.nPos;
+    int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);position=std::clamp(position,info.nMin,maximum);
+    if(position==gRequestTabScrollOffset)return;
+    gRequestTabScrollOffset=position;positionRequestTabs();info.fMask=SIF_POS;info.nPos=position;SetScrollInfo(gRequestTabScroll,SB_CTL,&info,FALSE);
+    InvalidateRect(gRequestTabScroll,nullptr,FALSE);UpdateWindow(gRequestTabScroll);
+    RECT visible{gRequestTabScrollOffset,0,gRequestTabScrollOffset+gRequestTabViewportWidth,px(35)};
+    RedrawWindow(gRequestTabs,&visible,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);
+}
+void scrollRequestTabs(WPARAM value) {
+    SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(gRequestTabScroll,SB_CTL,&info);
+    int position=gRequestTabScrollOffset;
     switch(LOWORD(value)){
-    case SB_LINELEFT:--position;break;case SB_LINERIGHT:++position;break;
+    case SB_LINELEFT:position-=px(24);break;case SB_LINERIGHT:position+=px(24);break;
     case SB_PAGELEFT:position-=(int)info.nPage;break;case SB_PAGERIGHT:position+=(int)info.nPage;break;
-    case SB_THUMBPOSITION:position=(int)(short)HIWORD(value);break;
+    case SB_THUMBPOSITION:position=(int)HIWORD(value);break;
     case SB_THUMBTRACK:position=info.nTrackPos;break;default:return;
     }
-    int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);position=std::clamp(position,info.nMin,maximum);
-    int current=(int)SendMessageW(upDown,UDM_GETPOS32,0,0);
-    if(position==current&&position==info.nPos)return;
-    SendMessageW(gRequestTabs,WM_SETREDRAW,FALSE,0);
-    SendMessageW(upDown,UDM_SETPOS32,0,position);
-    SendMessageW(gRequestTabs,WM_HSCROLL,MAKEWPARAM(SB_THUMBPOSITION,position),(LPARAM)upDown);
-    SendMessageW(gRequestTabs,WM_SETREDRAW,TRUE,0);
-    int actual=(int)SendMessageW(upDown,UDM_GETPOS32,0,0);
-    info.fMask=SIF_POS;info.nPos=actual;SetScrollInfo(gRequestTabScroll,SB_CTL,&info,FALSE);
-    ShowWindow(upDown,SW_HIDE);InvalidateRect(gRequestTabScroll,nullptr,FALSE);RedrawWindow(gRequestTabs,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);
+    setRequestTabScrollOffset(position);
 }
 
 RECT requestTabScrollThumbRect(HWND scroll) {
@@ -532,15 +548,22 @@ void setRequestTabScrollFromThumb(HWND scroll,int thumbLeft) {
     int travel=std::max(0,(int)client.right-(int)client.left-((int)thumb.right-(int)thumb.left));
     int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);
     int position=travel==0?info.nMin:info.nMin+MulDiv(std::clamp(thumbLeft,(int)client.left,(int)client.left+travel)-(int)client.left,maximum-info.nMin,travel);
-    scrollRequestTabs(MAKEWPARAM(SB_THUMBPOSITION,position));
+    setRequestTabScrollOffset(position);
 }
 
 LRESULT CALLBACK requestTabScrollProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
     switch(message){
     case WM_ERASEBKGND:return 1;
     case WM_PAINT:{
-        PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT client{};GetClientRect(h,&client);FillRect(dc,&client,gSidebarBrush);
-        RECT thumb=requestTabScrollThumbRect(h);fillRoundRect(dc,thumb,RGB(156,163,175),px(4));EndPaint(h,&paint);return 0;
+        PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT client{};GetClientRect(h,&client);
+        int width=client.right-client.left,height=client.bottom-client.top;
+        if(width>0&&height>0){
+            HDC buffer=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);HGDIOBJ oldBitmap=SelectObject(buffer,bitmap);
+            FillRect(buffer,&client,gSidebarBrush);RECT thumb=requestTabScrollThumbRect(h);fillRoundRect(buffer,thumb,RGB(156,163,175),px(4));
+            BitBlt(dc,paint.rcPaint.left,paint.rcPaint.top,paint.rcPaint.right-paint.rcPaint.left,paint.rcPaint.bottom-paint.rcPaint.top,buffer,paint.rcPaint.left,paint.rcPaint.top,SRCCOPY);
+            SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);
+        }
+        EndPaint(h,&paint);return 0;
     }
     case WM_LBUTTONDOWN:{
         SetFocus(gRequestTabs);RECT thumb=requestTabScrollThumbRect(h);int x=(short)LOWORD(l);
@@ -552,9 +575,11 @@ LRESULT CALLBACK requestTabScrollProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT
         if(gDraggingRequestTabScroll&&(w&MK_LBUTTON)){setRequestTabScrollFromThumb(h,(short)LOWORD(l)-gRequestTabScrollDragOffset);return 0;}
         break;
     case WM_LBUTTONUP:
-        if(gDraggingRequestTabScroll){gDraggingRequestTabScroll=false;ReleaseCapture();return 0;}
+        if(gDraggingRequestTabScroll){gDraggingRequestTabScroll=false;ReleaseCapture();RedrawWindow(gRequestTabs,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);return 0;}
         break;
-    case WM_CAPTURECHANGED:gDraggingRequestTabScroll=false;break;
+    case WM_CAPTURECHANGED:
+        if(gDraggingRequestTabScroll){gDraggingRequestTabScroll=false;RedrawWindow(gRequestTabs,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);}
+        break;
     }
     return DefSubclassProc(h,message,w,l);
 }
@@ -563,11 +588,12 @@ LRESULT CALLBACK requestTabsProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,
     if(message==WM_ERASEBKGND)return 1;
     if(message==WM_PAINT){
         PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT client{};GetClientRect(h,&client);
-        int width=client.right-client.left,height=client.bottom-client.top;
+        RECT dirty=paint.rcPaint;int width=dirty.right-dirty.left,height=dirty.bottom-dirty.top;
         if(width>0&&height>0){
             HDC buffer=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);HGDIOBJ oldBitmap=SelectObject(buffer,bitmap);
+            SetViewportOrgEx(buffer,-dirty.left,-dirty.top,nullptr);IntersectClipRect(buffer,dirty.left,dirty.top,dirty.right,dirty.bottom);
             DefSubclassProc(h,WM_PRINTCLIENT,(WPARAM)buffer,PRF_CLIENT);
-            BitBlt(dc,paint.rcPaint.left,paint.rcPaint.top,paint.rcPaint.right-paint.rcPaint.left,paint.rcPaint.bottom-paint.rcPaint.top,buffer,paint.rcPaint.left,paint.rcPaint.top,SRCCOPY);
+            BitBlt(dc,dirty.left,dirty.top,width,height,buffer,dirty.left,dirty.top,SRCCOPY);
             SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);
         }
         EndPaint(h,&paint);return 0;
@@ -916,6 +942,9 @@ void createControls() {
     gAddFolder=child(L"BUTTON",L"+",BS_OWNERDRAW,IDC_ADD_FOLDER);
     gSidebarDivider=child(L"STATIC",L"",SS_LEFT,IDC_SIDEBAR_DIVIDER);
     gTree=child(WC_TREEVIEWW,L"",TVS_SHOWSELALWAYS|TVS_FULLROWSELECT|TVS_TRACKSELECT|TVS_NOHSCROLL,IDC_TREE,0);TreeView_SetExtendedStyle(gTree,TVS_EX_DOUBLEBUFFER,TVS_EX_DOUBLEBUFFER);
+    // Keep the tab control and its custom scrollbar in adjacent rectangles.
+    // Overlapping sibling windows can briefly expose one another while the tab
+    // window moves on every drag frame, which makes the thumb appear to flash.
     gRequestTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE,IDC_REQUEST_TABS);SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(30)));SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(12),px(4)));SetWindowSubclass(gRequestTabs,requestTabsProc,3,0);
     gRequestTabScroll=child(L"SCROLLBAR",L"",SBS_HORZ,IDC_REQUEST_TAB_SCROLL);SetWindowSubclass(gRequestTabScroll,requestTabScrollProc,8,0);ShowWindow(gRequestTabScroll,SW_HIDE);
     gMethod=child(L"BUTTON",L"GET",BS_OWNERDRAW,IDC_METHOD);
@@ -966,7 +995,8 @@ void layout(int width,int height) {
     int sidebar=std::clamp(gData.sidebarWidth,180,std::min(420,width-660));int workspaceX=sidebar;int workspaceW=width-workspaceX;
     constexpr int contentInset=10;int contentX=workspaceX+contentInset;int contentW=workspaceW-contentInset*2;
     move(gSearch,12,12,sidebar-64,32);if(!gResizeSidebar)updateSearchFormatting();move(gAddFolder,sidebar-44,12,32,32);move(gSidebarDivider,0,55,sidebar,1);move(gTree,8,64,sidebar-16,height-72);
-    move(gRequestTabs,contentX,0,contentW,48);move(gRequestTabScroll,contentX,35,contentW,10);
+    gRequestTabViewportX=px(contentX);gRequestTabViewportWidth=px(contentW);
+    move(gRequestTabs,contentX-dip(gRequestTabScrollOffset),0,std::max(contentW,dip(gRequestTabContentWidth)),35);move(gRequestTabScroll,contentX,35,contentW,10);
     constexpr int requestRowTop=57;constexpr int rowHeight=30;constexpr int commandGap=8;constexpr int saveWidth=72;constexpr int saveMoreWidth=28;constexpr int sendWidth=82;
     int sendX=contentX+contentW-sendWidth;int saveMoreX=sendX-commandGap-saveMoreWidth;int saveX=saveMoreX-saveWidth;int urlX=contentX+112;int urlWidth=saveX-commandGap-urlX;
     move(gMethod,contentX,requestRowTop,104,rowHeight);move(gUrlFrame,urlX,requestRowTop,urlWidth,rowHeight);move(gUrl,urlX+10,requestRowTop+2,urlWidth-20,rowHeight-4);
@@ -1128,7 +1158,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
                 else if(ref&&ref->kind==NodeRef::Kind::Case)openRequest(ref->ownerRequest,(ApiRequestCase*)ref->value);
             }return 0;
         }
-        if(header->idFrom==IDC_REQUEST_TABS&&header->code==TCN_SELCHANGE){saveEditor();for(int& row:gSelectedEntryRows)row=-1;gSelectedTab=TabCtrl_GetCurSel(gRequestTabs);loadEditor();selectTreeTab(selectedTab());PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);return 0;}
+        if(header->idFrom==IDC_REQUEST_TABS&&header->code==TCN_SELCHANGE){saveEditor();for(int& row:gSelectedEntryRows)row=-1;gSelectedTab=TabCtrl_GetCurSel(gRequestTabs);gEnsureSelectedRequestTabVisible=true;loadEditor();selectTreeTab(selectedTab());PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);return 0;}
         // Closing is intercepted before the tab control changes selection.
         if(header->idFrom==IDC_EDITOR_TABS&&header->code==TCN_SELCHANGE){saveEditor();gEditorPage=TabCtrl_GetCurSel(gEditorTabs);showEditorPage();return 0;}
         if(header->idFrom==IDC_RESPONSE_TABS&&header->code==TCN_SELCHANGE){gResponsePage=TabCtrl_GetCurSel(gResponseTabs);showResponsePage();return 0;}
