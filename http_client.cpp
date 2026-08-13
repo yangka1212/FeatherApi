@@ -79,9 +79,15 @@ bool isJsonContentType(string contentType) {
     return subtype=="json"||(subtype.size()>5&&subtype.compare(subtype.size()-5,5,"+json")==0);
 }
 
+string windowsLineEndings(const string& value) {
+    string result;result.reserve(value.size()+value.size()/8);
+    for(size_t i=0;i<value.size();++i){if(value[i]=='\n'&&(i==0||value[i-1]!='\r'))result+='\r';result+=value[i];}
+    return result;
+}
+
 string formatResponseBody(const string& body,const std::vector<KeyValueEntry>& headers) {
     if(body.empty())return {};
-    return isJsonContentType(headerValue(headers,"Content-Type"))?prettyJson(body):body;
+    return isJsonContentType(headerValue(headers,"Content-Type"))?windowsLineEndings(prettyJson(body)):body;
 }
 
 wstring decodeBody(const string& bytes,const std::vector<KeyValueEntry>& headers) {
@@ -223,7 +229,7 @@ HttpResult executeHttp(const RequestSnapshot& input,std::atomic<bool>& cancel,st
         char buffer[8192];DWORD read=0;
         while(!cancel) {
             if(!WinHttpReadData(request,buffer,sizeof(buffer),&read)){ok=FALSE;break;}
-            if(!read)break;size_t remaining=20*1024*1024-result.rawBody.size();if(!remaining){result.truncated=true;break;}size_t take=std::min<size_t>(read,remaining);result.rawBody.append(buffer,take);if(take<read){result.truncated=true;break;}
+            if(!read)break;size_t remaining=5*1024*1024-result.rawBody.size();if(!remaining){result.truncated=true;break;}size_t take=std::min<size_t>(read,remaining);result.rawBody.append(buffer,take);if(take<read){result.truncated=true;break;}
         }
     }
     result.cancelled=cancel.load();
@@ -237,7 +243,7 @@ HttpResult executeHttp(const RequestSnapshot& input,std::atomic<bool>& cancel,st
         result.sizeBytes=result.rawBody.size();string contentLength=headerValue(result.headers,"Content-Length");if(!contentLength.empty())try{result.sizeBytes=(size_t)std::stoull(trimAscii(contentLength));}catch(const std::exception&){}
         result.rawBody=toUtf8(decodeBody(result.rawBody,result.headers));
         result.prettyBody=result.rawBody.size()<=2*1024*1024?formatResponseBody(result.rawBody,result.headers):result.rawBody;
-        if(result.truncated)result.prettyBody+="\r\n\r\n[响应超过 20 MB，内容已截断]";
+        if(result.truncated)result.prettyBody+="\r\n\r\n[响应超过 5 MB，内容已截断]";
     }
     result.durationMs=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
     if(activeRequest){HINTERNET owned=activeRequest->exchange(nullptr);if(owned)WinHttpCloseHandle(owned);}

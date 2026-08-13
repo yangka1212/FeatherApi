@@ -249,7 +249,7 @@ int main() {
         check(loopback.request.find("one")!=std::string::npos&&loopback.request.find("two")!=std::string::npos,"HTTP preserves multiple values for a request header");
         const bool hasPayload=loopback.request.size()>=7&&loopback.request.compare(loopback.request.size()-7,7,"payload")==0;
         check(loopback.request.find("Content-Type: text/plain; charset=utf-8")!=std::string::npos&&hasPayload,"HTTP sends Raw body like WPF");
-        check(liveResult.rawBody==R"({"ok":true})"&&liveResult.prettyBody.find('\n')!=std::string::npos&&liveResult.sizeBytes==11&&responseHeader,"HTTP reads status, headers, size and formatted JSON body");
+        check(liveResult.rawBody==R"({"ok":true})"&&liveResult.prettyBody.find("\r\n")!=std::string::npos&&liveResult.sizeBytes==11&&responseHeader,"HTTP reads status, headers, size and Windows-formatted JSON body");
         check(orderedHeaders==std::vector<std::string>({"first","second"}),"HTTP preserves repeated response header order like WPF");
         closesocket(loopback.listener);loopback.listener=INVALID_SOCKET;
     }
@@ -264,10 +264,10 @@ int main() {
     if(plainJson.port!=0){RequestSnapshot request;request.method="GET";request.url="http://127.0.0.1:"+std::to_string(plainJson.port)+"/plain";auto result=executeHttp(request,cancel);if(plainJson.worker.joinable())plainJson.worker.join();
         check(result.transportSuccess&&result.prettyBody==plainJson.responseBody,"HTTP does not format JSON-looking text without a JSON Content-Type");closesocket(plainJson.listener);plainJson.listener=INVALID_SOCKET;}
 
-    LoopbackExchange oversized;oversized.responseBody.assign(20*1024*1024+1,'x');oversized.responseHeaders.clear();
+    LoopbackExchange oversized;oversized.responseBody.assign(5*1024*1024+1,'x');oversized.responseHeaders.clear();
     check(winsockReady&&oversized.start(),"HTTP oversized-response loopback starts");
     if(oversized.port!=0){RequestSnapshot large;large.method="GET";large.url="http://127.0.0.1:"+std::to_string(oversized.port)+"/large";auto largeResult=executeHttp(large,cancel);if(oversized.worker.joinable())oversized.worker.join();
-        check(largeResult.transportSuccess&&largeResult.truncated&&largeResult.rawBody.size()==20*1024*1024&&largeResult.prettyBody.find("[响应超过 20 MB，内容已截断]")!=std::string::npos,"HTTP marks a response truncated when data continues past the exact 20 MB boundary");closesocket(oversized.listener);oversized.listener=INVALID_SOCKET;}
+        check(largeResult.transportSuccess&&largeResult.truncated&&largeResult.rawBody.size()==5*1024*1024&&largeResult.prettyBody.find("[响应超过 5 MB，内容已截断]")!=std::string::npos,"HTTP marks a response truncated when data continues past the exact 5 MB boundary");closesocket(oversized.listener);oversized.listener=INVALID_SOCKET;}
 
     if(winsockReady)WSACleanup();
     CoUninitialize();
