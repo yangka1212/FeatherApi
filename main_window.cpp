@@ -30,7 +30,8 @@ enum : int {
     IDC_PROMPT_EDIT=900,IDC_URL_FRAME,
     IDM_FOLDER_ADD_REQUEST=1000,IDM_FOLDER_ADD_CHILD,IDM_FOLDER_IMPORT,IDM_FOLDER_RENAME,IDM_FOLDER_DELETE,
     IDM_REQUEST_OPEN,IDM_REQUEST_RENAME,IDM_REQUEST_DUPLICATE,IDM_REQUEST_MOVE,IDM_REQUEST_DELETE,
-    IDM_SAVE_CASE,IDM_CASE_DELETE
+    IDM_SAVE_CASE,IDM_CASE_DELETE,
+    IDM_TAB_CLOSE_ALL,IDM_TAB_CLOSE_OTHERS,IDM_TAB_CLOSE_LEFT,IDM_TAB_CLOSE_RIGHT
 };
 constexpr UINT WM_HTTP_DONE=WM_APP+1;
 constexpr UINT WM_SEARCH_REFRESH=WM_APP+2;
@@ -89,7 +90,6 @@ std::thread gImportWorker;
 std::atomic<HINTERNET> gImportRequest=nullptr;
 bool gSelectingTree=false;
 bool gRebuildingTree=false;
-bool gSearchExpandedFolder=false;
 bool gDraggingRequestTabScroll=false;
 int gRequestTabScrollDragOffset=0;
 int gRequestTabScrollOffset=0,gRequestTabContentWidth=0,gRequestTabViewportX=0,gRequestTabViewportWidth=0;
@@ -104,6 +104,7 @@ std::unordered_set<string> gExpandedRequests;
 
 void commitCellEditor(bool save=true);
 void closeTab(int index);
+void closeTabRange(int contextIndex,int command);
 void layout(int width,int height);
 void findInResponseBody(bool forward);
 void showResponseFind(bool visible);
@@ -354,7 +355,6 @@ bool folderMatches(const ApiFolder& folder,const wstring& query) {
 }
 void insertFolder(ApiFolder& folder,HTREEITEM parent,const wstring& query,bool parentMatches=false) {
     bool ownMatch=parentMatches||query.empty()||containsText(folder.name,query);if(!ownMatch&&!folderMatches(folder,query))return;
-    if(!query.empty()&&!folder.expanded){folder.expanded=true;gSearchExpandedFolder=true;}
     wstring label=toWide(folder.name);
     HTREEITEM item=insertTreeItem(parent,label,NodeRef::Kind::Folder,&folder,&folder,nullptr);
     for(auto& child:folder.children)insertFolder(*child,item,query,ownMatch);
@@ -365,9 +365,16 @@ void insertFolder(ApiFolder& folder,HTREEITEM parent,const wstring& query,bool p
         for(auto& c:request->cases)insertTreeItem(requestItem,toWide(c->name),NodeRef::Kind::Case,c.get(),&folder,request.get());
         if(gExpandedRequests.find(request->id)!=gExpandedRequests.end())TreeView_Expand(gTree,requestItem,TVE_EXPAND);
     }
-    if(folder.expanded||!query.empty())TreeView_Expand(gTree,item,TVE_EXPAND);
+    if(folder.expanded)TreeView_Expand(gTree,item,TVE_EXPAND);
 }
-void syncFolderExpansionState() {
+bool treeItemIsRevealed(HTREEITEM item) {
+    for(HTREEITEM parent=TreeView_GetParent(gTree,item);parent;parent=TreeView_GetParent(gTree,parent)){
+        TVITEMW info{};info.hItem=parent;info.mask=TVIF_STATE;info.stateMask=TVIS_EXPANDED;TreeView_GetItem(gTree,&info);
+        if((info.state&TVIS_EXPANDED)==0)return false;
+    }
+    return true;
+}
+void syncVisibleFolderExpansionState() {
     if(!gTree)return;
     std::function<void(HTREEITEM)> sync=[&](HTREEITEM parent){
         for(HTREEITEM item=TreeView_GetChild(gTree,parent);item;item=TreeView_GetNextSibling(gTree,item)){
@@ -384,7 +391,7 @@ void syncFolderExpansionState() {
 void rebuildTree() {
     NodeRef::Kind preserveKind=NodeRef::Kind::Folder;void* preserveValue=nullptr;
     if(gTreeSelection){preserveKind=gTreeSelection->kind;preserveValue=gTreeSelection->value;}
-    gRebuildingTree=true;gSearchExpandedFolder=false;
+    gRebuildingTree=true;
     gTreeSelection=nullptr;TreeView_DeleteAllItems(gTree);gNodeRefs.clear();wstring query=trimWide(textOf(gSearch));
     for(auto& folder:gData.folders)insertFolder(*folder,TVI_ROOT,query,false);
     if(preserveValue){
@@ -395,10 +402,9 @@ void rebuildTree() {
                 if(auto found=find(item))return found;
             }return (HTREEITEM)nullptr;
         };
-        if(auto found=find(TVI_ROOT)){TreeView_SelectItem(gTree,found);TreeView_EnsureVisible(gTree,found);}
+        if(auto found=find(TVI_ROOT);found&&treeItemIsRevealed(found)){TreeView_SelectItem(gTree,found);TreeView_EnsureVisible(gTree,found);}
     }
     gRebuildingTree=false;
-    if(gSearchExpandedFolder)setSaveStatus(L"未保存");
 }
 
 HTREEITEM findTreeRequest(ApiRequest* request) {
@@ -420,10 +426,10 @@ HTREEITEM findTreeValue(NodeRef::Kind kind,void* value) {
     };return find(TVI_ROOT);
 }
 void selectTreeValue(NodeRef::Kind kind,void* value) {
-    if(auto item=findTreeValue(kind,value)){gSelectingTree=true;TreeView_SelectItem(gTree,item);TreeView_EnsureVisible(gTree,item);gSelectingTree=false;}
+    if(auto item=findTreeValue(kind,value);item&&treeItemIsRevealed(item)){gSelectingTree=true;TreeView_SelectItem(gTree,item);TreeView_EnsureVisible(gTree,item);gSelectingTree=false;}
 }
 void selectTreeRequest(ApiRequest* request) {
-    if(!request)return;if(auto item=findTreeRequest(request)){gSelectingTree=true;TreeView_SelectItem(gTree,item);TreeView_EnsureVisible(gTree,item);gSelectingTree=false;}
+    if(!request)return;if(auto item=findTreeRequest(request);item&&treeItemIsRevealed(item)){gSelectingTree=true;TreeView_SelectItem(gTree,item);TreeView_EnsureVisible(gTree,item);gSelectingTree=false;}
 }
 void selectTreeTab(const std::shared_ptr<TabState>& tab) {
     if(!tab)return;if(tab->requestCase)selectTreeValue(NodeRef::Kind::Case,tab->requestCase);else selectTreeRequest(tab->request);
@@ -632,6 +638,22 @@ LRESULT CALLBACK requestTabsProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,
         TCHITTESTINFO hit{};hit.pt={(short)LOWORD(l),(short)HIWORD(l)};int index=TabCtrl_HitTest(h,&hit);
         if(index>=0){RECT tabRect{};TabCtrl_GetItemRect(h,index,&tabRect);if(hit.pt.x>=tabRect.right-px(28)){closeTab(index);return 0;}}
     }
+    if(message==WM_CONTEXTMENU){
+        POINT screen{(short)LOWORD(l),(short)HIWORD(l)},client=screen;
+        int index=gSelectedTab;
+        if(screen.x==-1&&screen.y==-1){
+            if(index<0)return 0;RECT tab{};TabCtrl_GetItemRect(h,index,&tab);client={tab.left,tab.bottom};screen=client;ClientToScreen(h,&screen);
+        }else{
+            ScreenToClient(h,&client);TCHITTESTINFO hit{};hit.pt=client;index=TabCtrl_HitTest(h,&hit);if(index<0)return 0;
+        }
+        HMENU menu=CreatePopupMenu();int count=(int)gTabs.size();
+        AppendMenuW(menu,MF_STRING,IDM_TAB_CLOSE_ALL,L"关闭全部");
+        AppendMenuW(menu,count>1?MF_STRING:MF_GRAYED,IDM_TAB_CLOSE_OTHERS,L"关闭其他");
+        AppendMenuW(menu,index>0?MF_STRING:MF_GRAYED,IDM_TAB_CLOSE_LEFT,L"关闭左侧");
+        AppendMenuW(menu,index+1<count?MF_STRING:MF_GRAYED,IDM_TAB_CLOSE_RIGHT,L"关闭右侧");
+        int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,screen.x,screen.y,0,gWindow,nullptr);DestroyMenu(menu);
+        if(command)closeTabRange(index,command);return 0;
+    }
     return DefSubclassProc(h,message,w,l);
 }
 
@@ -672,7 +694,7 @@ void saveEditor(bool updateBodyType=true) {
     if(previousMethod!=r.method)refreshRequestTabs();
 }
 bool saveNow(bool feedback=false) {
-    if(gCellEditor)commitCellEditor();saveEditor();syncFolderExpansionState();if(saveAppData(gData)){setSaveStatus(L"已保存");if(feedback)showSaveFeedback(true);return true;}setSaveStatus(L"保存失败");if(feedback)showSaveFeedback(false);if(auto tab=selectedTab()){tab->validation=L"保存失败：无法写入本地数据文件。";setValidationText(tab->validation);}return false;
+    if(gCellEditor)commitCellEditor();saveEditor();syncVisibleFolderExpansionState();if(saveAppData(gData)){setSaveStatus(L"已保存");if(feedback)showSaveFeedback(true);return true;}setSaveStatus(L"保存失败");if(feedback)showSaveFeedback(false);if(auto tab=selectedTab()){tab->validation=L"保存失败：无法写入本地数据文件。";setValidationText(tab->validation);}return false;
 }
 void scheduleSave() {
     auto tab=selectedTab();if(!tab||!tab->requestCase)setSaveStatus(L"未保存");
@@ -720,15 +742,35 @@ void closeTab(int index) {
     gTabs[(size_t)index]->cancelNow();gTabs.erase(gTabs.begin()+index);gSelectedTab=nextSelection;
     refreshRequestTabs();loadEditor();selectTreeTab(selectedTab());
 }
+void closeTabRange(int contextIndex,int command) {
+    if(contextIndex<0||contextIndex>=(int)gTabs.size())return;
+    saveEditor();auto contextTab=gTabs[(size_t)contextIndex];
+    auto shouldClose=[&](int index){
+        switch(command){
+        case IDM_TAB_CLOSE_ALL:return true;
+        case IDM_TAB_CLOSE_OTHERS:return index!=contextIndex;
+        case IDM_TAB_CLOSE_LEFT:return index<contextIndex;
+        case IDM_TAB_CLOSE_RIGHT:return index>contextIndex;
+        default:return false;
+        }
+    };
+    bool changed=false;for(int index=0;index<(int)gTabs.size();++index)if(shouldClose(index)){gTabs[(size_t)index]->cancelNow();changed=true;}
+    if(!changed)return;
+    for(int index=(int)gTabs.size()-1;index>=0;--index)if(shouldClose(index))gTabs.erase(gTabs.begin()+index);
+    for(int& row:gSelectedEntryRows)row=-1;
+    if(command==IDM_TAB_CLOSE_ALL)gSelectedTab=-1;
+    else {auto found=std::find(gTabs.begin(),gTabs.end(),contextTab);gSelectedTab=found==gTabs.end()?-1:(int)std::distance(gTabs.begin(),found);}
+    refreshRequestTabs();loadEditor();selectTreeTab(selectedTab());
+}
 
 void addFolder(ApiFolder* parent) {
     wstring name;if(!prompt(parent?L"新增子目录":L"新增目录",L"请输入目录名称：",L"新目录",name))return;
-    auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name=toUtf8(name);ApiFolder* pointer=folder.get();if(parent){parent->children.push_back(std::move(folder));parent->expanded=true;}else gData.folders.push_back(std::move(folder));gSelectedFolder=pointer;rebuildTree();selectTreeValue(NodeRef::Kind::Folder,pointer);setSaveStatus(L"未保存");
+    auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name=toUtf8(name);ApiFolder* pointer=folder.get();if(parent)parent->children.push_back(std::move(folder));else gData.folders.push_back(std::move(folder));gSelectedFolder=pointer;rebuildTree();selectTreeValue(NodeRef::Kind::Folder,pointer);setSaveStatus(L"未保存");
 }
 void addRequest(ApiFolder* folder) {
     if(!folder){if(gData.folders.empty()){auto f=std::make_unique<ApiFolder>();f->id=newId();f->name="默认目录";gData.folders.push_back(std::move(f));}folder=gData.folders.front().get();}
     wstring name;if(!prompt(L"新增接口",L"请输入接口名称：",L"新接口",name))return;
-    auto request=std::make_unique<ApiRequest>();request->id=newId();request->name=toUtf8(name);ApiRequest* pointer=request.get();folder->requests.push_back(std::move(request));folder->expanded=true;rebuildTree();openRequest(pointer);setSaveStatus(L"未保存");
+    auto request=std::make_unique<ApiRequest>();request->id=newId();request->name=toUtf8(name);ApiRequest* pointer=request.get();folder->requests.push_back(std::move(request));rebuildTree();openRequest(pointer);setSaveStatus(L"未保存");
 }
 void renameFolder(ApiFolder* folder) {
     if(!folder)return;wstring result;
@@ -791,13 +833,13 @@ void moveRequest(ApiRequest* request) {
         for(auto& child:f.children)collect(*child);
     };for(auto& f:gData.folders)collect(*f);
     ApiFolder* target=nullptr;if(!pickFolder(choices,target))return;
-    std::unique_ptr<ApiRequest> moving;for(auto it=source->requests.begin();it!=source->requests.end();++it)if(it->get()==request){moving=std::move(*it);source->requests.erase(it);break;}target->requests.push_back(std::move(moving));target->expanded=true;gSelectedFolder=target;rebuildTree();openRequest(request);setSaveStatus(L"未保存");
+    std::unique_ptr<ApiRequest> moving;for(auto it=source->requests.begin();it!=source->requests.end();++it)if(it->get()==request){moving=std::move(*it);source->requests.erase(it);break;}target->requests.push_back(std::move(moving));gSelectedFolder=target;rebuildTree();openRequest(request);setSaveStatus(L"未保存");
 }
 void moveRequestDirect(ApiRequest* request,ApiFolder* target) {
     ApiFolder* source=findFolderForRequest(request);if(!source||!target||source==target)return;
     std::unique_ptr<ApiRequest> moving;
     for(auto it=source->requests.begin();it!=source->requests.end();++it)if(it->get()==request){moving=std::move(*it);source->requests.erase(it);break;}
-    if(!moving)return;target->requests.push_back(std::move(moving));target->expanded=true;gSelectedFolder=target;rebuildTree();openRequest(request);setSaveStatus(L"未保存");
+    if(!moving)return;target->requests.push_back(std::move(moving));gSelectedFolder=target;rebuildTree();openRequest(request);setSaveStatus(L"未保存");
 }
 
 void showTreeMenu(POINT point) {
@@ -1252,7 +1294,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         }
         if(header->idFrom==IDC_TREE&&header->code==TVN_ITEMEXPANDEDW){
             auto info=(NMTREEVIEWW*)l;auto ref=(NodeRef*)info->itemNew.lParam;
-            if(ref&&ref->kind==NodeRef::Kind::Folder&&!gRebuildingTree){((ApiFolder*)ref->value)->expanded=info->action==TVE_EXPAND;markCatalogUnsaved();}
+            if(ref&&ref->kind==NodeRef::Kind::Folder&&!gRebuildingTree&&!gSelectingTree){((ApiFolder*)ref->value)->expanded=info->action==TVE_EXPAND;saveNow();}
             else if(ref&&ref->kind==NodeRef::Kind::Request){auto request=(ApiRequest*)ref->value;if(info->action==TVE_EXPAND)gExpandedRequests.insert(request->id);else gExpandedRequests.erase(request->id);}
             return 0;
         }

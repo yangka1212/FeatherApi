@@ -170,7 +170,7 @@ std::unique_ptr<ApiRequest> readRequest(const Json& json) {
 }
 
 std::unique_ptr<ApiFolder> readFolder(const Json& json) {
-    auto f=std::make_unique<ApiFolder>();f->id=normalizedId(getStoredText(json,"Id"));f->name=normalizedName(getStoredText(json,"Name"),"未命名目录");f->expanded=getStoredBool(json,"IsExpanded",true);
+    auto f=std::make_unique<ApiFolder>();f->id=normalizedId(getStoredText(json,"Id"));f->name=normalizedName(getStoredText(json,"Name"),"未命名目录");f->expanded=getStoredBool(json,"IsExpanded",false);
     if(auto children=json.getInsensitive("Children");children&&children->array())for(const auto& child:*children->array())f->children.push_back(readFolder(child));
     if(auto requests=json.getInsensitive("Requests");requests&&requests->array())for(const auto& request:*requests->array())f->requests.push_back(readRequest(request));return f;
 }
@@ -356,11 +356,10 @@ bool importOpenApiJson(ApiFolder& target,const string& document,bool overwrite,O
                 if(conflict&&!overwrite){++summary.skipped;continue;}auto imported=buildRequest();
                 if(conflict){conflict->name=imported->name;conflict->method=imported->method;conflict->url=imported->url;conflict->query=std::move(imported->query);conflict->headers=std::move(imported->headers);conflict->bodyType=imported->bodyType;conflict->body=imported->body;conflict->formFields=std::move(imported->formFields);++summary.overwritten;}
                 else{folder->requests.push_back(std::move(imported));++summary.added;}
-                folder->expanded=true;
             }
         }
     }
-    if(summary.added+summary.overwritten+summary.skipped>0)target.expanded=true;return true;
+    return true;
 }
 
 bool isValidJson(const string& value) {

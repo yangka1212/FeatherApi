@@ -60,7 +60,7 @@ struct ApiRequest {
 struct ApiFolder {
     std::string id;
     std::string name = "新目录";
-    bool expanded = true;
+    bool expanded = false;
     std::vector<std::unique_ptr<ApiFolder>> children;
     std::vector<std::unique_ptr<ApiRequest>> requests;
 };
