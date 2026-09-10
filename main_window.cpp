@@ -3,6 +3,7 @@
 
 #include <commctrl.h>
 #include <commdlg.h>
+#include <richedit.h>
 #include <shlwapi.h>
 #include <algorithm>
 #include <chrono>
@@ -62,6 +63,7 @@ struct FolderChoice { ApiFolder* folder=nullptr;std::wstring label; };
 struct FolderPickerContext { const std::vector<FolderChoice>* choices=nullptr;ApiFolder* selected=nullptr;bool accepted=false; };
 
 HINSTANCE gInstance{};
+HMODULE gRichEditModule{};
 HWND gWindow{},gSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gRequestTabScroll{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
 HWND gEditorTabs{},gKvList{},gBodyType{},gFormat{},gCompress{},gBody{},gValidation{};
 HWND gSummary{},gResponseTabs{},gResponseBody{},gResponseHeaders{},gResponseFindPanel{},gResponseFindEdit{},gResponseFindPrev{},gResponseFindNext{},gResponseFindClose{},gBodyNone{},gEmptyTitle{},gEmptyHelp{};
@@ -1091,7 +1093,10 @@ void createControls() {
     gRequestTabScroll=child(L"SCROLLBAR",L"",SBS_HORZ,IDC_REQUEST_TAB_SCROLL);SetWindowSubclass(gRequestTabScroll,requestTabScrollProc,8,0);ShowWindow(gRequestTabScroll,SW_HIDE);
     gMethod=child(L"BUTTON",L"GET",BS_OWNERDRAW,IDC_METHOD);
     gUrlFrame=child(L"STATIC",L"",SS_OWNERDRAW,IDC_URL_FRAME);
-    gUrl=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOHSCROLL,IDC_URL);applyFont(gUrl,gCodeFont);SendMessageW(gUrl,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(0,0));SetWindowSubclass(gUrl,urlProc,6,0);
+    const wchar_t* urlClass=gRichEditModule?MSFTEDIT_CLASS:L"EDIT";
+    gUrl=child(urlClass,L"",ES_MULTILINE|ES_AUTOHSCROLL,IDC_URL);
+    if(gRichEditModule)SendMessageW(gUrl,EM_SETTEXTMODE,TM_PLAINTEXT|TM_MULTILEVELUNDO,0);
+    applyFont(gUrl,gCodeFont);SendMessageW(gUrl,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(0,0));SetWindowSubclass(gUrl,urlProc,6,0);
     gSave=child(L"BUTTON",L"保存",BS_OWNERDRAW,IDC_SAVE);gSaveMore=child(L"BUTTON",L"▾",BS_OWNERDRAW,IDC_SAVE_MORE);
     gSaveTooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,gWindow,nullptr,gInstance,nullptr);
     TOOLINFOW saveTool{sizeof(saveTool)};saveTool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;saveTool.hwnd=gWindow;saveTool.uId=(UINT_PTR)gSave;saveTool.lpszText=(LPWSTR)gSaveStatus.c_str();SendMessageW(gSaveTooltip,TTM_ADDTOOLW,0,(LPARAM)&saveTool);
@@ -1201,6 +1206,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     switch(message) {
     case WM_CREATE: {
         gWindow=h;INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_TREEVIEW_CLASSES|ICC_TAB_CLASSES|ICC_LISTVIEW_CLASSES};InitCommonControlsEx(&controls);
+        gRichEditModule=LoadLibraryW(L"Msftedit.dll");
         gDpi=GetDpiForWindow(h);recreateFonts();
         gSidebarBrush=CreateSolidBrush(COLOR_SIDEBAR);gWhiteBrush=CreateSolidBrush(RGB(255,255,255));gAccentBrush=CreateSolidBrush(COLOR_ACCENT);gSelectedBrush=CreateSolidBrush(COLOR_SELECTED);gHoverBrush=CreateSolidBrush(COLOR_HOVER);gBorderBrush=CreateSolidBrush(COLOR_BORDER);createControls();
         TreeView_SetBkColor(gTree,COLOR_SIDEBAR);TreeView_SetTextColor(gTree,COLOR_PRIMARY);TreeView_SetLineColor(gTree,COLOR_BORDER);TreeView_SetItemHeight(gTree,px(30));
@@ -1377,7 +1383,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         MessageBoxW(gWindow,result.c_str(),L"导入 OpenAPI/Swagger",MB_OK|MB_ICONINFORMATION);return 0;
     }
     case WM_CLOSE:gImportCancel=true;{HINTERNET handle=gImportRequest.exchange(nullptr);if(handle)WinHttpCloseHandle(handle);}if(gImportWorker.joinable())gImportWorker.join();for(auto& tab:gTabs)tab->cancelNow();for(auto& tab:gTabs)if(tab->worker.joinable())tab->worker.join();saveNow();DestroyWindow(h);return 0;
-    case WM_DESTROY:DeleteObject(gUiFont);DeleteObject(gCodeFont);DeleteObject(gTitleFont);DeleteObject(gTreeFolderFont);DeleteObject(gTreeMethodFont);DeleteObject(gSidebarBrush);DeleteObject(gWhiteBrush);DeleteObject(gAccentBrush);DeleteObject(gSelectedBrush);DeleteObject(gHoverBrush);DeleteObject(gBorderBrush);PostQuitMessage(0);return 0;
+    case WM_DESTROY:DeleteObject(gUiFont);DeleteObject(gCodeFont);DeleteObject(gTitleFont);DeleteObject(gTreeFolderFont);DeleteObject(gTreeMethodFont);DeleteObject(gSidebarBrush);DeleteObject(gWhiteBrush);DeleteObject(gAccentBrush);DeleteObject(gSelectedBrush);DeleteObject(gHoverBrush);DeleteObject(gBorderBrush);if(gRichEditModule){FreeLibrary(gRichEditModule);gRichEditModule=nullptr;}PostQuitMessage(0);return 0;
     }return DefWindowProcW(h,message,w,l);
 }
 }
