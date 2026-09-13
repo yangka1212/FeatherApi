@@ -1,5 +1,7 @@
 #include <winsock2.h>
 #include "app.h"
+#include "ui_helpers.h"
+#include "interaction_state.h"
 #include <objbase.h>
 
 #include <algorithm>
@@ -7,8 +9,10 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <chrono>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "comctl32.lib")
 
 namespace {
 int failures=0;
@@ -25,6 +29,9 @@ struct LoopbackExchange {
     std::string responseContentType="application/json; charset=utf-8";
     std::string responseHeaders="X-FeatherApi-Test: loopback\r\nX-Order: first\r\nX-Order: second\r\n";
     bool served=false;
+    std::string status="201 Created";
+    int delayMs=0;
+    std::atomic<bool> received=false;
     std::thread worker;
 
     bool start() {
@@ -44,7 +51,8 @@ struct LoopbackExchange {
                     if(request.size()>=expected)break;
                 }
             }
-            const std::string response="HTTP/1.1 201 Created\r\nContent-Type: "+responseContentType+"\r\nContent-Length: "+std::to_string(responseBody.size())+"\r\n"+responseHeaders+"Connection: close\r\n\r\n"+responseBody;
+            received=true;if(delayMs)std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            const std::string response="HTTP/1.1 "+status+"\r\nContent-Type: "+responseContentType+"\r\nContent-Length: "+std::to_string(responseBody.size())+"\r\n"+responseHeaders+"Connection: close\r\n\r\n"+responseBody;
             size_t sent=0;while(sent<response.size()){int count=send(client,response.data()+sent,(int)(response.size()-sent),0);if(count<=0)break;sent+=(size_t)count;}
             served=sent==response.size();shutdown(client,SD_BOTH);closesocket(client);
         });return true;
@@ -56,6 +64,21 @@ struct LoopbackExchange {
 int main() {
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     WSADATA winsock{};const bool winsockReady=WSAStartup(MAKEWORD(2,2),&winsock)==0;
+
+    INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_LISTVIEW_CLASSES};
+    check(InitCommonControlsEx(&controls)!=FALSE,"list controls initialize");
+    HWND list=CreateWindowExW(0,WC_LISTVIEWW,L"",LVS_REPORT,0,0,100,100,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    check(list!=nullptr,"hidden list control creates");
+    const std::wstring longField=std::wstring(12000,L'x')+L"中文尾部";
+    std::string longHeader;
+    if(list){
+        LVCOLUMNW column{};column.mask=LVCF_WIDTH;column.cx=100;ListView_InsertColumn(list,0,&column);
+        LVITEMW item{};item.mask=LVIF_TEXT;item.pszText=const_cast<wchar_t*>(longField.c_str());ListView_InsertItem(list,&item);
+        check(listCellText(list,0,0)==longField,"list reads long Unicode values without truncation");
+        ListView_SetItemText(list,0,0,const_cast<wchar_t*>(L""));check(listCellText(list,0,0).empty(),"list reads empty values");
+        std::wstring token(12000,L'a');token+=L"-tail";ListView_SetItemText(list,0,0,token.data());
+        longHeader=toUtf8(listCellText(list,0,0));DestroyWindow(list);
+    }
 
     ApiRequest original;
     original.id=newId();original.name="用户详情";original.method="POST";original.url="https://example.test/users";
@@ -70,6 +93,14 @@ int main() {
     check(copy->query.size()==1&&copy->query[0].value=="张三","clone preserves Unicode params");
     check(copy->cases.size()==1&&copy->cases[0]->id!=original.cases[0]->id,"clone gives cases new ids");
     check(copy->query[0].type=="string"&&copy->query[0].description=="user name","clone preserves parameter metadata");
+    auto baseline=RequestContent::from(original);auto restored=cloneRequest(original);baseline.apply(*restored);
+    check(baseline==RequestContent::from(*restored)&&restored->id!=original.id,"editing baseline restores content without changing identity");
+    restored->headers[0].enabled=false;check(!(baseline==RequestContent::from(*restored)),"dirty comparison includes enabled flags");
+    baseline.apply(*restored);restored->query[0].description="changed";check(!(baseline==RequestContent::from(*restored)),"dirty comparison includes metadata");
+    check(nextEntryCell(0,4,2,false).row==1&&nextEntryCell(1,1,2,true).column==4,"grid navigation crosses row boundaries");
+    check(nextEntryCell(0,1,2,true).row==-1&&nextEntryCell(1,4,2,false).row==-1,"grid navigation leaves at both boundaries");
+    check(ResponseMatches::find(L"中文 Foo foo",L"FOO").positions==std::vector<size_t>({3,7}),"response matching is Unicode-positioned and case-insensitive");
+    check(ResponseMatches::find(L"abc",L"").positions.empty()&&ResponseMatches::find(L"abc",L"z").positions.empty(),"empty and missing queries return no matches");
     check(tabSelectionAfterClose(2,0,4)==1,"closing a tab before the selection preserves the selected tab");
     check(tabSelectionAfterClose(1,3,4)==1,"closing a tab after the selection preserves the selected tab");
     check(tabSelectionAfterClose(1,1,4)==1,"closing the selected tab selects the tab now at its position");
@@ -86,10 +117,17 @@ int main() {
     auto dataPath=tempRoot/L"data.json";AppData stored;stored.sidebarWidth=275;stored.requestPanelHeight=360;
     auto storedFolder=std::make_unique<ApiFolder>();storedFolder->id=newId();storedFolder->name="测试目录";storedFolder->expanded=false;
     storedFolder->requests.push_back(cloneRequest(original));stored.folders.push_back(std::move(storedFolder));
+    stored.folders[0]->requests[0]->headers.push_back({true,"X-Long",toUtf8(longField)});
     check(saveAppDataToPath(stored,dataPath.wstring()),"storage saves to an explicit path");
     AppData loaded;check(loadAppDataFromPath(dataPath.wstring(),loaded),"storage loads from an explicit path");
     check(loaded.sidebarWidth==275&&loaded.requestPanelHeight==360,"storage preserves panel settings");
     check(loaded.folders.size()==1&&!loaded.folders[0]->expanded&&loaded.folders[0]->requests[0]->name=="用户详情 - 副本","storage round-trips nested request data");
+    check(loaded.folders[0]->requests[0]->headers.back().value==toUtf8(longField),"storage preserves long Unicode fields");
+    HANDLE locked=CreateFileW(dataPath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+    check(locked!=INVALID_HANDLE_VALUE,"storage target locks for failure test");
+    if(locked!=INVALID_HANDLE_VALUE){stored.sidebarWidth=310;check(!saveAppDataToPath(stored,dataPath.wstring()),"save reports replacement failure");CloseHandle(locked);
+        AppData preserved;check(loadAppDataFromPath(dataPath.wstring(),preserved)&&preserved.sidebarWidth==275,"failed save preserves previous data");
+        check(saveAppDataToPath(stored,dataPath.wstring()),"save retry succeeds after unlocking");}
     auto normalizedPath=tempRoot/L"normalized.json";{
         std::ofstream normalized(normalizedPath,std::ios::binary);normalized<<R"({"Settings":{"SidebarWidth":999,"RequestPanelHeight":10},"Folders":[{"Id":"","Name":"   ","Children":[],"Requests":[{"Id":"","Name":" ","Method":" post ","Cases":[]}]}]})";
     }
@@ -126,6 +164,13 @@ int main() {
     check(target.children[0]->requests[0]->query[1].type=="file","OpenAPI binary parameter imports as file");
     check(target.children[0]->requests[1]->bodyType=="JSON","OpenAPI JSON body imports");
     check(target.children[0]->requests[1]->body.find("\"name\"")!=std::string::npos,"OpenAPI schema creates JSON sample");
+    for(const std::string token: {"9007199254740993","18446744073709551615","0.1234567890123456789","1.234567890123456789e+123","1e400","-0"}) {
+        std::string document=R"({"openapi":"3.0.1","paths":{"/number":{"post":{"parameters":[{"in":"query","name":"n","schema":{"type":"number","default":)"+token+R"(}}],"requestBody":{"content":{"application/json":{"example":{"n":)"+token+R"(}}}}}}}})";
+        ApiFolder numbers;OpenApiImportSummary summary;
+        bool imported=importOpenApiJson(numbers,document,false,summary,error);
+        check(imported&&numbers.requests.size()==1,"numeric example imports");
+        if(imported&&numbers.requests.size()==1){check(numbers.requests[0]->body.find(token)!=std::string::npos,"JSON body preserves numeric spelling and precision");check(numbers.requests[0]->query.size()==1&&numbers.requests[0]->query[0].value==token,"parameter default preserves numeric precision");}
+    }
     const std::string multipart=R"({"openapi":"3.0.4","paths":{"/api/Reconciliation/import":{"post":{"summary":"导入账单","requestBody":{"content":{"multipart/form-data":{"schema":{"type":"object","properties":{"File":{"type":"string","format":"binary","description":"账单文件"},"SourceName":{"type":"string","description":"渠道名称"},"Cycle":{"type":"string","format":"date-time"},"OrderWeek":{"type":"integer","format":"int32"}}}}}}}}}})";
     ApiFolder multipartTarget;multipartTarget.id=newId();OpenApiImportSummary multipartSummary;
     check(importOpenApiJson(multipartTarget,multipart,false,multipartSummary,error),"OpenAPI multipart document imports");
@@ -239,10 +284,12 @@ int main() {
     check(winsockReady&&loopback.start(),"HTTP loopback server starts");
     if(loopback.port!=0){
         RequestSnapshot live;live.method="POST";live.url="http://127.0.0.1:"+std::to_string(loopback.port)+"/echo#client";live.query={{true,"q","a b"}};live.bodyType="Raw";live.body="payload";live.headers={{true,"X-Request-Test","native"},{true,"X-Multi","one"},{true,"X-Multi","two"}};
+        live.headers.push_back({true,"X-Long",longHeader});
         auto liveResult=executeHttp(live,cancel);
         if(loopback.worker.joinable())loopback.worker.join();
         const bool responseHeader=std::any_of(liveResult.headers.begin(),liveResult.headers.end(),[](const KeyValueEntry& header){return _stricmp(header.key.c_str(),"X-FeatherApi-Test")==0&&header.value=="loopback";});
         std::vector<std::string> orderedHeaders;for(const auto& header:liveResult.headers)if(_stricmp(header.key.c_str(),"X-Order")==0)orderedHeaders.push_back(header.value);
+        check(longHeader.size()>4096&&loopback.request.find("X-Long: "+longHeader+"\r\n")!=std::string::npos,"HTTP sends full long field read from control");
         check(loopback.served&&liveResult.transportSuccess&&liveResult.statusCode==201,"HTTP loopback request completes");
         check(loopback.request.find("POST /echo?q=a%20b HTTP/1.1")!=std::string::npos&&loopback.request.find("X-Request-Test: native")!=std::string::npos,"HTTP sends method, query and custom header");
         check(loopback.request.find("User-Agent:")==std::string::npos,"HTTP does not add a User-Agent when WPF would not");
@@ -268,6 +315,23 @@ int main() {
     check(winsockReady&&oversized.start(),"HTTP oversized-response loopback starts");
     if(oversized.port!=0){RequestSnapshot large;large.method="GET";large.url="http://127.0.0.1:"+std::to_string(oversized.port)+"/large";auto largeResult=executeHttp(large,cancel);if(oversized.worker.joinable())oversized.worker.join();
         check(largeResult.transportSuccess&&largeResult.truncated&&largeResult.rawBody.size()==5*1024*1024&&largeResult.prettyBody.find("[响应超过 5 MB，内容已截断]")!=std::string::npos,"HTTP marks a response truncated when data continues past the exact 5 MB boundary");closesocket(oversized.listener);oversized.listener=INVALID_SOCKET;}
+
+    LoopbackExchange errorResponse;errorResponse.status="500 Internal Server Error";errorResponse.responseBody=R"({"error":"test"})";
+    check(winsockReady&&errorResponse.start(),"HTTP error-response loopback starts");
+    if(errorResponse.port!=0){RequestSnapshot request;request.method="GET";request.url="http://127.0.0.1:"+std::to_string(errorResponse.port)+"/error";
+        auto result=executeHttp(request,cancel);if(errorResponse.worker.joinable())errorResponse.worker.join();
+        check(result.transportSuccess&&result.statusCode==500&&result.rawBody==errorResponse.responseBody,"HTTP 500 is a readable HTTP response, not a transport failure");closesocket(errorResponse.listener);errorResponse.listener=INVALID_SOCKET;}
+
+    LoopbackExchange slow;slow.delayMs=600;
+    check(winsockReady&&slow.start(),"HTTP delayed-response loopback starts");
+    if(slow.port!=0){RequestSnapshot request;request.method="GET";request.url="http://127.0.0.1:"+std::to_string(slow.port)+"/slow";
+        std::atomic<HINTERNET> active=nullptr;HttpResult result;
+        std::thread client([&](){result=executeHttp(request,cancel,&active);});
+        auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(!slow.received&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        cancel=true;HINTERNET handle=active.exchange(nullptr);if(handle)WinHttpCloseHandle(handle);client.join();cancel=false;
+        check(slow.received&&result.cancelled&&!result.transportSuccess,"cancellation interrupts a pending response");
+        if(slow.worker.joinable())slow.worker.join();closesocket(slow.listener);slow.listener=INVALID_SOCKET;}
 
     if(winsockReady)WSACleanup();
     CoUninitialize();

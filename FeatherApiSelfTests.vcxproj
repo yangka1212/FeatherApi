@@ -23,6 +23,6 @@
     <ClCompile Include="storage.cpp" />
     <ClCompile Include="http_client.cpp" />
   </ItemGroup>
-  <ItemGroup><ClInclude Include="app.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="app.h" /><ClInclude Include="ui_helpers.h" /><ClInclude Include="interaction_state.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

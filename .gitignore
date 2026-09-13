@@ -32,3 +32,6 @@ data.json
 
 # Temporary alternate Git metadata used when the existing metadata is locked
 .git-local/
+
+# Local interaction regression builds
+build-ux/

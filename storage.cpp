@@ -11,6 +11,8 @@
 #include <ctime>
 #include <sstream>
 #include <variant>
+#include <limits>
+#include <locale>
 
 using std::string;
 using std::wstring;
@@ -56,13 +58,15 @@ static wstring localAppData() {
 wstring win32DataPath() { return localAppData() + L"\\FeatherApi-Win32\\data.json"; }
 
 namespace {
+struct JsonNumber { string token; };
+
 struct Json {
     using Object = std::vector<std::pair<string, Json>>;
     using Array = std::vector<Json>;
-    std::variant<std::nullptr_t, bool, double, string, Object, Array> value;
+    std::variant<std::nullptr_t, bool, JsonNumber, string, Object, Array> value;
     Json() : value(nullptr) {}
     Json(bool v) : value(v) {}
-    Json(double v) : value(v) {}
+    Json(JsonNumber v) : value(std::move(v)) {}
     Json(string v) : value(std::move(v)) {}
     Json(Object v) : value(std::move(v)) {}
     Json(Array v) : value(std::move(v)) {}
@@ -70,7 +74,12 @@ struct Json {
     const Array* array() const { return std::get_if<Array>(&value); }
     string text(const string& fallback = {}) const { auto p=std::get_if<string>(&value); return p?*p:fallback; }
     bool boolean(bool fallback=true) const { auto p=std::get_if<bool>(&value); return p?*p:fallback; }
-    double number(double fallback=0) const { auto p=std::get_if<double>(&value); return p?*p:fallback; }
+    int integer(int fallback) const {
+        auto p=std::get_if<JsonNumber>(&value);if(!p)return fallback;
+        std::istringstream input(p->token);input.imbue(std::locale::classic());double parsed=0;
+        if(!(input>>parsed)||!std::isfinite(parsed)||parsed<std::numeric_limits<int>::min()||parsed>std::numeric_limits<int>::max())return fallback;
+        return (int)parsed;
+    }
     const Json* get(const char* key) const { auto o=object();if(!o)return nullptr;for(const auto& entry:*o)if(entry.first==key)return &entry.second;return nullptr; }
     const Json* getInsensitive(const char* key) const { auto o=object();if(!o)return nullptr;for(const auto& entry:*o)if(_stricmp(entry.first.c_str(),key)==0)return &entry.second;return nullptr; }
 };
@@ -127,7 +136,7 @@ private:
         if(source_[position_]=='0')++position_;else if(source_[position_]>='1'&&source_[position_]<='9'){while(position_<source_.size()&&std::isdigit((unsigned char)source_[position_]))++position_;}else return false;
         if(position_<source_.size()&&source_[position_]=='.'){++position_;size_t fraction=position_;while(position_<source_.size()&&std::isdigit((unsigned char)source_[position_]))++position_;if(position_==fraction)return false;}
         if(position_<source_.size()&&(source_[position_]=='e'||source_[position_]=='E')){++position_;if(position_<source_.size()&&(source_[position_]=='+'||source_[position_]=='-'))++position_;size_t exponent=position_;while(position_<source_.size()&&std::isdigit((unsigned char)source_[position_]))++position_;if(position_==exponent)return false;}
-        string token=source_.substr(start,position_-start);char* end=nullptr;double result=strtod(token.c_str(),&end);if(!end||*end!='\0'||!std::isfinite(result))return false;out=Json(result);return true;
+        out=Json(JsonNumber{source_.substr(start,position_-start)});return true;
     }
 };
 
@@ -196,7 +205,7 @@ const Json* resolveRef(const Json& root,const Json* value,int depth=0) {
 void writeJson(std::ostream& out,const Json& value,int indent=0) {
     if(std::holds_alternative<std::nullptr_t>(value.value)){out<<"null";return;}
     if(auto boolean=std::get_if<bool>(&value.value)){out<<(*boolean?"true":"false");return;}
-    if(auto number=std::get_if<double>(&value.value)){if(*number==(long long)*number)out<<(long long)*number;else out<<*number;return;}
+    if(auto number=std::get_if<JsonNumber>(&value.value)){out<<number->token;return;}
     if(auto text=std::get_if<string>(&value.value)){escape(out,*text);return;}
     if(auto array=value.array()){out<<'[';for(size_t i=0;i<array->size();++i){if(i)out<<',';out<<'\n'<<string((size_t)indent+2,' ');writeJson(out,(*array)[i],indent+2);}if(!array->empty())out<<'\n'<<string((size_t)indent,' ');out<<']';return;}
     auto object=value.object();out<<'{';size_t index=0;for(const auto& entry:*object){if(index++)out<<',';out<<'\n'<<string((size_t)indent+2,' ');escape(out,entry.first);out<<": ";writeJson(out,entry.second,indent+2);}if(object&&!object->empty())out<<'\n'<<string((size_t)indent,' ');out<<'}';
@@ -209,12 +218,12 @@ Json sampleFromSchema(const Json& root,const Json* source,int depth=0) {
     string type=getText(*schema,"type");
     if(type=="array"){Json::Array values;if(auto items=schema->get("items"))values.push_back(sampleFromSchema(root,items,depth+1));return Json(std::move(values));}
     if(type=="object"||schema->get("properties")){Json::Object values;if(auto properties=schema->get("properties");properties&&properties->object())for(const auto& property:*properties->object())values.emplace_back(property.first,sampleFromSchema(root,&property.second,depth+1));return Json(std::move(values));}
-    if(type=="integer"||type=="number")return Json(0.0);if(type=="boolean")return Json(false);return Json(string());
+    if(type=="integer"||type=="number")return Json(JsonNumber{"0"});if(type=="boolean")return Json(false);return Json(string());
 }
 
 string scalarText(const Json* value) {
     if(!value)return {};if(auto text=std::get_if<string>(&value->value))return *text;if(auto boolean=std::get_if<bool>(&value->value))return *boolean?"true":"false";
-    if(auto number=std::get_if<double>(&value->value)){std::ostringstream out;if(*number==(long long)*number)out<<(long long)*number;else out<<*number;return out.str();}return jsonText(*value);
+    if(auto number=std::get_if<JsonNumber>(&value->value))return number->token;return jsonText(*value);
 }
 
 string parameterValue(const Json& root,const Json& parameter) {
@@ -254,7 +263,7 @@ bool loadAppDataFromPath(const wstring& path,AppData& data) {
     std::ifstream input(std::filesystem::path(path),std::ios::binary);if(!input)return false;
     string source((std::istreambuf_iterator<char>(input)),{});if(source.size()>=3&&(unsigned char)source[0]==0xEF&&(unsigned char)source[1]==0xBB&&(unsigned char)source[2]==0xBF)source.erase(0,3);
     Json root;if(!Parser(source).parse(root)||!root.object())return false;AppData loaded;
-    if(auto settings=root.getInsensitive("Settings")){if(auto p=settings->getInsensitive("SidebarWidth"))loaded.sidebarWidth=std::clamp((int)p->number(320),180,420);if(auto p=settings->getInsensitive("RequestPanelHeight"))loaded.requestPanelHeight=std::max(180,(int)p->number(330));}
+    if(auto settings=root.getInsensitive("Settings")){if(auto p=settings->getInsensitive("SidebarWidth"))loaded.sidebarWidth=std::clamp(p->integer(320),180,420);if(auto p=settings->getInsensitive("RequestPanelHeight"))loaded.requestPanelHeight=std::max(180,p->integer(330));}
     if(auto folders=root.getInsensitive("Folders");folders&&folders->array())for(const auto& folder:*folders->array())loaded.folders.push_back(readFolder(folder));
     if(loaded.folders.empty()){auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name="默认目录";loaded.folders.push_back(std::move(folder));}data=std::move(loaded);return true;
 }

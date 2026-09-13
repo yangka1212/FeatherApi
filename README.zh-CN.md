@@ -48,6 +48,8 @@ ctest --test-dir build -C Release --output-on-failure
 
 ## 数据位置
 
+日常操作、快捷键与交互回归说明见 [交互说明](docs/interaction.md)。
+
 默认数据文件位于：
 
 ```text
