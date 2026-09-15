@@ -1636,12 +1636,13 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(download->result.statusCode<200||download->result.statusCode>=300){wstring downloadError=L"下载 Swagger/OpenAPI 文档失败：HTTP "+std::to_wstring(download->result.statusCode)+L" "+download->result.statusText;MessageBoxW(gWindow,downloadError.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         if(download->result.truncated){wstring sizeError=L"Swagger/OpenAPI 文档超过 5 MB，已取消导入。";MessageBoxW(gWindow,sizeError.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         ApiFolder* target=findFolderById(download->targetId);if(!target){MessageBoxW(gWindow,L"目标目录已被删除，无法应用导入结果。",L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
+        const string& importSourceUrl=download->result.finalUrl.empty()?download->sourceUrl:download->result.finalUrl;
         auto previewTarget=cloneFolderForImport(*target);OpenApiImportSummary preview;wstring previewError;
-        if(!importOpenApiJson(*previewTarget,download->result.rawBody,false,preview,previewError,download->sourceUrl)){MessageBoxW(gWindow,previewError.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
+        if(!importOpenApiJson(*previewTarget,download->result.rawBody,false,preview,previewError,importSourceUrl)){MessageBoxW(gWindow,previewError.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         if(preview.added+preview.overwritten+preview.skipped==0){MessageBoxW(gWindow,L"未找到可导入的接口。",L"导入 OpenAPI/Swagger",MB_OK|MB_ICONINFORMATION);return 0;}
         bool overwrite=false;if(preview.skipped>0){wstring conflictPrompt=L"发现 "+std::to_wstring(preview.skipped)+L" 个同目录同方法同 URL 的已有接口。\r\n\r\n选择“是”覆盖已有接口；选择“否”跳过已有接口；选择“取消”不导入。";int choice=MessageBoxW(gWindow,conflictPrompt.c_str(),L"导入冲突",MB_YESNOCANCEL|MB_ICONQUESTION);if(choice==IDCANCEL)return 0;overwrite=choice==IDYES;}
         OpenApiImportSummary summary;wstring error;
-        if(!importOpenApiJson(*target,download->result.rawBody,overwrite,summary,error,download->sourceUrl)){MessageBoxW(gWindow,error.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
+        if(!importOpenApiJson(*target,download->result.rawBody,overwrite,summary,error,importSourceUrl)){MessageBoxW(gWindow,error.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         rebuildTree();refreshRequestTabs();loadEditor();setSaveStatus(L"未保存");
         if(!saveNow()){MessageBoxW(gWindow,L"导入数据已应用，但无法写入本地数据文件。请检查文件权限后点击“保存”重试。",L"导入 OpenAPI/Swagger 保存失败",MB_OK|MB_ICONWARNING);return 0;}
         wstring result=L"导入完成。\r\n新增："+std::to_wstring(summary.added)+L"\r\n覆盖："+std::to_wstring(summary.overwritten)+L"\r\n跳过冲突："+std::to_wstring(summary.skipped)+L"\r\n无法导入："+std::to_wstring(summary.skippedOperations);

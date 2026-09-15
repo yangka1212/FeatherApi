@@ -214,6 +214,8 @@ HttpResult executeHttp(const RequestSnapshot& input,std::atomic<bool>& cancel,st
         body.empty()?WINHTTP_NO_REQUEST_DATA:(void*)body.data(),(DWORD)body.size(),(DWORD)body.size(),0);
     if(ok)ok=WinHttpReceiveResponse(request,nullptr);
     if(ok) {
+        DWORD finalUrlSize=0;WinHttpQueryOption(request,WINHTTP_OPTION_URL,nullptr,&finalUrlSize);
+        if(GetLastError()==ERROR_INSUFFICIENT_BUFFER&&finalUrlSize){wstring finalUrl(finalUrlSize/sizeof(wchar_t),L'\0');if(WinHttpQueryOption(request,WINHTTP_OPTION_URL,finalUrl.data(),&finalUrlSize)){while(!finalUrl.empty()&&!finalUrl.back())finalUrl.pop_back();result.finalUrl=toUtf8(finalUrl);}}
         DWORD size=sizeof(result.statusCode);
         WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,
                             &result.statusCode,&size,WINHTTP_NO_HEADER_INDEX);

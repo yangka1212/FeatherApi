@@ -229,6 +229,11 @@ int main() {
     const std::string relativeSwagger=R"({"swagger":"2.0","basePath":"/v1","paths":{"/health":{"get":{}}}})";
     ApiFolder relative;relative.id=newId();relative.name="相对";OpenApiImportSummary relativeSummary;
     check(importOpenApiJson(relative,relativeSwagger,false,relativeSummary,error)&&relative.requests[0]->url=="/v1/health","Swagger without host preserves basePath");
+    ApiFolder sourcedSwagger;sourcedSwagger.id=newId();OpenApiImportSummary sourcedSwaggerSummary;
+    check(importOpenApiJson(sourcedSwagger,relativeSwagger,false,sourcedSwaggerSummary,error,"https://gateway.example.com:8443/swagger/v1/swagger.json")&&sourcedSwagger.requests[0]->url=="https://gateway.example.com:8443/v1/health","Swagger without host uses document URL origin");
+    const std::string serverlessOpenApi=R"({"openapi":"3.0.1","paths":{"/health":{"get":{}}}})";
+    ApiFolder sourcedOpenApi;sourcedOpenApi.id=newId();OpenApiImportSummary sourcedOpenApiSummary;
+    check(importOpenApiJson(sourcedOpenApi,serverlessOpenApi,false,sourcedOpenApiSummary,error,"https://api.example.com?document=openapi")&&sourcedOpenApi.requests[0]->url=="https://api.example.com/health","OpenAPI without servers uses document URL origin");
 
     const std::string casing=R"({"openapi":"3.0.1","paths":{"/items":{"POST":{"parameters":[{"in":"QUERY","name":"page"}],"requestBody":{"content":{"Application/JSON; charset=utf-8":{"schema":{"type":"object","properties":{"id":{"type":"integer"}}}}}}}}}})";
     ApiFolder casingTarget;casingTarget.id=newId();casingTarget.name="大小写";OpenApiImportSummary casingSummary;
@@ -291,6 +296,7 @@ int main() {
         std::vector<std::string> orderedHeaders;for(const auto& header:liveResult.headers)if(_stricmp(header.key.c_str(),"X-Order")==0)orderedHeaders.push_back(header.value);
         check(longHeader.size()>4096&&loopback.request.find("X-Long: "+longHeader+"\r\n")!=std::string::npos,"HTTP sends full long field read from control");
         check(loopback.served&&liveResult.transportSuccess&&liveResult.statusCode==201,"HTTP loopback request completes");
+        check(liveResult.finalUrl.rfind("http://127.0.0.1:"+std::to_string(loopback.port)+"/echo",0)==0,"HTTP exposes the final response URL for imports");
         check(loopback.request.find("POST /echo?q=a%20b HTTP/1.1")!=std::string::npos&&loopback.request.find("X-Request-Test: native")!=std::string::npos,"HTTP sends method, query and custom header");
         check(loopback.request.find("User-Agent:")==std::string::npos,"HTTP does not add a User-Agent when WPF would not");
         check(loopback.request.find("one")!=std::string::npos&&loopback.request.find("two")!=std::string::npos,"HTTP preserves multiple values for a request header");

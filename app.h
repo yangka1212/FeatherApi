@@ -84,6 +84,7 @@ struct RequestSnapshot {
 struct HttpResult {
     bool transportSuccess = false;
     bool cancelled = false;
+    std::string finalUrl;
     unsigned statusCode = 0;
     std::wstring statusText;
     unsigned long errorCode = 0;

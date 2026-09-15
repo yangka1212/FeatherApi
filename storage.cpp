@@ -147,7 +147,7 @@ string trimText(string value) { while(!value.empty()&&std::isspace((unsigned cha
 bool equalsIgnoreCase(const string& left,const string& right){return _stricmp(left.c_str(),right.c_str())==0;}
 bool containsIgnoreCase(const string& value,const string& search){if(search.empty())return true;auto lower=[](unsigned char c){return (char)std::tolower(c);};return std::search(value.begin(),value.end(),search.begin(),search.end(),[&](char left,char right){return lower((unsigned char)left)==lower((unsigned char)right);})!=value.end();}
 string combineUrl(string baseUrl,string path){if(baseUrl.empty())return path;while(!baseUrl.empty()&&baseUrl.back()=='/')baseUrl.pop_back();size_t start=0;while(start<path.size()&&path[start]=='/')++start;return baseUrl+"/"+path.substr(start);}
-string sourceOrigin(const string& url){size_t scheme=url.find("://");if(scheme==string::npos)return {};size_t authority=url.find('/',scheme+3);return url.substr(0,authority==string::npos?url.size():authority);}
+string sourceOrigin(const string& url){size_t scheme=url.find("://");if(scheme==string::npos)return {};size_t authority=url.find_first_of("/?#",scheme+3);return url.substr(0,authority==string::npos?url.size():authority);}
 string resolveImportBase(string baseUrl,const string& sourceUrl){
     baseUrl=trimText(baseUrl);string origin=sourceOrigin(sourceUrl);
     if(baseUrl.empty())return origin;
