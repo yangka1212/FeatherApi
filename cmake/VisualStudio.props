@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Compatibility entry points only. CMake owns all compiled source lists. -->
+  <PropertyGroup>
+    <FeatherPreset Condition="'$(Configuration)'=='Debug'">debug</FeatherPreset>
+    <FeatherPreset Condition="'$(Configuration)'!='Debug'">release</FeatherPreset>
+    <FeatherBuild>powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\build.ps1&quot; -Configuration $(Configuration) -Target $(MSBuildProjectName)</FeatherBuild>
+    <NMakeBuildCommandLine>$(FeatherBuild) -Action Build</NMakeBuildCommandLine>
+    <NMakeReBuildCommandLine>$(FeatherBuild) -Action Build -Rebuild</NMakeReBuildCommandLine>
+    <NMakeCleanCommandLine>$(FeatherBuild) -Action Clean</NMakeCleanCommandLine>
+    <NMakeOutput>$(ProjectDir)build\$(FeatherPreset)\$(MSBuildProjectName).exe</NMakeOutput>
+    <OutDir>$(ProjectDir)build\$(FeatherPreset)\</OutDir>
+    <IntDir>$(ProjectDir)build\msbuild\$(MSBuildProjectName)\$(Configuration)\</IntDir>
+    <NMakeIncludeSearchPath>$(ProjectDir)src;$(ProjectDir);$(NMakeIncludeSearchPath)</NMakeIncludeSearchPath>
+    <NMakePreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;$(NMakePreprocessorDefinitions)</NMakePreprocessorDefinitions>
+    <AdditionalOptions>/std:c++17 /utf-8 %(AdditionalOptions)</AdditionalOptions>
+    <LocalDebuggerCommand>$(NMakeOutput)</LocalDebuggerCommand>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="$(ProjectDir)src\**\*.cpp;$(ProjectDir)tests\**\*.cpp" />
+    <ClInclude Include="$(ProjectDir)src\**\*.h" />
+    <None Include="$(ProjectDir)CMakeLists.txt;$(ProjectDir)CMakePresets.json;$(ProjectDir)resources.rc;$(ProjectDir)app.manifest" />
+  </ItemGroup>
+</Project>

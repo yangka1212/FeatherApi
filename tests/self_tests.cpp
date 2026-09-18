@@ -1,7 +1,13 @@
 #include <winsock2.h>
-#include "app.h"
-#include "ui_helpers.h"
-#include "interaction_state.h"
+#include "ui/ui_helpers.h"
+#include "domain/interaction_state.h"
+#include "application/openapi_import.h"
+#include "application/request_operations.h"
+#include "infrastructure/http_client.h"
+#include "json/json.h"
+#include "platform/encoding.h"
+#include "platform/identity.h"
+#include "infrastructure/storage.h"
 #include <objbase.h>
 
 #include <algorithm>
@@ -11,8 +17,6 @@
 #include <thread>
 #include <chrono>
 
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "comctl32.lib")
 
 namespace {
 int failures=0;

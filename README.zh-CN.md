@@ -41,10 +41,10 @@ Windows x64 用户可以从[最新发行版](https://github.com/yangka1212/Feath
 ### CMake
 
 ```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Action Test
 ```
+
+构建脚本自动发现 Visual Studio 工具链；产物位于 `build/release`。模块职责、Debug 构建与打包流程见 [开发架构](docs/architecture.md)。
 
 ## 数据位置
 

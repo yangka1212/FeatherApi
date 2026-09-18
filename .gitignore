@@ -17,6 +17,7 @@ x86/
 # CMake output
 build/
 cmake-build-*/
+CMakeUserPresets.json
 
 # Local IDE and OS files
 .vscode/

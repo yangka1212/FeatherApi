@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app.h"
+#include "domain/models.h"
 #include <map>
 #include <tuple>
 #include <cwctype>
@@ -82,3 +82,7 @@ struct ResponseMatches {
         return result;
     }
 };
+
+int tabSelectionAfterClose(int selectedIndex, int closedIndex, int tabCountBeforeClose);
+bool listCheckboxStateChanged(unsigned oldState, unsigned newState);
+std::wstring formatBytes(size_t bytes);

@@ -1,5 +1,14 @@
 // Exercise the actual Win32 controllers against an isolated fixture. No user data is loaded or saved.
-#include "app.h"
+#include "ui/main_window.h"
+#include "ui/ui_helpers.h"
+#include "domain/interaction_state.h"
+#include "application/openapi_import.h"
+#include "application/request_operations.h"
+#include "infrastructure/http_client.h"
+#include "json/json.h"
+#include "platform/encoding.h"
+#include "platform/identity.h"
+#include "infrastructure/storage.h"
 #include <commctrl.h>
 #include <filesystem>
 #include <iostream>
@@ -11,14 +20,8 @@ bool loadTestData(AppData&,std::wstring&);
 bool saveTestData(const AppData&);
 HRESULT WINAPI testTaskDialog(const TASKDIALOGCONFIG*,int*,int*,BOOL*);
 
-// Keep persistence and modal decisions injectable without exposing testing switches in the application.
-#define loadAppData loadTestData
-#define saveAppData saveTestData
-#define TaskDialogIndirect testTaskDialog
-#include "main_window.cpp"
-#undef loadAppData
-#undef saveAppData
-#undef TaskDialogIndirect
+// White-box controller coverage; production dependencies use the explicit service seam.
+#include "ui/main_window.cpp"
 
 bool loadTestData(AppData& data,std::wstring& source) {
     source=testDataPath;
@@ -138,12 +141,13 @@ static void runControllerTests() {
 }
 int main(int argc,char**) {
     std::cout.setf(std::ios::unitbuf);SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
+    gServices={loadTestData,saveTestData,testTaskDialog};
     testMode=argc>1;SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     wchar_t executable[MAX_PATH]{};GetModuleFileNameW(nullptr,executable,MAX_PATH);
     auto testRoot=std::filesystem::path(executable).parent_path()/L"ui-sandbox";
     if(testMode)testRoot/=toWide(newId());testDataPath=(testRoot/L"data.json").wstring();
-    if(!testMode){CoUninitialize();return runMainWindow(GetModuleHandleW(nullptr),SW_SHOWNORMAL);}
+    if(!testMode){CoUninitialize();return runMainWindow(GetModuleHandleW(nullptr),SW_SHOWNORMAL,gServices);}
     gInstance=GetModuleHandleW(nullptr);gDpi=GetDpiForSystem();
     WNDCLASSW find{};find.hInstance=gInstance;find.lpfnWndProc=responseFindPanelProc;find.lpszClassName=L"FeatherApiResponseFind";find.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);RegisterClassW(&find);
     WNDCLASSW wc{};wc.hInstance=gInstance;wc.lpfnWndProc=windowProc;wc.lpszClassName=L"FeatherApiControllerTests";RegisterClassW(&wc);

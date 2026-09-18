@@ -1,6 +1,12 @@
-#include "app.h"
-#include "ui_helpers.h"
-#include "interaction_state.h"
+#include "ui/main_window.h"
+#include "ui/ui_helpers.h"
+#include "domain/interaction_state.h"
+#include "application/openapi_import.h"
+#include "application/request_operations.h"
+#include "infrastructure/http_client.h"
+#include "json/json.h"
+#include "platform/encoding.h"
+#include "platform/identity.h"
 #include "resources.h"
 
 #include <commctrl.h>
@@ -15,11 +21,6 @@
 #include <thread>
 #include <unordered_set>
 
-#pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "comdlg32.lib")
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "ole32.lib")
 
 using std::string;
 using std::wstring;
@@ -77,6 +78,7 @@ struct ImportDownload { string targetId;string sourceUrl;HttpResult result; };
 struct FolderChoice { ApiFolder* folder=nullptr;std::wstring label; };
 struct FolderPickerContext { const std::vector<FolderChoice>* choices=nullptr;ApiFolder* selected=nullptr;bool accepted=false; };
 
+MainWindowServices gServices{};
 HINSTANCE gInstance{};
 HMODULE gRichEditModule{};
 HWND gWindow{},gSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gRequestTabScroll{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
@@ -205,7 +207,7 @@ int askSaveChanges(const wstring& title,const wstring& message,bool exiting=fals
     config.pszWindowTitle=L"FeatherApi";config.pszMainInstruction=title.c_str();config.pszContent=message.c_str();
     config.cButtons=3;config.pButtons=buttons;config.nDefaultButton=IDCANCEL;config.pszMainIcon=TD_WARNING_ICON;
     int choice=IDCANCEL;gClosingPrompt=true;
-    HRESULT result=TaskDialogIndirect(&config,&choice,nullptr,nullptr);
+    HRESULT result=gServices.showTaskDialog(&config,&choice,nullptr,nullptr);
     if(FAILED(result))choice=MessageBoxW(gWindow,(message+L"\r\n\r\n是：保存全部\r\n否：放弃修改\r\n取消：返回编辑").c_str(),title.c_str(),MB_YESNOCANCEL|MB_ICONWARNING|MB_DEFBUTTON3);
     gClosingPrompt=false;for(auto pending:gDeferredCompletions)PostMessageW(gWindow,pending.first,pending.second,0);gDeferredCompletions.clear();return choice;
 }
@@ -755,7 +757,7 @@ void saveEditor(bool updateBodyType=true) {
 bool saveNow(bool feedback=false) {
     if(gCellEditor)commitCellEditor();saveEditor();syncVisibleFolderExpansionState();
     for(auto& tab:gTabs)if(tab->requestCase)caseContent(*tab).apply(*tab->requestCase);
-    if(saveAppData(gData)){
+    if(gServices.saveData(gData)){
         gSavedContent=WorkspaceContent::from(gData);gSaveFailed=false;updateDirtyStatus();
         if(auto tab=selectedTab();tab&&tab->validation==L"保存失败：无法写入本地数据文件。") {tab->validation.clear();setValidationText(L"");}
         rebuildTree();if(feedback)showSaveFeedback(true);return true;
@@ -1430,7 +1432,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         TreeView_SetBkColor(gTree,COLOR_SIDEBAR);TreeView_SetTextColor(gTree,COLOR_PRIMARY);TreeView_SetLineColor(gTree,COLOR_BORDER);TreeView_SetItemHeight(gTree,px(30));
         ListView_SetBkColor(gKvList,RGB(255,255,255));ListView_SetTextColor(gKvList,COLOR_PRIMARY);ListView_SetTextBkColor(gKvList,CLR_NONE);
         ListView_SetBkColor(gResponseHeaders,RGB(255,255,255));ListView_SetTextColor(gResponseHeaders,COLOR_PRIMARY);ListView_SetTextBkColor(gResponseHeaders,CLR_NONE);
-        wstring loadSource;loadAppData(gData,loadSource);if(gData.folders.empty()){auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name="默认目录";gData.folders.push_back(std::move(folder));}
+        wstring loadSource;gServices.loadData(gData,loadSource);if(gData.folders.empty()){auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name="默认目录";gData.folders.push_back(std::move(folder));}
         gSavedContent=WorkspaceContent::from(gData);
         rebuildTree();if(!gData.folders.empty()){for(auto& folder:gData.folders)if(auto request=firstRequestIn(*folder)){openRequest(request);break;}}refreshRequestTabs();loadEditor();return 0;
     }
@@ -1664,7 +1666,8 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
 }
 }
 
-int runMainWindow(HINSTANCE instance,int showCommand) {
+int runMainWindow(HINSTANCE instance,int showCommand,const MainWindowServices& services) {
+    gServices=services;
     gInstance=instance;CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);gDpi=GetDpiForSystem();
     WNDCLASSW findPanelClass{};findPanelClass.hInstance=instance;findPanelClass.lpfnWndProc=responseFindPanelProc;findPanelClass.lpszClassName=L"FeatherApiResponseFind";findPanelClass.hCursor=LoadCursorW(nullptr,IDC_ARROW);findPanelClass.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);RegisterClassW(&findPanelClass);
     WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=windowProc;wc.lpszClassName=L"FeatherApiWindow";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_FEATHERAPI));wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);wc.style=CS_DBLCLKS;RegisterClassW(&wc);

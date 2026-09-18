@@ -41,10 +41,10 @@ Windows x64 users can download the portable ZIP package from the [latest release
 ### CMake
 
 ```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Action Test
 ```
+
+The script discovers the Visual Studio C++ toolchain and writes artifacts to `build/release`. See the [architecture and development guide](docs/architecture.md) (Chinese) for module boundaries, Debug builds, and packaging.
 
 ## Data Location
 

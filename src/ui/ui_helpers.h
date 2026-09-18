@@ -1,6 +1,7 @@
 #pragma once
 
-#include "app.h"
+#include "platform/windows.h"
+#include <string>
 #include <commctrl.h>
 
 inline std::wstring listCellText(HWND list, int row, int column) {

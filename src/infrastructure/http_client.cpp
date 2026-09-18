@@ -1,4 +1,7 @@
-#include "app.h"
+#include "infrastructure/http_client.h"
+#include "json/json.h"
+#include "platform/encoding.h"
+#include "platform/identity.h"
 
 #include <chrono>
 #include <cctype>
@@ -24,25 +27,6 @@ string urlEncode(const string& value) {
     return result;
 }
 string formEncode(const string& value){string result=urlEncode(value);size_t position=0;while((position=result.find("%20",position))!=string::npos){result.replace(position,3,"+");++position;}return result;}
-
-string normalizedJsonString(const string& value,size_t& position) {
-    string result;result+='"';++position;
-    auto appendCodePoint=[&](unsigned code){
-        if(code=='"'){result+="\\\"";return;}if(code=='\\'){result+="\\\\";return;}
-        if(code<0x20){char escaped[7]{};snprintf(escaped,sizeof(escaped),"\\u%04X",code);result+=escaped;return;}
-        wstring wide;if(code<=0xFFFF)wide+=(wchar_t)code;else{code-=0x10000;wide+=(wchar_t)(0xD800+(code>>10));wide+=(wchar_t)(0xDC00+(code&0x3FF));}result+=toUtf8(wide);
-    };
-    auto hex=[](char c)->unsigned{return c>='0'&&c<='9'?(unsigned)(c-'0'):c>='a'&&c<='f'?(unsigned)(c-'a'+10):(unsigned)(c-'A'+10);};
-    while(position<value.size()){
-        char c=value[position++];if(c=='"'){result+='"';break;}if(c!='\\'){result+=c;continue;}
-        char escaped=value[position++];if(escaped=='u'){
-            unsigned code=0;for(int i=0;i<4;++i)code=(code<<4)+hex(value[position++]);
-            if(code>=0xD800&&code<=0xDBFF){position+=2;unsigned low=0;for(int i=0;i<4;++i)low=(low<<4)+hex(value[position++]);code=0x10000+((code-0xD800)<<10)+(low-0xDC00);}
-            appendCodePoint(code);
-        }else if(escaped=='/'){result+='/';}
-        else{result+='\\';result+=escaped;}
-    }return result;
-}
 
 wstring errorText(DWORD code) {
     wchar_t* message=nullptr;
@@ -140,28 +124,6 @@ bool buildMultipartFormBody(const std::vector<KeyValueEntry>& fields,const strin
         else {body+="\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"+entry.value+"\r\n";}
     }
     body+="--"+boundary+"--\r\n";return true;
-}
-
-string prettyJson(const string& value, bool compact) {
-    if(!isValidJson(value))return value;
-    string output;output.reserve(value.size()+128);
-    int indent=0;bool quoted=false,escaped=false;
-    auto newline=[&](){if(compact)return;output+='\n';output.append((size_t)indent*2,' ');};
-    for(size_t position=0;position<value.size();) {
-        char c=value[position++];
-        if(quoted) {
-            output+=c;
-            if(escaped)escaped=false;else if(c=='\\')escaped=true;else if(c=='"')quoted=false;
-            continue;
-        }
-        if(c=='"'){--position;output+=normalizedJsonString(value,position);}
-        else if(c=='{'||c=='['){size_t next=position;while(next<value.size()&&std::isspace((unsigned char)value[next]))++next;char close=c=='{'?'}':']';if(next<value.size()&&value[next]==close){output+=c;output+=close;position=next+1;}else{output+=c;++indent;newline();}}
-        else if(c=='}'||c==']'){--indent;newline();output+=c;}
-        else if(c==','){output+=c;newline();}
-        else if(c==':'){output+=c;if(!compact)output+=' ';}
-        else if(!std::isspace((unsigned char)c))output+=c;
-    }
-    return output.empty()?value:output;
 }
 
 HttpResult executeHttp(const RequestSnapshot& input,std::atomic<bool>& cancel,std::atomic<HINTERNET>* activeRequest) {

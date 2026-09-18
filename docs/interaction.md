@@ -34,10 +34,10 @@
 现有 `FeatherApiSelfTests` 覆盖存储、JSON、导入和本地 HTTP 回归。新增 `FeatherApiUiTests` 直接验证真实窗口控制器，替换数据加载、保存及关闭对话框选择，不访问用户数据。
 
 ```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Action Test
 ```
+
+模块划分与开发入口见 [开发架构](architecture.md)。增加了 `FeatherArchitecture` 依赖边界检查。
 
 也可以使用 Visual Studio 分别构建 `FeatherApi.vcxproj`、`FeatherApiSelfTests.vcxproj`、`FeatherApiUiTests.vcxproj`。
 
