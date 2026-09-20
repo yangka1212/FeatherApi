@@ -49,6 +49,181 @@ static void finish(const std::shared_ptr<TabState>& tab,bool success,bool cancel
     done->result.rawBody="{\"new\":true}";done->result.prettyBody="{\n  \"new\": true\n}";done->result.errorMessage=L"模拟连接失败";
     SendMessageW(gWindow,WM_HTTP_DONE,(WPARAM)done,0);
 }
+static RECT boundsInWindow(HWND control) {
+    RECT bounds{};GetWindowRect(control,&bounds);MapWindowPoints(nullptr,gWindow,(POINT*)&bounds,2);return bounds;
+}
+static CHARFORMAT2W responseFormatAt(size_t position) {
+    DWORD start=0,end=0;POINT scroll{};SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);SendMessageW(gResponseBody,EM_GETSCROLLPOS,0,(LPARAM)&scroll);
+    SendMessageW(gResponseBody,WM_SETREDRAW,FALSE,0);CHARFORMAT2W format{};format.cbSize=sizeof(format);
+    SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)position,(LPARAM)(position+1));
+    SendMessageW(gResponseBody,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);
+    SendMessageW(gResponseBody,EM_SETSEL,start,end);SendMessageW(gResponseBody,EM_SETSCROLLPOS,0,(LPARAM)&scroll);SendMessageW(gResponseBody,WM_SETREDRAW,TRUE,0);return format;
+}
+static bool hasAutomaticBackground(const CHARFORMAT2W& format) {
+    return !(format.dwMask&CFM_BACKCOLOR)||(format.dwEffects&CFE_AUTOBACKCOLOR);
+}
+static void responseSelection(DWORD& start,DWORD& end) {
+    SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
+}
+static bool responseMatchIsVisible(size_t position,size_t length) {
+    RECT viewport{};SendMessageW(gResponseBody,EM_GETRECT,0,(LPARAM)&viewport);
+    POINTL first{},last{};
+    SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&first,(LPARAM)position);
+    SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&last,(LPARAM)(position+length));
+    return first.x>=viewport.left&&first.x<viewport.right&&first.y>=viewport.top&&first.y<viewport.bottom&&
+           last.x>=viewport.left&&last.x<viewport.right&&last.y>=viewport.top&&last.y<viewport.bottom;
+}
+static void pressResponseFindEnter(bool previous) {
+    BYTE originalKeys[256]{},keys[256]{};GetKeyboardState(originalKeys);for(int i=0;i<256;++i)keys[i]=originalKeys[i];
+    if(previous)keys[VK_SHIFT]|=0x80;else keys[VK_SHIFT]&=0x7f;
+    SetKeyboardState(keys);SendMessageW(gResponseFindEdit,WM_KEYDOWN,VK_RETURN,0);SetKeyboardState(originalKeys);
+}
+static void runLargeResponseFindTests(const std::shared_ptr<TabState>& tab) {
+    if(gResponseFindVisible)SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+    const wstring longQuery(300,L'x');tab->rawView=true;tab->responseRaw=toUtf8(L"\""+longQuery+L"\"");tab->responsePretty=tab->responseRaw;showResponsePage();
+    SendMessageW(gResponseBody,EM_SETSEL,1,301);SetFocus(gResponseBody);
+    BYTE originalKeys[256]{},ctrlKeys[256]{};GetKeyboardState(originalKeys);for(int i=0;i<256;++i)ctrlKeys[i]=originalKeys[i];ctrlKeys[VK_CONTROL]|=0x80;
+    SetKeyboardState(ctrlKeys);SendMessageW(gResponseBody,WM_KEYDOWN,'F',0);SetKeyboardState(originalKeys);
+    DWORD start=0,end=0;responseSelection(start,end);
+    check(textOf(gResponseFindEdit)==longQuery&&textOf(gFindStatus)==L"1 / 1"&&start==1&&end==301,
+          "Ctrl+F seeds and finds an arbitrary long single-line response selection");
+    SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+
+    std::string raw="[";for(int i=0;i<180;++i){if(i)raw+=",";raw+="\"scroll-hit\"";}raw+="]";
+    tab->rawView=false;tab->responseRaw=raw;tab->responsePretty=prettyJson(raw);showResponsePage();const auto rendered=responseText();
+    const size_t first=rendered.find(L"scroll-hit"),last=rendered.rfind(L"scroll-hit"),previous=rendered.rfind(L"scroll-hit",last-1);
+    SetFocus(gResponseFind);SendMessageW(gResponseFind,BM_CLICK,0,0);SetFocus(gResponseFindEdit);setText(gResponseFindEdit,L"scroll-hit");responseSelection(start,end);
+    check(textOf(gFindStatus)==L"1 / 180"&&start==first&&end==first+10,"long response search counts every match while selecting the first");
+    const auto offscreen=responseFormatAt(last);check(hasAutomaticBackground(offscreen),"an offscreen response match is not eagerly formatted");
+    check(!responseMatchIsVisible(last,10),"the final response match starts outside the viewport");
+    pressResponseFindEnter(true);SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(last,10),"previous search scrolls an offscreen final match into view while the query keeps focus");
+    check(GetFocus()==gResponseFindEdit,"scrolling to a response match keeps keyboard focus in the query");
+    pressResponseFindEnter(false);SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(first,10),"next search wraps and scrolls back to the first match");
+    SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)first,(LPARAM)(first+10));
+    const int lineCount=(int)SendMessageW(gResponseBody,EM_GETLINECOUNT,0,0);SendMessageW(gResponseBody,EM_LINESCROLL,0,lineCount-5);
+    // The fixture window is hidden, so RedrawWindow does not dispatch WM_PAINT.
+    // Exercise its real paint handler explicitly after moving the viewport.
+    SendMessageW(gResponseBody,WM_PAINT,0,0);
+    const auto visibleLast=responseFormatAt(last);check(!hasAutomaticBackground(visibleLast),"scrolling and repainting applies the match background when an offscreen result becomes visible");
+    SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)first,(LPARAM)(first+10));pressResponseFindEnter(true);SendMessageW(gResponseBody,WM_PAINT,0,0);responseSelection(start,end);
+    const auto currentLast=responseFormatAt(last),visiblePrevious=responseFormatAt(previous);
+    check(start==last&&end==last+10&&textOf(gFindStatus).find(L"180 / 180")!=wstring::npos,"previous navigation wraps to the final match in a long response");
+    check(!hasAutomaticBackground(currentLast)&&!hasAutomaticBackground(visiblePrevious)&&currentLast.crBackColor!=visiblePrevious.crBackColor,
+          "the newly current visible match is stronger than neighboring visible matches");
+    SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+    tab->selectionStart=tab->selectionEnd=0;tab->responseScroll={};tab->firstVisibleLine=tab->horizontalScroll=0;
+
+    raw="raw-hit\n";for(int i=0;i<180;++i)raw+=std::string(600,'x')+"\n";raw+="raw-hit tail-only";
+    tab->rawView=true;tab->responseRaw=raw;tab->responsePretty=raw;showResponsePage();
+    const auto rawRendered=responseText();const size_t rawLast=rawRendered.rfind(L"raw-hit"),tail=rawRendered.find(L"tail-only");
+    SetFocus(gResponseFind);SendMessageW(gResponseFind,BM_CLICK,0,0);SetFocus(gResponseFindEdit);
+    check(!responseMatchIsVisible(tail,9),"the unique raw response match starts below the viewport beyond 64K characters");
+    setText(gResponseFindEdit,L"tail-only");SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(tail,9)&&GetFocus()==gResponseFindEdit,"typing a query scrolls its offscreen first result into view without taking focus");
+    setText(gResponseFindEdit,L"raw-hit");SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(0,7),"changing a query scrolls from the bottom back to its first result");
+    SetFocus(gResponseFindNext);SendMessageW(gResponseFindNext,BM_CLICK,0,0);SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(rawLast,7)&&GetFocus()==gResponseFindNext,"the next button reveals a distant match without taking keyboard focus");
+    SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+    tab->selectionStart=tab->selectionEnd=0;tab->responseScroll={};tab->firstVisibleLine=tab->horizontalScroll=0;
+
+    tab->responseRaw="raw-hit "+std::string(600,'x')+" raw-hit tail-only";tab->responsePretty=tab->responseRaw;showResponsePage();
+    const auto wideRendered=responseText();const size_t wideLast=wideRendered.rfind(L"raw-hit"),wideTail=wideRendered.find(L"tail-only");
+    SetFocus(gResponseFind);SendMessageW(gResponseFind,BM_CLICK,0,0);SetFocus(gResponseFindEdit);setText(gResponseFindEdit,L"raw-hit");
+    check(!responseMatchIsVisible(wideLast,7),"a long raw line has a match outside the horizontal viewport");
+    pressResponseFindEnter(false);SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(wideLast,7),"next search horizontally scrolls a long raw line to its current match");
+    pressResponseFindEnter(true);SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(0,7),"previous search scrolls a long raw line back to its first match");
+    setText(gResponseFindEdit,L"tail-only");SendMessageW(gResponseBody,WM_PAINT,0,0);
+    check(responseMatchIsVisible(wideTail,9),"typing a query horizontally reveals its offscreen first result");
+    SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+    tab->selectionStart=tab->selectionEnd=0;tab->responseScroll={};tab->firstVisibleLine=tab->horizontalScroll=0;
+}
+static void runResponseFindTests(const std::shared_ptr<TabState>& tab,ApiRequest* request,ApiRequestCase* requestCase,ApiRequest* otherRequest) {
+    tab->rawView=false;tab->responseRaw="{\"match\":\"match\",\"other\":\"match\"}";tab->responsePretty=prettyJson(tab->responseRaw);showResponsePage();
+    const auto rendered=responseText();
+    const size_t first=rendered.find(L"match"),second=rendered.find(L"match",first+1),third=rendered.find(L"match",second+1),other=rendered.find(L"other");
+    check(first!=wstring::npos&&second!=wstring::npos&&third!=wstring::npos&&rendered.find(L"match",third+1)==wstring::npos,"response-search fixture has three hand-checked matches");
+
+    if(gResponseFindVisible)SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+    SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)other,(LPARAM)(other+5));SetFocus(gResponseBody);
+    BYTE originalCtrlKeys[256]{},ctrlKeys[256]{};GetKeyboardState(originalCtrlKeys);std::copy(std::begin(originalCtrlKeys),std::end(originalCtrlKeys),std::begin(ctrlKeys));ctrlKeys[VK_CONTROL]|=0x80;
+    SetKeyboardState(ctrlKeys);SendMessageW(gResponseBody,WM_KEYDOWN,'F',0);SetKeyboardState(originalCtrlKeys);
+    DWORD start=0,end=0;responseSelection(start,end);
+    check(textOf(gResponseFindEdit)==L"other"&&textOf(gFindStatus)==L"1 / 1"&&start==other&&end==other+5,"Ctrl+F seeds the focused response selection and immediately finds it");
+    SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+    responseSelection(start,end);check(start==other&&end==other+5,"closing response search retains the selected text for copying");
+
+    SetFocus(gResponseFind);SendMessageW(gResponseFind,BM_CLICK,0,0);SetFocus(gResponseFindEdit);setText(gResponseFindEdit,L"match");
+    responseSelection(start,end);
+    check(start==first&&end==first+5&&textOf(gFindStatus)==L"1 / 3","typing a visible response query immediately selects the first match and reports 1 / N");
+    check(IsWindowEnabled(gResponseFindPrev)&&IsWindowEnabled(gResponseFindNext),"response-search arrows enable when matches exist");
+
+    auto firstFormat=responseFormatAt(first),secondFormat=responseFormatAt(second),thirdFormat=responseFormatAt(third);
+    const auto pale=[](COLORREF color){return GetRValue(color)+GetGValue(color)+GetBValue(color)>450;};
+    check((firstFormat.dwMask&CFM_BACKCOLOR)&&(secondFormat.dwMask&CFM_BACKCOLOR)&&(thirdFormat.dwMask&CFM_BACKCOLOR)&&
+          !(firstFormat.dwEffects&CFE_AUTOBACKCOLOR)&&!(secondFormat.dwEffects&CFE_AUTOBACKCOLOR)&&!(thirdFormat.dwEffects&CFE_AUTOBACKCOLOR)&&
+          pale(firstFormat.crBackColor)&&pale(secondFormat.crBackColor)&&pale(thirdFormat.crBackColor)&&
+          secondFormat.crBackColor==thirdFormat.crBackColor&&firstFormat.crBackColor!=secondFormat.crBackColor,
+          "all visible matches have a pale background and the current match is stronger");
+    check(firstFormat.crTextColor==RGB(29,78,160)&&(firstFormat.dwEffects&CFE_BOLD)&&
+          secondFormat.crTextColor==RGB(21,128,61)&&!(secondFormat.dwEffects&CFE_BOLD),
+          "response-search backgrounds preserve JSON foreground colors and bold keys");
+    SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)first,(LPARAM)(first+5));
+
+    pressResponseFindEnter(false);responseSelection(start,end);
+    check(start==second&&end==second+5&&textOf(gFindStatus)==L"2 / 3","Enter advances to the next response match");
+    pressResponseFindEnter(true);responseSelection(start,end);
+    check(start==first&&end==first+5&&textOf(gFindStatus).find(L"1 / 3")!=wstring::npos,"Shift+Enter moves to the previous response match");
+    pressResponseFindEnter(true);responseSelection(start,end);
+    check(start==third&&end==third+5,"previous-match navigation wraps without replacing the compact count with prose");
+
+    openRequest(otherRequest);openRequest(request,requestCase);responseSelection(start,end);
+    check(gResponseFindVisible&&textOf(gResponseFindEdit)==L"match"&&textOf(gFindStatus).find(L"3 / 3")!=wstring::npos&&start==third&&end==third+5,
+          "each response tab restores its search query and current match");
+
+    SetFocus(gResponseFindEdit);setText(gResponseFindEdit,L"missing");responseSelection(start,end);
+    check(textOf(gFindStatus)==L"未找到"&&!IsWindowEnabled(gResponseFindPrev)&&!IsWindowEnabled(gResponseFindNext)&&start==third&&end==third+5,
+          "a missing response query disables navigation without moving the response selection");
+    setText(gResponseFindEdit,L"");responseSelection(start,end);
+    check(!IsWindowEnabled(gResponseFindPrev)&&!IsWindowEnabled(gResponseFindNext)&&start==third&&end==third+5,
+          "an empty response query disables navigation without moving the response selection");
+
+    setText(gResponseFindEdit,L"match");SendMessageW(gResponseFindEdit,WM_KEYDOWN,VK_RETURN,0);responseSelection(start,end);
+    const DWORD selectedStart=start,selectedEnd=end;
+    SendMessageW(gResponseBody,EM_SETSEL,selectedStart,selectedEnd);SendMessageW(gResponseFindClose,BM_CLICK,0,0);responseSelection(start,end);
+    const auto closedFirst=responseFormatAt(first),closedSecond=responseFormatAt(second),closedThird=responseFormatAt(third);
+    check(start==selectedStart&&end==selectedEnd,"closing response search preserves the current response selection");
+    check(hasAutomaticBackground(closedFirst)&&hasAutomaticBackground(closedSecond)&&hasAutomaticBackground(closedThird),
+          "closing response search removes match backgrounds");
+    check(closedSecond.crTextColor==RGB(21,128,61)&&!(closedSecond.dwEffects&CFE_BOLD),"closing search keeps JSON syntax formatting intact");
+
+    for(UINT dpi:{96u,144u,192u}){
+        // Ask for the widest supported sidebar: the layout clamps this request
+        // to the maximum that still leaves the workspace usable at 980 DIPs.
+        gData.sidebarWidth=420;
+        RECT proposed{0,0,MulDiv(980,(int)dpi,96),MulDiv(640,(int)dpi,96)};
+        SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
+        RECT closedBody=boundsInWindow(gResponseBody),toolbar=boundsInWindow(gResponseTabs),closedMode=boundsInWindow(gResponseMode),headersItem{};
+        TabCtrl_GetItemRect(gResponseTabs,1,&headersItem);MapWindowPoints(gResponseTabs,gWindow,(POINT*)&headersItem,2);
+        const int modeGap=closedMode.left-headersItem.right;
+        check(modeGap>=0&&modeGap<=(closedMode.right-closedMode.left)/2,
+              "response mode follows the Body and Headers items with a compact gap at 100/150/200 percent");
+        SetFocus(gResponseMode);SendMessageW(gResponseFind,BM_CLICK,0,0);
+        RECT openBody=boundsInWindow(gResponseBody),openMode=boundsInWindow(gResponseMode),find=boundsInWindow(gResponseFindPanel),client{};GetClientRect(gWindow,&client);
+        check(EqualRect(&closedBody,&openBody),"opening inline response search does not shift body geometry at 100/150/200 percent");
+        check(EqualRect(&closedMode,&openMode),"opening inline response search does not move the response mode at 100/150/200 percent");
+        check(find.left>=openMode.right&&find.right>find.left,
+              "inline response search opens to the right without overlapping the response mode at 100/150/200 percent");
+        check(find.top>=toolbar.top&&find.bottom<=toolbar.bottom&&find.left>=0&&find.right<=client.right&&find.right>find.left,
+              "minimum-window response search stays compact inside the existing toolbar at 100/150/200 percent");
+        check(textOf(gResponseFindEdit)==L"match","opening search outside the response body does not seed from an old body selection");
+        SendMessageW(gResponseFindClose,BM_CLICK,0,0);
+    }
+}
 static void runControllerTests() {
     auto request=gData.folders[0]->requests[0].get();auto second=gData.folders[0]->requests[1].get();auto c=request->cases[0].get();
     check(!workspaceDirty(),"fixture starts clean");
@@ -83,8 +258,9 @@ static void runControllerTests() {
     auto hello=rendered.find(L"hello");SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)hello,(LPARAM)(hello+5));
     CHARFORMAT2W stringFormat{};stringFormat.cbSize=sizeof(stringFormat);SendMessageW(gResponseBody,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&stringFormat);
     check(stringFormat.crTextColor==RGB(21,128,61)&&!(stringFormat.dwEffects&CFE_BOLD),"JSON strings have separate coloring without bold");
-    setText(gResponseFindEdit,L"user_name");findInResponseBody(true);DWORD start=0,end=0;SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
+    SetFocus(gResponseFind);SendMessageW(gResponseFind,BM_CLICK,0,0);SetFocus(gResponseFindEdit);setText(gResponseFindEdit,L"user_name");DWORD start=0,end=0;SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
     check(rendered.substr(start,end-start)==L"user_name","search selects the exact word after multiple JSON line breaks");
+    SendMessageW(gResponseFindClose,BM_CLICK,0,0);
     POINTL hit{};SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&hit,(LPARAM)(key+3));
     SendMessageW(gResponseBody,WM_LBUTTONDBLCLK,MK_LBUTTON,MAKELPARAM(hit.x+1,hit.y+2));SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
     check(rendered.substr(start,end-start)==L"user_name","double click selects a complete English JSON field without quotes");
@@ -103,21 +279,12 @@ static void runControllerTests() {
     check(tab->summary.find(L"已取消")==0&&tab->responseRaw==oldBody&&tab->oldResponse,"cancelled requests retain explicitly labelled previous response");
     finish(tab,false);check(tab->summary.find(L"网络错误")==0&&tab->responseRaw==oldBody,"network failures preserve previous response");
     finish(tab,true,false,500);check(tab->responseRaw=="{\"new\":true}"&&tab->statusCode==500&&!tab->oldResponse,"HTTP 500 replaces response normally");
-    tab->findVisible=true;gResponseFindVisible=true;setText(gResponseFindEdit,L"new");findInResponseBody(true);
-    check(textOf(gFindStatus)==L"1 / 1","response search shows current match and total");findInResponseBody(true);check(textOf(gFindStatus).find(L"已循环")!=wstring::npos,"search wrap is visible");
-    setText(gResponseFindEdit,L"missing");findInResponseBody(true);check(textOf(gFindStatus)==L"未找到","missing search term has visible feedback");
-    setText(gResponseFindEdit,L"new");findInResponseBody(true);tab->rawView=true;captureView();showResponsePage();
+    runLargeResponseFindTests(tab);runResponseFindTests(tab,request,c,second);
+    tab->rawView=true;captureView();showResponsePage();
     openRequest(second);finish(tab,true,false,201);check(textOf(gUrl)==toWide(second->url),"background completion does not replace the selected request editor");
-    openRequest(request,c);check(tab->rawView&&textOf(gResponseFindEdit)==L"new"&&gResponseFindVisible,"response mode and search query belong to each tab");
+    openRequest(request,c);check(tab->rawView&&textOf(gResponseFindEdit)==L"match"&&!gResponseFindVisible,"response mode and search query belong to each tab");
     check(saveNow(),"case response can be saved");
 
-    for(UINT dpi:{96u,144u,192u}){
-        RECT proposed{0,0,MulDiv(980,(int)dpi,96),MulDiv(640,(int)dpi,96)};
-        SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
-        RECT body{},find{},client{};GetWindowRect(gResponseBody,&body);GetWindowRect(gResponseFindPanel,&find);GetClientRect(gWindow,&client);
-        MapWindowPoints(nullptr,gWindow,(POINT*)&body,2);MapWindowPoints(nullptr,gWindow,(POINT*)&find,2);
-        check(body.top>=find.bottom&&body.bottom<=client.bottom&&body.right<=client.right&&body.bottom>body.top,"minimum-window layout keeps search above response at 100/150/200 percent");
-    }
     tab->sending=true;tab->cancel=false;tab->started=std::chrono::steady_clock::now()-std::chrono::milliseconds(200);
     SendMessageW(gWindow,WM_TIMER,REQUEST_TIMER,0);check(tab->summary.find(L"请求中")!=wstring::npos,"request timer updates elapsed status");
     cancelCurrent();check(tab->cancel&&tab->summary==L"正在取消","cancel button immediately enters cancelling state");finish(tab,false,true);

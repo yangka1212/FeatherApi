@@ -31,7 +31,7 @@ enum : int {
     IDC_SEND,IDC_CANCEL,IDC_EDITOR_TABS,IDC_KV_LIST,IDC_ADD_ROW,IDC_DELETE_ROW,IDC_BODY_TYPE,
     IDC_FORMAT,IDC_COMPRESS,IDC_BODY,IDC_VALIDATION,IDC_SUMMARY,
     IDC_RESPONSE_TABS,IDC_RESPONSE_BODY,IDC_RESPONSE_HEADERS,IDC_RESPONSE_FIND_PANEL,IDC_RESPONSE_FIND_EDIT,IDC_RESPONSE_FIND_PREV,IDC_RESPONSE_FIND_NEXT,IDC_RESPONSE_FIND_CLOSE,IDC_BODY_NONE,IDC_EMPTY_TITLE,IDC_EMPTY_HELP,IDC_SIDEBAR_DIVIDER,IDC_REQUEST_TAB_SCROLL,
-    IDC_SAVE_STATUS,IDC_RESPONSE_MODE,IDC_RESPONSE_FIND,IDC_FIND_STATUS,
+    IDC_SAVE_STATUS,IDC_RESPONSE_MODE,IDC_RESPONSE_FIND,IDC_FIND_STATUS,IDC_RESPONSE_MODE_DIVIDER,
     IDC_PROMPT_EDIT=900,IDC_URL_FRAME,
     IDM_FOLDER_ADD_REQUEST=1000,IDM_FOLDER_ADD_CHILD,IDM_FOLDER_IMPORT,IDM_FOLDER_RENAME,IDM_FOLDER_DELETE,
     IDM_REQUEST_OPEN,IDM_REQUEST_RENAME,IDM_REQUEST_DUPLICATE,IDM_REQUEST_MOVE,IDM_REQUEST_DELETE,
@@ -46,6 +46,8 @@ constexpr UINT WM_UPDATE_TAB_SCROLL=WM_APP+5;
 constexpr UINT_PTR SAVE_FEEDBACK_TIMER=1;
 constexpr UINT_PTR REQUEST_TIMER=2;
 constexpr UINT_PTR DIRTY_TIMER=3;
+constexpr UINT_PTR FIND_WRAP_TIMER=4;
+constexpr int RESPONSE_TAB_WIDTH=68;
 
 struct NodeRef { enum class Kind { Folder, Request, Case } kind; void* value; ApiFolder* ownerFolder; ApiRequest* ownerRequest; };
 struct TabState {
@@ -84,7 +86,7 @@ HMODULE gRichEditModule{};
 HWND gWindow{},gSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gRequestTabScroll{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
 HWND gEditorTabs{},gKvList{},gBodyType{},gFormat{},gCompress{},gBody{},gValidation{};
 HWND gSummary{},gResponseTabs{},gResponseBody{},gResponseHeaders{},gResponseFindPanel{},gResponseFindEdit{},gResponseFindPrev{},gResponseFindNext{},gResponseFindClose{},gBodyNone{},gEmptyTitle{},gEmptyHelp{};
-HWND gSaveStatusLabel{},gResponseMode{},gResponseFind{},gFindStatus{};
+HWND gSaveStatusLabel{},gResponseMode{},gResponseModeDivider{},gResponseFind{},gFindStatus{},gResponseToolbarHot{};
 HFONT gUiFont{},gCodeFont{},gTitleFont{},gTreeFolderFont{},gTreeMethodFont{};
 HBRUSH gSidebarBrush{},gWhiteBrush{};
 HBRUSH gAccentBrush{},gSelectedBrush{},gHoverBrush{},gBorderBrush{};
@@ -100,6 +102,7 @@ int gSelectedEntryRows[3]{-1,-1,-1};
 ApiFolder* gSelectedFolder=nullptr;
 NodeRef* gTreeSelection=nullptr;
 int gEditorPage=0,gResponsePage=0;
+int gResponseTabHot=-1;
 bool gLoadingEditor=false,gLoadingEntryList=false;
 ApiRequest* gDragRequest=nullptr;
 ApiFolder* gDragTarget=nullptr;
@@ -123,6 +126,10 @@ bool gEnsureSelectedRequestTabVisible=false;
 bool gResponseFindVisible=false;
 wstring gResponseFindQuery;
 size_t gResponseFindPosition=wstring::npos;
+wstring gResponseSearchText;
+std::vector<size_t> gResponseMatches,gResponseHighlights;
+size_t gResponseHighlightLength=0,gResponseHighlightCurrent=wstring::npos;
+bool gApplyingResponseHighlights=false,gResponseFindWrapped=false;
 UINT gDpi=96;
 std::unordered_set<string> gExpandedRequests;
 
@@ -132,6 +139,9 @@ void closeTabRange(int contextIndex,int command);
 void layout(int width,int height);
 void findInResponseBody(bool forward);
 void showResponseFind(bool visible);
+void refreshResponseFind(bool selectFirst);
+void paintResponseMatches();
+void layoutResponseFindControls();
 void refreshRequestTabs();
 void updateDirtyStatus();
 void captureView();
@@ -333,7 +343,85 @@ LRESULT drawTab(const NMCUSTOMDRAW* draw,HWND tab) {
     SelectObject(dc,old);return CDRF_SKIPDEFAULT;
 }
 
+void paintResponseTabs(HWND tab,HDC dc) {
+    RECT client{};GetClientRect(tab,&client);FillRect(dc,&client,gWhiteBrush);
+    auto oldFont=(HFONT)SelectObject(dc,gUiFont);SetBkMode(dc,TRANSPARENT);
+    int selected=TabCtrl_GetCurSel(tab);bool enabled=IsWindowEnabled(tab)!=FALSE;
+    for(int index=0;index<TabCtrl_GetItemCount(tab);++index){
+        RECT item{};TabCtrl_GetItemRect(tab,index,&item);item.top=client.top;item.bottom=client.bottom;
+        if(enabled&&index==gResponseTabHot){RECT hover=item;InflateRect(&hover,-px(3),-px(4));fillRoundRect(dc,hover,COLOR_HOVER,6);}
+        wchar_t label[64]{};TCITEMW info{};info.mask=TCIF_TEXT;info.pszText=label;info.cchTextMax=64;TabCtrl_GetItem(tab,index,&info);
+        RECT text=item;text.bottom-=px(2);SetTextColor(dc,!enabled?RGB(156,163,175):(index==selected?COLOR_ACCENT:COLOR_SECONDARY));
+        DrawTextW(dc,label,-1,&text,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        if(index==selected){
+            SIZE size{};GetTextExtentPoint32W(dc,label,lstrlenW(label),&size);
+            int center=(item.left+item.right)/2;RECT underline{center-size.cx/2,client.bottom-px(2),center+(size.cx+1)/2,client.bottom};
+            FillRect(dc,&underline,enabled?gAccentBrush:gBorderBrush);
+        }
+        if(enabled&&GetFocus()==tab&&index==TabCtrl_GetCurFocus(tab)&&!(SendMessageW(tab,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){
+            RECT focus=item;InflateRect(&focus,-px(4),-px(5));DrawFocusRect(dc,&focus);
+        }
+    }
+    SelectObject(dc,oldFont);
+}
+
+LRESULT CALLBACK responseTabsProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    // Tab controls do not support NM_CUSTOMDRAW. Paint the strip ourselves,
+    // while keeping the native control's selection, keyboard and accessibility.
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PRINTCLIENT){paintResponseTabs(h,(HDC)w);return 0;}
+    if(message==WM_PAINT){
+        PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT client{};GetClientRect(h,&client);
+        int width=client.right-client.left,height=client.bottom-client.top;
+        if(width>0&&height>0){
+            HDC buffer=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);auto oldBitmap=SelectObject(buffer,bitmap);
+            paintResponseTabs(h,buffer);BitBlt(dc,0,0,width,height,buffer,0,0,SRCCOPY);
+            SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);
+        }
+        EndPaint(h,&paint);return 0;
+    }
+    if(message==WM_MOUSEMOVE){
+        TCHITTESTINFO hit{};hit.pt={(short)LOWORD(l),(short)HIWORD(l)};int hot=TabCtrl_HitTest(h,&hit);
+        if(hot!=gResponseTabHot){gResponseTabHot=hot;InvalidateRect(h,nullptr,FALSE);}
+        TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,h,0};TrackMouseEvent(&tracking);
+    }
+    if(message==WM_MOUSELEAVE||message==WM_ENABLE){gResponseTabHot=-1;InvalidateRect(h,nullptr,FALSE);}
+    if(message==WM_NCDESTROY){gResponseTabHot=-1;RemoveWindowSubclass(h,responseTabsProc,id);}
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_UPDATEUISTATE||message==TCM_SETCURSEL||message==TCM_SETCURFOCUS||message==WM_KEYDOWN||message==WM_LBUTTONDOWN)
+        InvalidateRect(h,nullptr,FALSE);
+    return result;
+}
+
 void drawButton(const DRAWITEMSTRUCT* draw) {
+    if(draw->CtlID==IDC_RESPONSE_MODE_DIVIDER){
+        FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
+        RECT line=draw->rcItem;line.left=(line.left+line.right)/2;line.right=line.left+px(1);line.top+=px(6);line.bottom-=px(6);
+        FillRect(draw->hDC,&line,gBorderBrush);return;
+    }
+    if(draw->CtlID==IDC_RESPONSE_MODE||draw->CtlID==IDC_RESPONSE_FIND){
+        bool disabled=(draw->itemState&ODS_DISABLED)!=0,pressed=(draw->itemState&ODS_SELECTED)!=0;
+        bool hot=!disabled&&gResponseToolbarHot==draw->hwndItem;
+        FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
+        if(!disabled&&(hot||pressed))fillRoundRect(draw->hDC,draw->rcItem,pressed?RGB(229,234,241):COLOR_HOVER,6);
+        COLORREF foreground=disabled?RGB(156,163,175):(hot||pressed?COLOR_PRIMARY:COLOR_SECONDARY);
+        // Retain the window text as the accessible name; the toolbar shows icons only.
+        HPEN pen=CreatePen(PS_SOLID,px(1),foreground);auto oldPen=(HPEN)SelectObject(draw->hDC,pen);auto oldBrush=(HBRUSH)SelectObject(draw->hDC,GetStockObject(NULL_BRUSH));
+        int cx=(draw->rcItem.left+draw->rcItem.right)/2,cy=(draw->rcItem.top+draw->rcItem.bottom)/2;
+        if(draw->CtlID==IDC_RESPONSE_MODE){
+            int x=cx-px(5);
+            for(int side:{-1,1}){
+                POINT brace[]={{x+side*px(2),cy-px(6)},{x+side*px(4),cy-px(6)},{x+side*px(4),cy-px(2)},
+                    {x+side*px(6),cy},{x+side*px(4),cy+px(2)},{x+side*px(4),cy+px(6)},{x+side*px(2),cy+px(6)}};
+                Polyline(draw->hDC,brace,7);
+            }
+            int arrow=cx+px(11);MoveToEx(draw->hDC,arrow-px(3),cy-px(1),nullptr);LineTo(draw->hDC,arrow,cy+px(2));LineTo(draw->hDC,arrow+px(3),cy-px(1));
+        }else{
+            int x=cx-px(6);Ellipse(draw->hDC,x,cy-px(6),x+px(10),cy+px(4));MoveToEx(draw->hDC,x+px(8),cy+px(3),nullptr);LineTo(draw->hDC,x+px(13),cy+px(8));
+        }
+        SelectObject(draw->hDC,oldBrush);SelectObject(draw->hDC,oldPen);DeleteObject(pen);
+        if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){RECT focus=draw->rcItem;InflateRect(&focus,-px(3),-px(3));DrawFocusRect(draw->hDC,&focus);}return;
+    }
     if(draw->CtlID==IDC_URL_FRAME){
         bool focused=GetFocus()==gUrl;COLORREF border=focused?COLOR_ACCENT:RGB(209,213,219);
         HBRUSH background=CreateSolidBrush(RGB(255,255,255));HPEN pen=CreatePen(PS_SOLID,px(1),border);
@@ -354,7 +442,7 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
         MoveToEx(draw->hDC,draw->rcItem.left,draw->rcItem.top+px(5),nullptr);LineTo(draw->hDC,draw->rcItem.left,draw->rcItem.bottom-px(5));
         SelectObject(draw->hDC,oldPen);DeleteObject(separator);
         int cx=(draw->rcItem.left+draw->rcItem.right)/2,cy=(draw->rcItem.top+draw->rcItem.bottom)/2+(pressed?px(1):0);
-        HPEN glyph=CreatePen(PS_SOLID,px(2),RGB(75,85,99));oldPen=(HPEN)SelectObject(draw->hDC,glyph);
+        HPEN glyph=CreatePen(PS_SOLID,px(2),(draw->itemState&ODS_DISABLED)?RGB(190,195,203):RGB(75,85,99));oldPen=(HPEN)SelectObject(draw->hDC,glyph);
         if(draw->CtlID==IDC_RESPONSE_FIND_CLOSE){
             int radius=px(4);MoveToEx(draw->hDC,cx-radius,cy-radius,nullptr);LineTo(draw->hDC,cx+radius,cy+radius);
             MoveToEx(draw->hDC,cx+radius,cy-radius,nullptr);LineTo(draw->hDC,cx-radius,cy+radius);
@@ -362,7 +450,8 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
             int tip=draw->CtlID==IDC_RESPONSE_FIND_PREV?-px(3):px(3);
             MoveToEx(draw->hDC,cx-px(4),cy-tip,nullptr);LineTo(draw->hDC,cx,cy+tip);LineTo(draw->hDC,cx+px(4),cy-tip);
         }
-        SelectObject(draw->hDC,oldPen);DeleteObject(glyph);return;
+        SelectObject(draw->hDC,oldPen);DeleteObject(glyph);
+        if(draw->itemState&ODS_FOCUS){RECT focus=draw->rcItem;InflateRect(&focus,-px(3),-px(3));DrawFocusRect(draw->hDC,&focus);}return;
     }
     bool primary=draw->CtlID==IDC_SEND;bool pressed=(draw->itemState&ODS_SELECTED)!=0;bool disabled=(draw->itemState&ODS_DISABLED)!=0;
     if(draw->CtlID==IDC_METHOD){
@@ -805,10 +894,12 @@ void updateResponseInsets() {
     SendMessageW(gResponseBody,EM_SETRECTNP,0,(LPARAM)&rect);
 }
 void displayResponse(const wstring& value,bool pretty) {
+    gResponseHighlights.clear();gResponseHighlightLength=0;gResponseHighlightCurrent=wstring::npos;
     SendMessageW(gResponseBody,WM_SETREDRAW,FALSE,0);setText(gResponseBody,value);
     if(gRichEditModule){
-        CHARFORMAT2W format{};format.cbSize=sizeof(format);format.dwMask=CFM_COLOR|CFM_BOLD;format.crTextColor=RGB(51,65,85);
+        CHARFORMAT2W format{};format.cbSize=sizeof(format);format.dwMask=CFM_COLOR|CFM_BOLD|CFM_BACKCOLOR;format.crTextColor=RGB(51,65,85);format.dwEffects=CFE_AUTOBACKCOLOR;
         SendMessageW(gResponseBody,EM_SETCHARFORMAT,SCF_ALL,(LPARAM)&format);
+        format.dwMask=CFM_COLOR|CFM_BOLD;format.dwEffects=0;
         PARAFORMAT2 paragraph{};paragraph.cbSize=sizeof(paragraph);paragraph.dwMask=PFM_LINESPACING;paragraph.bLineSpacingRule=5;paragraph.dyLineSpacing=24;
         SendMessageW(gResponseBody,EM_SETSEL,0,-1);SendMessageW(gResponseBody,EM_SETPARAFORMAT,0,(LPARAM)&paragraph);
         // Bound per-token native messages for very large responses.
@@ -833,17 +924,21 @@ void displayResponse(const wstring& value,bool pretty) {
         }
         SendMessageW(gResponseBody,EM_SETSEL,0,0);SendMessageW(gResponseBody,EM_EMPTYUNDOBUFFER,0,0);
     }
+    gResponseSearchText=responseText();for(auto& c:gResponseSearchText)c=static_cast<wchar_t>(towlower(c));
     updateResponseInsets();SendMessageW(gResponseBody,WM_SETREDRAW,TRUE,0);InvalidateRect(gResponseBody,nullptr,TRUE);
 }
 void showResponsePage() {
     auto tab=selectedTab();if(!tab)return;
     setVisible(gResponseBody,gResponsePage==0);setVisible(gResponseHeaders,gResponsePage==1);
-    for(HWND control:{gResponseMode,gResponseFind})setVisible(control,gResponsePage==0);
+    setVisible(gResponseMode,gResponsePage==0);setVisible(gResponseModeDivider,gResponsePage==0);setVisible(gResponseFind,gResponsePage==0&&!gResponseFindVisible);
     bool showFind=gResponsePage==0&&gResponseFindVisible;
     setVisible(gResponseFindPanel,showFind);setVisible(gFindStatus,showFind);
     if(gResponsePage==0){
         displayResponse(toWide(tab->rawView?tab->responseRaw:tab->responsePretty),!tab->rawView);
-        setText(gResponseMode,tab->rawView?L"原始 ▾":L"格式化 ▾");
+        setText(gResponseMode,tab->rawView?L"原始":L"格式化");
+        TOOLINFOW modeTip{sizeof(modeTip)};modeTip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;modeTip.hwnd=gWindow;modeTip.uId=(UINT_PTR)gResponseMode;
+        modeTip.lpszText=(LPWSTR)(tab->rawView?L"响应显示方式：原始（点击切换）":L"响应显示方式：格式化（点击切换）");
+        SendMessageW(gSaveTooltip,TTM_UPDATETIPTEXTW,0,(LPARAM)&modeTip);
         SendMessageW(gResponseBody,EM_SETSEL,tab->selectionStart,tab->selectionEnd);
         if(gRichEditModule)SendMessageW(gResponseBody,EM_SETSCROLLPOS,0,(LPARAM)&tab->responseScroll);
         else {
@@ -855,12 +950,16 @@ void showResponsePage() {
     EnableWindow(gResponseMode,hasResponse);
     setText(gSummary,tab->summary+(tab->oldResponse?L"   · 正在显示上次响应":L""));InvalidateRect(gSummary,nullptr,TRUE);
     RECT client{};GetClientRect(gWindow,&client);layout((int)client.right,(int)client.bottom);
+    if(gResponsePage==0){
+        refreshResponseFind(false);
+        if(gRichEditModule)SendMessageW(gResponseBody,EM_HIDESELECTION,gResponseFindVisible&&GetFocus()!=gResponseBody,0);
+    }
 }
 void loadEditor() {
     captureView();gLoadingEditor=true;auto tab=selectedTab();bool active=tab!=nullptr;
     for(HWND control:{gRequestTabs,gMethod,gUrlFrame,gUrl,gSave,gSaveMore,gSend,gCancel,gEditorTabs,gSummary,gResponseTabs})EnableWindow(control,active);
     setVisible(gEmptyTitle,!active);setVisible(gEmptyHelp,!active);
-    for(HWND control:{gMethod,gUrlFrame,gUrl,gSaveMore,gEditorTabs,gKvList,gBodyType,gFormat,gCompress,gBody,gValidation,gSummary,gResponseTabs,gResponseBody,gResponseHeaders,gBodyNone,gResponseMode,gResponseFind})setVisible(control,active);
+    for(HWND control:{gMethod,gUrlFrame,gUrl,gSaveMore,gEditorTabs,gKvList,gBodyType,gFormat,gCompress,gBody,gValidation,gSummary,gResponseTabs,gResponseBody,gResponseHeaders,gBodyNone,gResponseMode,gResponseModeDivider,gResponseFind})setVisible(control,active);
     EnableWindow(gSave,TRUE);setVisible(gSave,true);
     if(!active){gDisplayedTab.reset();setVisible(gResponseFindPanel,false);setVisible(gFindStatus,false);setVisible(gSend,false);setVisible(gCancel,false);setText(gUrl,L"");setText(gResponseBody,L"");gLoadingEditor=false;return;}
     gEditorPage=tab->editorPage;gResponsePage=tab->responsePage;gResponseFindVisible=tab->findVisible;gResponseFindQuery=tab->findQuery;gResponseFindPosition=tab->findPosition;
@@ -1115,41 +1214,165 @@ LRESULT CALLBACK responseHeadersProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_
     if(message==WM_KEYDOWN&&GetKeyState(VK_CONTROL)<0&&w=='C'){copySelectedListRow(h,false);return 0;}
     return DefSubclassProc(h,message,w,l);
 }
+void layoutResponseFindControls() {
+    RECT panel{};GetClientRect(gResponseFindPanel,&panel);int width=dip(panel.right);
+    HDC dc=GetDC(gFindStatus);auto oldFont=(HFONT)SelectObject(dc,gUiFont);SIZE statusSize{};wstring status=textOf(gFindStatus);
+    GetTextExtentPoint32W(dc,status.c_str(),(int)status.size(),&statusSize);SelectObject(dc,oldFont);ReleaseDC(gFindStatus,dc);
+    int statusWidth=std::clamp(dip(statusSize.cx)+12,48,154),editWidth=std::max(1,width-28-statusWidth-88);
+    MoveWindow(gResponseFindEdit,px(28),px(6),px(editWidth),px(22),TRUE);
+    MoveWindow(gFindStatus,px(28+editWidth),px(2),px(statusWidth),px(28),TRUE);
+    MoveWindow(gResponseFindPrev,px(width-88),px(2),px(28),px(28),TRUE);
+    MoveWindow(gResponseFindNext,px(width-60),px(2),px(28),px(28),TRUE);
+    MoveWindow(gResponseFindClose,px(width-32),px(2),px(28),px(28),TRUE);
+}
+void updateResponseFindStatus() {
+    auto current=std::lower_bound(gResponseMatches.begin(),gResponseMatches.end(),gResponseFindPosition);
+    bool found=current!=gResponseMatches.end()&&*current==gResponseFindPosition;
+    wstring status=gResponseFindQuery.empty()?L"":L"未找到";
+    if(found)status=(gResponseFindWrapped?L"↻ ":L"")+std::to_wstring(current-gResponseMatches.begin()+1)+L" / "+std::to_wstring(gResponseMatches.size());
+    setText(gFindStatus,status);EnableWindow(gResponseFindPrev,found);EnableWindow(gResponseFindNext,found);
+    layoutResponseFindControls();
+    InvalidateRect(gFindStatus,nullptr,TRUE);
+}
+void paintResponseMatches() {
+    if(!gRichEditModule||gApplyingResponseHighlights)return;
+    std::vector<size_t> visible;
+    if(gResponseFindVisible&&gResponsePage==0&&!gResponseMatches.empty()){
+        // Only decorate visible portions of lines. Even a multi-megabyte raw
+        // line can have millions of matches outside the horizontal viewport.
+        RECT viewport{};SendMessageW(gResponseBody,EM_GETRECT,0,(LPARAM)&viewport);
+        if(viewport.right>viewport.left&&viewport.bottom>viewport.top){
+            POINTL bottom{viewport.right-1,viewport.bottom-1};
+            LRESULT lastChar=SendMessageW(gResponseBody,EM_CHARFROMPOS,0,(LPARAM)&bottom);
+            int firstLine=(int)SendMessageW(gResponseBody,EM_GETFIRSTVISIBLELINE,0,0);
+            int lastLine=(int)SendMessageW(gResponseBody,EM_EXLINEFROMCHAR,0,lastChar);
+            for(int line=firstLine;line<=lastLine;++line){
+                LRESULT start=SendMessageW(gResponseBody,EM_LINEINDEX,line,0);if(start<0)break;
+                POINTL origin{};SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&origin,start);
+                LONG y=std::clamp(origin.y,viewport.top,viewport.bottom-1);
+                POINTL left{viewport.left,y},right{viewport.right-1,y};
+                LRESULT begin=SendMessageW(gResponseBody,EM_CHARFROMPOS,0,(LPARAM)&left);
+                LRESULT end=SendMessageW(gResponseBody,EM_CHARFROMPOS,0,(LPARAM)&right);
+                if(begin<0||end<begin)continue;
+                size_t earliest=(size_t)begin>=gResponseFindQuery.size()?(size_t)begin-gResponseFindQuery.size()+1:0;
+                for(auto match=std::lower_bound(gResponseMatches.begin(),gResponseMatches.end(),earliest);match!=gResponseMatches.end()&&*match<=(size_t)end;++match)visible.push_back(*match);
+            }
+        }
+        if(gResponseFindPosition!=wstring::npos)visible.push_back(gResponseFindPosition);
+        std::sort(visible.begin(),visible.end());visible.erase(std::unique(visible.begin(),visible.end()),visible.end());
+    }
+    if(visible==gResponseHighlights&&gResponseHighlightLength==gResponseFindQuery.size()&&gResponseHighlightCurrent==gResponseFindPosition)return;
+    gApplyingResponseHighlights=true;
+    CHARRANGE selection{};POINT scroll{};
+    SendMessageW(gResponseBody,EM_EXGETSEL,0,(LPARAM)&selection);SendMessageW(gResponseBody,EM_GETSCROLLPOS,0,(LPARAM)&scroll);
+    LRESULT modified=SendMessageW(gResponseBody,EM_GETMODIFY,0,0);
+    SendMessageW(gResponseBody,WM_SETREDRAW,FALSE,0);
+    CHARFORMAT2W format{};format.cbSize=sizeof(format);format.dwMask=CFM_BACKCOLOR;format.dwEffects=CFE_AUTOBACKCOLOR;
+    for(size_t position:gResponseHighlights){
+        SendMessageW(gResponseBody,EM_SETSEL,position,position+gResponseHighlightLength);
+        SendMessageW(gResponseBody,EM_SETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);
+    }
+    format.dwEffects=0;
+    for(size_t position:visible){
+        format.crBackColor=position==gResponseFindPosition?RGB(255,203,87):RGB(255,240,171);
+        SendMessageW(gResponseBody,EM_SETSEL,position,position+gResponseFindQuery.size());
+        SendMessageW(gResponseBody,EM_SETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);
+    }
+    SendMessageW(gResponseBody,EM_EXSETSEL,0,(LPARAM)&selection);SendMessageW(gResponseBody,EM_SETSCROLLPOS,0,(LPARAM)&scroll);
+    SendMessageW(gResponseBody,EM_SETMODIFY,modified,0);SendMessageW(gResponseBody,WM_SETREDRAW,TRUE,0);
+    gResponseHighlights=std::move(visible);gResponseHighlightLength=gResponseFindQuery.size();gResponseHighlightCurrent=gResponseFindPosition;
+    gApplyingResponseHighlights=false;
+    // Formatting with redraw disabled invalidates Rich Edit's cached pixels.
+    // Even inside WM_PAINT, repaint the full client: a scroll's
+    // original dirty strip no longer covers everything that needs refreshing.
+    InvalidateRect(gResponseBody,nullptr,TRUE);
+}
+void selectResponseMatch() {
+    // Rich Edit ignores EM_SCROLLCARET while its selection is hidden. Reveal it
+    // for scrolling, then restore our match backgrounds without moving focus.
+    bool hideSelection=gRichEditModule&&gResponseFindVisible&&GetFocus()!=gResponseBody;
+    if(hideSelection)SendMessageW(gResponseBody,EM_HIDESELECTION,FALSE,0);
+    size_t end=gResponseFindPosition+gResponseFindQuery.size();
+    SendMessageW(gResponseBody,EM_SETSEL,end,end);
+    SendMessageW(gResponseBody,EM_SCROLLCARET,0,0);
+    // Reveal both ends: scrolling only the caret can leave the start clipped
+    // when navigating left. For a match wider than the viewport, show its start.
+    SendMessageW(gResponseBody,EM_SETSEL,gResponseFindPosition,gResponseFindPosition);
+    SendMessageW(gResponseBody,EM_SCROLLCARET,0,0);
+    SendMessageW(gResponseBody,EM_SETSEL,gResponseFindPosition,end);
+    if(hideSelection)SendMessageW(gResponseBody,EM_HIDESELECTION,TRUE,0);
+}
+void refreshResponseFind(bool selectFirst) {
+    gResponseMatches.clear();wstring query=gResponseFindQuery;
+    for(auto& c:query)c=static_cast<wchar_t>(towlower(c));
+    if(!query.empty())for(size_t pos=gResponseSearchText.find(query);pos!=wstring::npos;pos=gResponseSearchText.find(query,pos+query.size()))gResponseMatches.push_back(pos);
+    bool valid=std::binary_search(gResponseMatches.begin(),gResponseMatches.end(),gResponseFindPosition);
+    if(selectFirst||!valid)gResponseFindPosition=gResponseMatches.empty()?wstring::npos:gResponseMatches.front();
+    if(gResponseFindVisible&&gResponsePage==0&&gResponseFindPosition!=wstring::npos&&(selectFirst||!valid)){
+        selectResponseMatch();
+    }
+    gResponseFindWrapped=false;KillTimer(gWindow,FIND_WRAP_TIMER);updateResponseFindStatus();paintResponseMatches();
+}
 void showResponseFind(bool visible) {
-    auto tab=selectedTab();if(!tab)return;captureView();
-    gResponseFindVisible=visible;tab->findVisible=visible;
-    showResponsePage();
-    if(visible){SetFocus(gResponseFindEdit);SendMessageW(gResponseFindEdit,EM_SETSEL,0,-1);}
-    else SetFocus(gResponseBody);
+    auto tab=selectedTab();if(!tab)return;
+    wstring seed;
+    if(visible&&gResponsePage==0&&GetFocus()==gResponseBody){
+        DWORD start=0,end=0;SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
+        if(end>start){seed=responseText().substr(start,end-start);if(seed.find_first_of(L"\r\n")!=wstring::npos)seed.clear();}
+    }
+    captureView();gResponseFindVisible=visible;tab->findVisible=visible;
+    bool switchedPage=visible&&gResponsePage!=0;
+    if(switchedPage){gResponsePage=0;tab->responsePage=0;TabCtrl_SetCurSel(gResponseTabs,0);showResponsePage();}
+    if(!seed.empty()){
+        bool loading=gLoadingEditor;gLoadingEditor=true;setText(gResponseFindEdit,seed);gLoadingEditor=loading;gResponseFindQuery=seed;
+    }
+    setVisible(gResponseFind, !visible&&gResponsePage==0);setVisible(gResponseFindPanel,visible);setVisible(gFindStatus,visible);
+    RECT client{};GetClientRect(gWindow,&client);layout((int)client.right,(int)client.bottom);
+    if(visible){
+        if(!switchedPage)refreshResponseFind(!seed.empty());SetFocus(gResponseFindEdit);SendMessageW(gResponseFindEdit,EM_SETSEL,0,-1);
+        if(gRichEditModule)SendMessageW(gResponseBody,EM_HIDESELECTION,TRUE,0);
+    }else{
+        gResponseFindWrapped=false;KillTimer(gWindow,FIND_WRAP_TIMER);updateResponseFindStatus();paintResponseMatches();
+        SetFocus(gResponseBody);if(gRichEditModule)SendMessageW(gResponseBody,EM_HIDESELECTION,FALSE,0);
+    }
+    captureView();
 }
 void findInResponseBody(bool forward) {
-    auto tab=selectedTab();if(!tab)return;
-    wstring query=textOf(gResponseFindEdit);auto matches=ResponseMatches::find(responseText(),query);
-    if(query!=gResponseFindQuery){gResponseFindQuery=query;gResponseFindPosition=wstring::npos;}
-    if(matches.positions.empty()){
-        setText(gFindStatus,query.empty()?L"输入查找内容":L"未找到");gResponseFindPosition=wstring::npos;
-        SendMessageW(gResponseBody,EM_SETSEL,0,0);captureView();return;
-    }
-    auto current=std::find(matches.positions.begin(),matches.positions.end(),gResponseFindPosition);
-    int count=(int)matches.positions.size(),index=current==matches.positions.end()?(forward?-1:count):(int)std::distance(matches.positions.begin(),current);
-    index+=forward?1:-1;bool wrapped=index<0||index>=count;
-    if(index<0)index=count-1;else if(index>=count)index=0;
-    gResponseFindPosition=matches.positions[(size_t)index];
-    setText(gFindStatus,std::to_wstring(index+1)+L" / "+std::to_wstring(count)+(wrapped?L" · 已循环":L""));
-    SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)gResponseFindPosition,(LPARAM)(gResponseFindPosition+query.size()));
-    SendMessageW(gResponseBody,EM_SCROLLCARET,0,0);captureView();
+    if(!selectedTab()||gResponseMatches.empty())return;
+    auto current=std::lower_bound(gResponseMatches.begin(),gResponseMatches.end(),gResponseFindPosition);
+    size_t index=current==gResponseMatches.end()?0:(size_t)(current-gResponseMatches.begin());
+    gResponseFindWrapped=forward?index+1==gResponseMatches.size():index==0;
+    index=forward?(index+1)%gResponseMatches.size():(index+gResponseMatches.size()-1)%gResponseMatches.size();
+    gResponseFindPosition=gResponseMatches[index];updateResponseFindStatus();
+    KillTimer(gWindow,FIND_WRAP_TIMER);if(gResponseFindWrapped)SetTimer(gWindow,FIND_WRAP_TIMER,1500,nullptr);
+    selectResponseMatch();paintResponseMatches();captureView();
 }
 LRESULT CALLBACK responseFindEditProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
-    if(message==WM_KEYDOWN&&w==VK_RETURN){findInResponseBody(GetKeyState(VK_SHIFT)>=0);return 0;}
-    if(message==WM_KEYDOWN&&w==VK_ESCAPE){showResponseFind(false);return 0;}
+    if(message==WM_IME_STARTCOMPOSITION)gImeComposing=true;
+    if(message==WM_IME_ENDCOMPOSITION){LRESULT result=DefSubclassProc(h,message,w,l);gImeComposing=false;gResponseFindQuery=textOf(h);refreshResponseFind(true);captureView();return result;}
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS)InvalidateRect(gResponseFindPanel,nullptr,FALSE);
+    if(message==WM_KEYDOWN&&!gImeComposing&&w==VK_RETURN){findInResponseBody(GetKeyState(VK_SHIFT)>=0);return 0;}
+    if(message==WM_KEYDOWN&&!gImeComposing&&w==VK_ESCAPE){showResponseFind(false);return 0;}
+    if(message==WM_CHAR&&!gImeComposing&&(w==VK_RETURN||w==VK_ESCAPE))return 0;
     if(message==WM_KEYDOWN&&GetKeyState(VK_CONTROL)<0&&w=='F'){SendMessageW(h,EM_SETSEL,0,-1);return 0;}
     return DefSubclassProc(h,message,w,l);
 }
 LRESULT CALLBACK responseFindPanelProc(HWND h,UINT message,WPARAM w,LPARAM l) {
-    if(message==WM_COMMAND){SendMessageW(gWindow,message,w,l);return 0;}
+    if(message==WM_COMMAND||message==WM_DRAWITEM||message==WM_CTLCOLORSTATIC||message==WM_CTLCOLOREDIT)return SendMessageW(gWindow,message,w,l);
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT){
+        PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT rect{};GetClientRect(h,&rect);FillRect(dc,&rect,gWhiteBrush);
+        HPEN border=CreatePen(PS_SOLID,px(1),GetFocus()==gResponseFindEdit?COLOR_ACCENT:COLOR_BORDER);auto oldPen=(HPEN)SelectObject(dc,border);auto oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
+        RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,px(6),px(6));SelectObject(dc,oldPen);DeleteObject(border);
+        HPEN icon=CreatePen(PS_SOLID,px(1),COLOR_SECONDARY);oldPen=(HPEN)SelectObject(dc,icon);
+        int x=px(8),y=(rect.bottom-px(10))/2;Ellipse(dc,x,y,x+px(9),y+px(9));MoveToEx(dc,x+px(8),y+px(8),nullptr);LineTo(dc,x+px(13),y+px(13));
+        SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(icon);EndPaint(h,&paint);return 0;
+    }
     return DefWindowProcW(h,message,w,l);
 }
 LRESULT CALLBACK responseBodyProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
+    if(message==WM_PAINT)paintResponseMatches();
+    if(gRichEditModule&&(message==WM_SETFOCUS||message==WM_KILLFOCUS))SendMessageW(h,EM_HIDESELECTION,message==WM_KILLFOCUS&&gResponseFindVisible,0);
     if(message==WM_LBUTTONDBLCLK){
         POINTL point{(short)LOWORD(l),(short)HIWORD(l)};
         LRESULT hit=gRichEditModule?SendMessageW(h,EM_CHARFROMPOS,0,(LPARAM)&point):LOWORD(SendMessageW(h,EM_CHARFROMPOS,0,l));
@@ -1281,6 +1504,18 @@ void showMethodMenu() {
     RECT bounds{};GetWindowRect(gMethod,&bounds);UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_LEFTALIGN|TPM_TOPALIGN,bounds.left,bounds.bottom,0,gWindow,nullptr);DestroyMenu(menu);
     if(command>=1&&command<=7){setText(gMethod,methods[command-1]);saveEditor();scheduleSave();InvalidateRect(gMethod,nullptr,TRUE);}
 }
+LRESULT CALLBACK responseToolbarButtonProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_MOUSEMOVE&&IsWindowEnabled(h)&&gResponseToolbarHot!=h){
+        HWND previous=gResponseToolbarHot;gResponseToolbarHot=h;
+        if(previous)InvalidateRect(previous,nullptr,FALSE);InvalidateRect(h,nullptr,FALSE);
+        TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,h,0};TrackMouseEvent(&track);
+    }
+    if(message==WM_MOUSELEAVE||((message==WM_ENABLE||message==WM_SHOWWINDOW)&&!w)||message==WM_NCDESTROY){
+        if(gResponseToolbarHot==h){gResponseToolbarHot=nullptr;InvalidateRect(h,nullptr,FALSE);}
+    }
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(h,responseToolbarButtonProc,id);
+    return DefSubclassProc(h,message,w,l);
+}
 void createControls() {
     gSearch=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOHSCROLL,IDC_SEARCH,WS_EX_CLIENTEDGE);SetWindowSubclass(gSearch,searchProc,5,0);
     gAddFolder=child(L"BUTTON",L"+",BS_OWNERDRAW,IDC_ADD_FOLDER);
@@ -1310,21 +1545,28 @@ void createControls() {
     gBody=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL,IDC_BODY,WS_EX_CLIENTEDGE);applyFont(gBody,gCodeFont);SendMessageW(gBody,EM_SETLIMITTEXT,2*1024*1024,0);
     gBodyNone=child(L"STATIC",L"当前请求不发送请求体。",SS_CENTER,IDC_BODY_NONE);
     gValidation=child(L"STATIC",L"",SS_LEFT,IDC_VALIDATION);gSummary=child(L"STATIC",L"暂无响应",SS_LEFT,IDC_SUMMARY);
-    gResponseTabs=child(WC_TABCONTROLW,L"",TCS_TABS,IDC_RESPONSE_TABS);SendMessageW(gResponseTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(30)));SendMessageW(gResponseTabs,TCM_SETPADDING,0,MAKELPARAM(px(12),px(4)));for(auto label:{L"Body",L"Headers"}){TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label;TabCtrl_InsertItem(gResponseTabs,TabCtrl_GetItemCount(gResponseTabs),&item);}
+    gResponseTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE|TCS_FIXEDWIDTH,IDC_RESPONSE_TABS);SendMessageW(gResponseTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(RESPONSE_TAB_WIDTH),px(30)));for(auto label:{L"Body",L"Headers"}){TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label;TabCtrl_InsertItem(gResponseTabs,TabCtrl_GetItemCount(gResponseTabs),&item);}
+    SetWindowSubclass(gResponseTabs,responseTabsProc,11,0);
     gResponseBody=child(gRichEditModule?MSFTEDIT_CLASS:L"EDIT",L"",ES_MULTILINE|ES_READONLY|ES_NOHIDESEL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL,IDC_RESPONSE_BODY,WS_EX_CLIENTEDGE);applyFont(gResponseBody,gCodeFont);SendMessageW(gResponseBody,EM_SETLIMITTEXT,5*1024*1024,0);SetWindowSubclass(gResponseBody,responseBodyProc,7,0);
-    if(gRichEditModule){SendMessageW(gResponseBody,EM_SETBKGNDCOLOR,0,RGB(248,250,252));SendMessageW(gResponseBody,EM_SETTARGETDEVICE,0,1);}
-    gResponseMode=child(L"BUTTON",L"格式化 ▾",BS_OWNERDRAW,IDC_RESPONSE_MODE);
+    if(gRichEditModule){SendMessageW(gResponseBody,EM_SETBKGNDCOLOR,0,RGB(248,250,252));SendMessageW(gResponseBody,EM_SETTARGETDEVICE,0,1);SendMessageW(gResponseBody,EM_SETUNDOLIMIT,0,0);}
+    gResponseModeDivider=child(L"STATIC",L"",SS_OWNERDRAW,IDC_RESPONSE_MODE_DIVIDER);
+    gResponseMode=child(L"BUTTON",L"格式化",BS_OWNERDRAW,IDC_RESPONSE_MODE);
     gResponseFind=child(L"BUTTON",L"查找",BS_OWNERDRAW,IDC_RESPONSE_FIND);
-    gFindStatus=child(L"STATIC",L"输入查找内容",SS_LEFT,IDC_FIND_STATUS);
+    for(HWND button:{gResponseMode,gResponseFind})SetWindowSubclass(button,responseToolbarButtonProc,10,0);
     gResponseHeaders=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL,IDC_RESPONSE_HEADERS,WS_EX_CLIENTEDGE);ListView_SetExtendedListViewStyle(gResponseHeaders,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);addListColumns(gResponseHeaders,false);
     SetWindowSubclass(gResponseHeaders,responseHeadersProc,4,0);
     gResponseFindPanel=CreateWindowExW(WS_EX_CONTROLPARENT,L"FeatherApiResponseFind",L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,0,0,10,10,gWindow,(HMENU)(INT_PTR)IDC_RESPONSE_FIND_PANEL,gInstance,nullptr);
-    gResponseFindEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,10,10,gResponseFindPanel,(HMENU)(INT_PTR)IDC_RESPONSE_FIND_EDIT,gInstance,nullptr);applyFont(gResponseFindEdit);SetWindowSubclass(gResponseFindEdit,responseFindEditProc,9,0);
-    auto findButton=[&](const wchar_t* label,int id){HWND button=CreateWindowW(L"BUTTON",label,WS_CHILD|WS_VISIBLE|WS_TABSTOP,0,0,10,10,gResponseFindPanel,(HMENU)(INT_PTR)id,gInstance,nullptr);applyFont(button);return button;};
+    gResponseFindEdit=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,10,10,gResponseFindPanel,(HMENU)(INT_PTR)IDC_RESPONSE_FIND_EDIT,gInstance,nullptr);applyFont(gResponseFindEdit);SetWindowSubclass(gResponseFindEdit,responseFindEditProc,9,0);
+    SendMessageW(gResponseFindEdit,EM_SETCUEBANNER,TRUE,(LPARAM)L"在响应中查找");
+    SendMessageW(gResponseFindEdit,EM_SETLIMITTEXT,5*1024*1024,0);
+    gFindStatus=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_CENTER|SS_CENTERIMAGE,0,0,10,10,gResponseFindPanel,(HMENU)(INT_PTR)IDC_FIND_STATUS,gInstance,nullptr);applyFont(gFindStatus);
+    auto findButton=[&](const wchar_t* label,int id){HWND button=CreateWindowW(L"BUTTON",label,WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,10,10,gResponseFindPanel,(HMENU)(INT_PTR)id,gInstance,nullptr);applyFont(button);return button;};
     gResponseFindPrev=findButton(L"上一个",IDC_RESPONSE_FIND_PREV);gResponseFindNext=findButton(L"下一个",IDC_RESPONSE_FIND_NEXT);gResponseFindClose=findButton(L"关闭",IDC_RESPONSE_FIND_CLOSE);
     for(HWND control:{gResponseFindPanel,gFindStatus})setVisible(control,false);
     auto tooltip=[&](HWND control,const wchar_t* label){TOOLINFOW tool{sizeof(tool)};tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tool.hwnd=gWindow;tool.uId=(UINT_PTR)control;tool.lpszText=(LPWSTR)label;SendMessageW(gSaveTooltip,TTM_ADDTOOLW,0,(LPARAM)&tool);};
     tooltip(gSend,L"发送请求 (Ctrl+Enter)");tooltip(gUrl,L"请求地址 (Ctrl+L)");tooltip(gResponseFind,L"查找响应 (Ctrl+F)，Enter 下一个，Shift+Enter 上一个，Esc 关闭");
+    tooltip(gResponseMode,L"响应显示方式：格式化 / 原始");
+    tooltip(gResponseFindPrev,L"上一个 (Shift+Enter)");tooltip(gResponseFindNext,L"下一个 (Enter)");tooltip(gResponseFindClose,L"关闭查找 (Esc)");tooltip(gFindStatus,L"当前匹配 / 全部匹配；↻ 表示已循环查找");
     tooltip(gKvList,L"Tab / Shift+Tab 连续编辑；Enter 提交；Esc 撤销单元格；F2 编辑；Delete 删除行");tooltip(gAddFolder,L"新增目录");
     gEmptyTitle=child(L"STATIC",L"还没有打开接口",SS_CENTER,IDC_EMPTY_TITLE);applyFont(gEmptyTitle,gTitleFont);
     gEmptyHelp=child(L"STATIC",L"请在左侧选择接口，或右键点击目录，选择“新增接口”。",SS_CENTER,IDC_EMPTY_HELP);
@@ -1373,21 +1615,20 @@ void layout(int width,int height) {
     move(gBody,contentX,editorTop+72,contentW,editorHeight-72-validationReserve);move(gBodyNone,contentX,editorTop+editorHeight/2,contentW,28);
     move(gValidation,contentX,editorTop+editorHeight-26,contentW,24);
     int responseTop=editorTop+editorHeight;move(gSummary,contentX,responseTop+4,contentW,28);
-    move(gResponseTabs,contentX,responseTop+34,contentW-164,36);
-    move(gResponseMode,contentX+contentW-158,responseTop+36,84,28);move(gResponseFind,contentX+contentW-68,responseTop+36,68,28);
-    bool findOpen=gResponseFindVisible&&gResponsePage==0&&selectedTab()!=nullptr;
-    int responseBodyTop=responseTop+68+(findOpen?38:0);
+    // Keep the view selector anchored to the tabs, independent of search state.
+    int responseTabsWidth=TabCtrl_GetItemCount(gResponseTabs)*RESPONSE_TAB_WIDTH+8;
+    int responseModeX=contentX+responseTabsWidth+12;
+    int findWidth=std::min(370,std::max(1,contentX+contentW-responseModeX-40-12));
+    move(gResponseTabs,contentX,responseTop+34,responseTabsWidth,34);
+    move(gResponseModeDivider,contentX+responseTabsWidth,responseTop+36,12,28);
+    move(gResponseMode,responseModeX,responseTop+36,40,28);move(gResponseFind,contentX+contentW-28,responseTop+36,28,28);
+    int responseBodyTop=responseTop+68;
     move(gResponseBody,contentX,responseBodyTop,contentW,std::max(40,height-responseBodyTop-10));
     move(gResponseHeaders,contentX,responseTop+68,contentW,std::max(40,height-responseTop-78));
-    move(gResponseFindPanel,contentX,responseTop+70,contentW-166,32);
-    move(gFindStatus,contentX+contentW-160,responseTop+76,160,24);
+    move(gResponseFindPanel,contentX+contentW-findWidth,responseTop+35,findWidth,32);
     move(gEmptyTitle,workspaceX+(workspaceW-360)/2,height/2-45,360,34);move(gEmptyHelp,workspaceX+(workspaceW-500)/2,height/2,500,28);
     if(deferred)EndDeferWindowPos(deferred);
-    int findEditWidth=std::max(100,contentW-166-196);
-    MoveWindow(gResponseFindEdit,0,px(2),px(findEditWidth),px(28),TRUE);
-    MoveWindow(gResponseFindPrev,px(findEditWidth+4),px(2),px(62),px(28),TRUE);
-    MoveWindow(gResponseFindNext,px(findEditWidth+68),px(2),px(62),px(28),TRUE);
-    MoveWindow(gResponseFindClose,px(findEditWidth+132),px(2),px(62),px(28),TRUE);updateUrlFormatting();updateResponseInsets();
+    layoutResponseFindControls();updateUrlFormatting();updateResponseInsets();
     PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);
     if(gResizeSidebar){
         // Repaint the parent surface exposed by all right-side children moving.
@@ -1439,20 +1680,22 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     case WM_SIZE:layout(LOWORD(l),HIWORD(l));return 0;
     case WM_GETMINMAXINFO:{auto info=(MINMAXINFO*)l;info->ptMinTrackSize.x=px(980);info->ptMinTrackSize.y=px(640);return 0;}
     case WM_DPICHANGED:{
-        gDpi=HIWORD(w);recreateFonts();for(HWND control=GetWindow(h,GW_CHILD);control;control=GetWindow(control,GW_HWNDNEXT))applyFont(control);applyFont(gUrl,gCodeFont);applyFont(gBody,gCodeFont);applyFont(gResponseBody,gCodeFont);applyFont(gEmptyTitle,gTitleFont);for(HWND control:{gResponseFindEdit,gResponseFindPrev,gResponseFindNext,gResponseFindClose})applyFont(control);updateSearchFormatting();TreeView_SetItemHeight(gTree,px(30));
+        gDpi=HIWORD(w);recreateFonts();for(HWND control=GetWindow(h,GW_CHILD);control;control=GetWindow(control,GW_HWNDNEXT))applyFont(control);applyFont(gUrl,gCodeFont);applyFont(gBody,gCodeFont);applyFont(gResponseBody,gCodeFont);applyFont(gEmptyTitle,gTitleFont);for(HWND control:{gResponseFindEdit,gResponseFindPrev,gResponseFindNext,gResponseFindClose,gFindStatus})applyFont(control);updateSearchFormatting();TreeView_SetItemHeight(gTree,px(30));
+        SendMessageW(gResponseTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(RESPONSE_TAB_WIDTH),px(30)));
         auto suggested=(RECT*)l;SetWindowPos(h,nullptr,suggested->left,suggested->top,suggested->right-suggested->left,suggested->bottom-suggested->top,SWP_NOZORDER|SWP_NOACTIVATE);return 0;
     }
     case WM_ERASEBKGND:{RECT client{};GetClientRect(h,&client);FillRect((HDC)w,&client,gWhiteBrush);RECT sidebar=client;sidebar.right=px(std::clamp(gData.sidebarWidth,180,420));FillRect((HDC)w,&sidebar,gSidebarBrush);return 1;}
+    case WM_CTLCOLOREDIT:if((HWND)l==gResponseFindEdit){SetTextColor((HDC)w,COLOR_PRIMARY);SetBkColor((HDC)w,RGB(255,255,255));return (LRESULT)gWhiteBrush;}break;
     case WM_CTLCOLORSTATIC:{HDC dc=(HDC)w;SetBkMode(dc,TRANSPARENT);if((HWND)l==gSidebarDivider){SetBkColor(dc,COLOR_BORDER);return (LRESULT)gBorderBrush;}if((HWND)l==gValidation)SetTextColor(dc,RGB(220,38,38));else if((HWND)l==gSaveStatusLabel)SetTextColor(dc,gSaveFailed?RGB(220,38,38):COLOR_SECONDARY);
+        else if((HWND)l==gFindStatus)SetTextColor(dc,!gResponseFindQuery.empty()&&gResponseMatches.empty()?RGB(185,28,28):(gResponseFindWrapped?COLOR_ACCENT:COLOR_SECONDARY));
         else if((HWND)l==gSummary){auto tab=selectedTab();COLORREF color=COLOR_PRIMARY;if(tab){if(tab->sending||tab->summary.find(L"已取消")==0)color=COLOR_SECONDARY;else if(tab->summary.find(L"网络错误")==0||tab->statusCode>=400)color=RGB(185,28,28);else if(tab->statusCode>=200&&tab->statusCode<300)color=RGB(21,128,61);}SetTextColor(dc,color);}
         else SetTextColor(dc,RGB(31,41,55));return (LRESULT)gWhiteBrush;}
     case WM_DRAWITEM:drawButton((DRAWITEMSTRUCT*)l);return TRUE;
     case WM_COMMAND: {
         int id=LOWORD(w),notification=HIWORD(w);
         if(id==IDC_RESPONSE_FIND_EDIT&&notification==EN_CHANGE&&!gLoadingEditor){
-            gResponseFindQuery=textOf(gResponseFindEdit);gResponseFindPosition=wstring::npos;
-            auto matches=ResponseMatches::find(responseText(),gResponseFindQuery);
-            setText(gFindStatus,gResponseFindQuery.empty()?L"输入查找内容":matches.positions.empty()?L"未找到":L"0 / "+std::to_wstring(matches.positions.size()));
+            if(gImeComposing)return 0;
+            gResponseFindQuery=textOf(gResponseFindEdit);refreshResponseFind(true);
             captureView();return 0;
         }
         if(id==IDC_SEARCH&&notification==EN_CHANGE){PostMessageW(h,WM_SEARCH_REFRESH,0,0);return 0;}
@@ -1463,7 +1706,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
             auto tab=selectedTab();if(!tab)break;HMENU menu=CreatePopupMenu();
             AppendMenuW(menu,MF_STRING|(!tab->rawView?MF_CHECKED:0),1,L"格式化");AppendMenuW(menu,MF_STRING|(tab->rawView?MF_CHECKED:0),2,L"原始");
             RECT rect{};GetWindowRect(gResponseMode,&rect);int choice=TrackPopupMenu(menu,TPM_RETURNCMD,rect.left,rect.bottom,0,h,nullptr);DestroyMenu(menu);
-            if(choice&&tab->rawView!=(choice==2)){captureView();tab->rawView=choice==2;tab->selectionStart=tab->selectionEnd=0;tab->firstVisibleLine=tab->horizontalScroll=0;tab->responseScroll={};tab->findPosition=gResponseFindPosition=wstring::npos;setText(gFindStatus,L"按 Enter 查找");showResponsePage();}break;
+            if(choice&&tab->rawView!=(choice==2)){captureView();tab->rawView=choice==2;tab->selectionStart=tab->selectionEnd=0;tab->firstVisibleLine=tab->horizontalScroll=0;tab->responseScroll={};tab->findPosition=gResponseFindPosition=wstring::npos;showResponsePage();captureView();}break;
         }
         case IDC_RESPONSE_FIND:showResponseFind(!gResponseFindVisible);break;
         case IDC_RESPONSE_FIND_PREV:if(notification==BN_CLICKED)findInResponseBody(false);break;
@@ -1597,6 +1840,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     case WM_SEARCH_REFRESH:rebuildTree();return 0;
     case WM_UPDATE_TAB_SCROLL:updateRequestTabScroll();return 0;
     case WM_TIMER:
+        if(w==FIND_WRAP_TIMER){KillTimer(h,FIND_WRAP_TIMER);gResponseFindWrapped=false;updateResponseFindStatus();return 0;}
         if(w==SAVE_FEEDBACK_TIMER){KillTimer(h,SAVE_FEEDBACK_TIMER);setText(gSave,L"保存全部");InvalidateRect(gSave,nullptr,TRUE);return 0;}
         if(w==DIRTY_TIMER){KillTimer(h,DIRTY_TIMER);updateDirtyStatus();return 0;}
         if(w==REQUEST_TIMER){
@@ -1619,7 +1863,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
             tab->statusCode=result.statusCode;tab->summary=std::to_wstring(result.statusCode)+L" "+result.statusText+L"    "+std::to_wstring(result.durationMs)+L" ms    "+formatBytes(result.sizeBytes);
             if(result.truncated)tab->summary+=L" · 响应已截断";
             tab->responseSummary=tab->summary;tab->oldResponse=false;
-            tab->selectionStart=tab->selectionEnd=0;tab->firstVisibleLine=tab->horizontalScroll=0;tab->responseScroll={};tab->findPosition=wstring::npos;tab->findStatus=L"按 Enter 查找";
+            tab->selectionStart=tab->selectionEnd=0;tab->firstVisibleLine=tab->horizontalScroll=0;tab->responseScroll={};tab->findPosition=wstring::npos;tab->findStatus.clear();
         }else{
             tab->summary=(result.cancelled?L"已取消    ":L"网络错误    ")+std::to_wstring(result.durationMs)+L" ms";
             tab->validation=result.cancelled?L"":result.errorMessage;tab->oldResponse=tab->responseSummary!=L"暂无响应";
@@ -1683,7 +1927,7 @@ int runMainWindow(HINSTANCE instance,int showCommand,const MainWindowServices& s
             if(ctrl&&message.wParam=='W'){closeTab(gSelectedTab);continue;}
             if(ctrl&&message.wParam==VK_TAB){switchRequestTab(shift);continue;}
             if(ctrl&&message.wParam=='F'&&selectedTab()){
-                captureView();gResponsePage=0;selectedTab()->responsePage=0;TabCtrl_SetCurSel(gResponseTabs,0);showResponseFind(true);continue;
+                showResponseFind(true);continue;
             }
             if(message.wParam==VK_ESCAPE&&gResponseFindVisible&&(focus==gResponseFindEdit||IsChild(gResponseFindPanel,focus)||focus==gResponseBody)){showResponseFind(false);continue;}
             if(message.wParam==VK_TAB&&!ctrl){
