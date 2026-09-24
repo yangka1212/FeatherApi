@@ -52,6 +52,190 @@ static void finish(const std::shared_ptr<TabState>& tab,bool success,bool cancel
 static RECT boundsInWindow(HWND control) {
     RECT bounds{};GetWindowRect(control,&bounds);MapWindowPoints(nullptr,gWindow,(POINT*)&bounds,2);return bounds;
 }
+static LRESULT CALLBACK observeRequestSelection(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR data) {
+    if(message==WM_NOTIFY){auto header=(NMHDR*)l;if(header->hwndFrom==gRequestTabs&&header->code==TCN_SELCHANGE)++*(int*)data;}
+    return DefSubclassProc(h,message,w,l);
+}
+static void runRequestTabTests(ApiRequest* request,ApiRequest* second) {
+    const UINT originalDpi=gDpi;const int originalSidebar=gData.sidebarWidth;RECT originalWindow{};GetWindowRect(gWindow,&originalWindow);
+    updateRequestTabScroll();
+    RECT client{},first{};GetClientRect(gRequestTabs,&client);TabCtrl_GetItemRect(gRequestTabs,0,&first);
+    HDC screen=GetDC(gRequestTabs),buffer=CreateCompatibleDC(screen);
+    HBITMAP bitmap=CreateCompatibleBitmap(screen,client.right,client.bottom);auto oldBitmap=SelectObject(buffer,bitmap);
+    PatBlt(buffer,0,0,client.right,client.bottom,BLACKNESS);
+    SendMessageW(gRequestTabs,WM_PRINTCLIENT,(WPARAM)buffer,PRF_CLIENT);
+    int tintedPixels=0;
+    for(int y=0;y<client.bottom;++y)for(int x=first.left;x<first.right;++x){
+        COLORREF color=GetPixel(buffer,x,y);
+        if(GetRValue(color)>160&&GetGValue(color)>GetRValue(color)+8&&GetGValue(color)>GetBValue(color)+5)++tintedPixels;
+    }
+    check(tintedPixels>px(10)*px(5),"request tab WM_PRINTCLIENT paints the GET method badge instead of the native strip");
+    SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);ReleaseDC(gRequestTabs,screen);
+
+    openRequest(second);openRequest(request);updateRequestTabScroll();auto active=selectedTab();
+    RECT clean{},dirty{};TabCtrl_GetItemRect(gRequestTabs,0,&clean);
+    const wstring originalUrl=textOf(gUrl);setText(gUrl,L"http://127.0.0.1/keep-current-draft");updateDirtyStatus();updateRequestTabScroll();
+    TabCtrl_GetItemRect(gRequestTabs,0,&dirty);
+    check(clean.right-clean.left==dirty.right-dirty.left,"dirty status does not shift request tab widths");
+    int selectionChanges=0,prompts=closePrompts;const auto count=gTabs.size();
+    SetWindowSubclass(gWindow,observeRequestSelection,71,(DWORD_PTR)&selectionChanges);
+    RECT close=requestTabCloseRect(gRequestTabs,1);
+    SendMessageW(gRequestTabs,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM((close.left+close.right)/2,(close.top+close.bottom)/2));
+    SendMessageW(gRequestTabs,WM_LBUTTONUP,0,MAKELPARAM((close.left+close.right)/2,(close.top+close.bottom)/2));
+    RemoveWindowSubclass(gWindow,observeRequestSelection,71);
+    check(gTabs.size()+1==count&&selectedTab()==active&&selectionChanges==0&&closePrompts==prompts&&
+          textOf(gUrl)==L"http://127.0.0.1/keep-current-draft"&&tabDirty(*active),
+          "closing an inactive request tab never selects it or changes the current draft");
+    setText(gUrl,originalUrl);updateDirtyStatus();
+
+    // Local requests exercise overflow without adding anything to the saved workspace.
+    std::vector<std::unique_ptr<ApiRequest>> overflow;
+    for(int i=0;i<8;++i){
+        auto extra=std::make_unique<ApiRequest>();extra->id="tab-overflow-"+std::to_string(i);
+        extra->name="请求标签滚动测试 "+std::to_string(i);extra->url="http://127.0.0.1/test";
+        openRequest(extra.get());overflow.push_back(std::move(extra));
+    }
+    int baselineHeight=0;
+    for(UINT dpi:{96u,144u,192u}){
+        gData.sidebarWidth=420;RECT proposed{0,0,MulDiv(980,(int)dpi,96),MulDiv(640,(int)dpi,96)};
+        SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
+        updateRequestTabScroll();
+        RECT tabs=boundsInWindow(gRequestTabs),scroll=boundsInWindow(gRequestTabScroll),last{};
+        TabCtrl_GetItemRect(gRequestTabs,TabCtrl_GetItemCount(gRequestTabs)-1,&last);
+        if(dpi==96)baselineHeight=tabs.bottom-tabs.top;
+        check(tabs.bottom-tabs.top==MulDiv(baselineHeight,(int)dpi,96)&&tabs.bottom<=scroll.top,
+              "request strip scales at 100/150/200 percent without overlapping its scrollbar");
+        check((GetWindowLongPtrW(gRequestTabScroll,GWL_STYLE)&WS_VISIBLE)&&last.left>=gRequestTabScrollOffset&&
+              last.right<=gRequestTabScrollOffset+gRequestTabViewportWidth,
+              "selecting an overflow request brings its entire tab into view at every DPI");
+        const RECT fixedSave=boundsInWindow(gSave),fixedMore=boundsInWindow(gSaveMore);
+        auto saveAreaIsProtected=[&](){
+            HRGN region=CreateRectRgn(0,0,0,0);const int regionKind=GetWindowRgn(gRequestTabs,region);
+            RECT clipped{};GetRgnBox(region,&clipped);DeleteObject(region);
+            RECT currentTabs=boundsInWindow(gRequestTabs);OffsetRect(&clipped,currentTabs.left,currentTabs.top);
+            RECT currentSave=boundsInWindow(gSave),currentMore=boundsInWindow(gSaveMore),currentScroll=boundsInWindow(gRequestTabScroll);
+            return regionKind!=ERROR&&regionKind!=NULLREGION&&clipped.right<=fixedSave.left&&currentScroll.right<=fixedSave.left&&
+                EqualRect(&fixedSave,&currentSave)&&EqualRect(&fixedMore,&currentMore);
+        };
+        bool saveProtected=saveAreaIsProtected();
+        auto selected=selectedTab();SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(gRequestTabScroll,SB_CTL,&info);
+        const int pages=(info.nMax-info.nMin+1)/std::max(1,(int)info.nPage)+2;
+        for(int i=0;i<pages;++i)SendMessageW(gWindow,WM_HSCROLL,SB_PAGELEFT,(LPARAM)gRequestTabScroll);
+        const bool reachedStart=gRequestTabScrollOffset==0;saveProtected=saveAreaIsProtected()&&saveProtected;
+        for(int i=0;i<pages;++i)SendMessageW(gWindow,WM_HSCROLL,SB_PAGERIGHT,(LPARAM)gRequestTabScroll);
+        check(reachedStart&&gRequestTabScrollOffset+gRequestTabViewportWidth>=last.right&&selectedTab()==selected,
+              "horizontal scrolling reaches both ends without switching the active request");
+        check(saveAreaIsProtected()&&saveProtected,
+              "the scrolled tab region and scrollbar stay clear of the fixed save controls at both ends");
+    }
+    while(gTabs.size()>1)closeTab((int)gTabs.size()-1,false);
+    gData.sidebarWidth=originalSidebar;SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
+    openRequest(request);updateRequestTabScroll();updateDirtyStatus();
+}
+static void runEntryTableTests(ApiRequest* request) {
+    const auto originalQuery=request->query;const auto originalContent=RequestContent::from(*request);
+    const UINT originalDpi=gDpi;RECT originalWindow{};GetWindowRect(gWindow,&originalWindow);
+    HWND header=ListView_GetHeader(gKvList);RECT first{},checkboxColumn{};
+    ListView_GetItemRect(gKvList,0,&first,LVIR_BOUNDS);Header_GetItemRect(header,0,&checkboxColumn);
+    MapWindowPoints(header,gKvList,(POINT*)&checkboxColumn,2);
+    const LPARAM click=MAKELPARAM((checkboxColumn.left+checkboxColumn.right)/2,(first.top+first.bottom)/2);
+    const bool originallyChecked=ListView_GetCheckState(gKvList,0)!=FALSE;
+    SendMessageW(gKvList,WM_LBUTTONDOWN,MK_LBUTTON,click);
+    const bool checkedAfterDown=ListView_GetCheckState(gKvList,0)!=FALSE;
+    SendMessageW(gKvList,WM_LBUTTONUP,0,click);
+    check(checkedAfterDown!=originallyChecked&&(ListView_GetCheckState(gKvList,0)!=FALSE)==checkedAfterDown&&
+          request->query[0].enabled==checkedAfterDown,"a checkbox mouse click toggles exactly once and updates the request");
+    SendMessageW(gKvList,WM_LBUTTONDOWN,MK_LBUTTON,click);SendMessageW(gKvList,WM_LBUTTONUP,0,click);
+
+    // Exercise the real paint path before reading the list back into the request.
+    RECT client{};GetClientRect(gKvList,&client);HDC screen=GetDC(gKvList),buffer=CreateCompatibleDC(screen);
+    HBITMAP bitmap=CreateCompatibleBitmap(screen,client.right,client.bottom);auto oldBitmap=SelectObject(buffer,bitmap);
+    SendMessageW(gKvList,WM_PRINTCLIENT,(WPARAM)buffer,PRF_CLIENT);
+    SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);ReleaseDC(gKvList,screen);
+    saveEditor();int trailing=ListView_GetItemCount(gKvList)-1;bool empty=true;
+    for(int column=1;column<=4;++column)empty=empty&&listCellText(gKvList,trailing,column).empty();
+    check(empty&&RequestContent::from(*request)==originalContent,
+          "painting the add-parameter hint keeps placeholder text out of request data");
+    ListView_SetItemState(gKvList,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
+    ListView_SetItemState(gKvList,trailing,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+    SendMessageW(gKvList,WM_KEYDOWN,VK_SPACE,0);
+    check(gCellEditor&&gEditRow==trailing&&gEditColumn==1&&ListView_GetCheckState(gKvList,trailing),
+          "Space on the add-parameter row starts editing without silently disabling the new entry");
+    setText(gCellEditor,L"added_from_trailing_row");commitCellEditor();
+    trailing=ListView_GetItemCount(gKvList)-1;empty=true;
+    for(int column=1;column<=4;++column)empty=empty&&listCellText(gKvList,trailing,column).empty();
+    check(request->query.size()==originalQuery.size()+1&&request->query.back().key=="added_from_trailing_row"&&
+          ListView_GetItemCount(gKvList)==(int)request->query.size()+1&&empty,
+          "editing the trailing parameter row appends one entry and preserves exactly one empty row");
+
+    for(UINT dpi:{96u,144u,192u}){
+        RECT proposed{0,0,MulDiv(1280,(int)dpi,96),MulDiv(820,(int)dpi,96)};
+        SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
+        RECT row{},heading=boundsInWindow(header);ListView_GetItemRect(gKvList,1,&row,LVIR_BOUNDS);
+        check(std::abs((int)(row.bottom-row.top)-px(32))<=1&&std::abs((int)(heading.bottom-heading.top)-px(32))<=1,
+              "native parameter rows and header remain 32 DIPs at 100/150/200 percent");
+        RECT value{};ListView_GetSubItemRect(gKvList,1,2,LVIR_BOUNDS,&value);
+        LVHITTESTINFO hit{};hit.pt={(value.left+value.right)/2,(value.top+value.bottom)/2};ListView_SubItemHitTest(gKvList,&hit);
+        check(hit.iItem==1&&hit.iSubItem==2,"native parameter hit testing matches the displayed cell at every DPI");
+        editListCell(1,3,true);RECT type{};ListView_GetSubItemRect(gKvList,1,3,LVIR_BOUNDS,&type);
+        MapWindowPoints(gKvList,gWindow,(POINT*)&type,2);RECT editor=boundsInWindow(gCellEditor);
+        check(gCellEditor&&gEditRow==1&&gEditColumn==3&&editor.top>=type.top&&editor.bottom<=type.bottom&&
+              editor.left>=type.left&&editor.right<=type.right,"the type dropdown fits inside its native parameter cell at every DPI");
+        commitCellEditor(false);
+    }
+
+    request->query.clear();
+    for(int i=0;i<40;++i)request->query.push_back({true,"scroll-row-"+std::to_string(i),"before","string",""});
+    fillEntryList(gKvList,request->query);editListCell(0,2,true);setText(gCellEditor,L"committed_before_scroll");
+    HWND editing=gCellEditor;const int top=ListView_GetTopIndex(gKvList);
+    SendMessageW(gKvList,WM_VSCROLL,SB_LINEDOWN,0);
+    check(!gCellEditor&&!IsWindow(editing)&&request->query[0].value=="committed_before_scroll"&&ListView_GetTopIndex(gKvList)>top,
+          "scrolling commits the current parameter edit and removes its overlay before moving rows");
+
+    commitCellEditor(false);request->query=originalQuery;fillEntryList(gKvList,request->query);
+    SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
+    gFocusedEntryColumn=1;ListView_SetItemState(gKvList,-1,0,LVIS_SELECTED|LVIS_FOCUSED);updateDirtyStatus();
+    check(RequestContent::from(*request)==originalContent,"parameter table checks restore the original request fixture");
+}
+static void runRequestToolbarTests(ApiRequest* request) {
+    const auto originalContent=RequestContent::from(*request);const wstring originalUrl=textOf(gUrl);
+    const UINT originalDpi=gDpi;const int originalSidebar=gData.sidebarWidth;RECT originalWindow{};GetWindowRect(gWindow,&originalWindow);
+    const wstring address=L"https://example.invalid/接口?name=中文&query="+wstring(180,L'x');
+    SendMessageW(gUrl,EM_SETSEL,0,-1);SendMessageW(gUrl,EM_REPLACESEL,TRUE,(LPARAM)address.c_str());
+    check(textOf(gUrl)==address&&request->url==toUtf8(address),"native URL editing preserves Unicode and long queries and updates the request");
+    SendMessageW(gUrl,WM_CHAR,VK_RETURN,0);
+    check(textOf(gUrl)==address,"Enter in the URL field never inserts a newline");
+    const DWORD selectedStart=10,selectedEnd=24;SendMessageW(gUrl,EM_SETSEL,selectedStart,selectedEnd);
+    for(UINT dpi:{96u,144u,192u}){
+        gData.sidebarWidth=420;RECT proposed{0,0,MulDiv(980,(int)dpi,96),MulDiv(640,(int)dpi,96)};
+        SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
+        RECT client{};GetClientRect(gWindow,&client);std::vector<RECT> actions;
+        for(HWND control:{gMethod,gUrl,gSave,gSaveMore,gSend,gEditorTabs})actions.push_back(boundsInWindow(control));
+        bool usable=true;
+        for(size_t i=0;i<actions.size();++i){
+            const RECT& rect=actions[i];usable=usable&&rect.left>=0&&rect.right<=client.right&&rect.top>=0&&
+                rect.bottom<=client.bottom&&rect.right>rect.left&&rect.bottom>rect.top;
+            for(size_t j=i+1;j<actions.size();++j){RECT overlap{};usable=usable&&!IntersectRect(&overlap,&rect,&actions[j]);}
+        }
+        RECT frame=boundsInWindow(gUrlFrame),url=boundsInWindow(gUrl),send=boundsInWindow(gSend),cancel=boundsInWindow(gCancel);
+        check(usable&&url.left>=frame.left&&url.right<=frame.right&&url.top>=frame.top&&url.bottom<=frame.bottom&&EqualRect(&send,&cancel),
+              "request controls stay usable at minimum width and send/cancel share one slot at every DPI");
+        RECT save=boundsInWindow(gSave),more=boundsInWindow(gSaveMore),tabs=boundsInWindow(gRequestTabs);
+        check(send.left>=frame.right&&send.left-frame.right<=px(16)&&save.bottom<=frame.top&&more.bottom<=frame.top&&
+              save.top>=tabs.top&&save.bottom<=tabs.bottom&&more.top>=tabs.top&&more.bottom<=tabs.bottom,
+              "the URL uses the space before Send while save actions stay in the top request-tab strip at every DPI");
+        RECT editClient{},format{};GetClientRect(gUrl,&editClient);SendMessageW(gUrl,EM_GETRECT,0,(LPARAM)&format);
+        check(format.left>=0&&format.right<=editClient.right&&format.top>=0&&format.bottom<=editClient.bottom&&
+              format.right>format.left&&format.bottom-format.top>=fontTextHeight(gUrl,gCodeFont),
+              "the native URL text rectangle fits its editor without clipping at every DPI");
+        DWORD start=0,end=0;SendMessageW(gUrl,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
+        check(textOf(gUrl)==address&&request->url==toUtf8(address)&&start==selectedStart&&end==selectedEnd,
+              "toolbar relayout preserves the native URL text and selection");
+    }
+    gData.sidebarWidth=originalSidebar;SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
+    setText(gUrl,originalUrl);updateDirtyStatus();
+    check(RequestContent::from(*request)==originalContent,"request toolbar checks restore the original request fixture");
+}
 static CHARFORMAT2W responseFormatAt(size_t position) {
     DWORD start=0,end=0;POINT scroll{};SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);SendMessageW(gResponseBody,EM_GETSCROLLPOS,0,(LPARAM)&scroll);
     SendMessageW(gResponseBody,WM_SETREDRAW,FALSE,0);CHARFORMAT2W format{};format.cbSize=sizeof(format);
@@ -227,6 +411,9 @@ static void runResponseFindTests(const std::shared_ptr<TabState>& tab,ApiRequest
 static void runControllerTests() {
     auto request=gData.folders[0]->requests[0].get();auto second=gData.folders[0]->requests[1].get();auto c=request->cases[0].get();
     check(!workspaceDirty(),"fixture starts clean");
+    runRequestTabTests(request,second);
+    runEntryTableTests(request);
+    runRequestToolbarTests(request);
     setText(gUrl,L"http://127.0.0.1/edited");updateDirtyStatus();check(tabDirty(*selectedTab())&&gSaveStatus==L"未保存","URL edits immediately mark the tab and workspace dirty");
     TreeView_Expand(gTree,TreeView_GetRoot(gTree),TVE_COLLAPSE);check(saveCalls==0,"expanding or collapsing a folder never saves pending request edits");
     TreeView_Expand(gTree,TreeView_GetRoot(gTree),TVE_EXPAND);
@@ -245,8 +432,13 @@ static void runControllerTests() {
     check(saveNow()&&c->url=="http://127.0.0.1/case-only"&&request->url!=c->url&&c->id=="case","save updates existing case without changing its parent or identity");
     const auto saved=gSavedContent;setText(gUrl,L"http://127.0.0.1/retry");failSave=true;
     check(!saveNow()&&gSaveFailed&&gSavedContent==saved&&tabDirty(*selectedTab()),"failed save preserves the last successful baseline and dirty draft");
+    SendMessageW(gWindow,WM_TIMER,SAVE_FEEDBACK_TIMER,0);
+    check(textOf(gSave)==L"保存失败","a late success-feedback timer cannot hide the current save failure");
     AppData disk;check(loadAppDataFromPath(testDataPath,disk)&&disk.folders[0]->requests[0]->cases[0]->url=="http://127.0.0.1/case-only","failed save leaves the file unchanged");
-    failSave=false;check(saveNow()&&!workspaceDirty()&&!gSaveFailed,"retry saves the retained case draft");
+    failSave=false;check(saveNow(true)&&!workspaceDirty()&&!gSaveFailed,"retry saves the retained case draft");
+    check(textOf(gSave)==L"已保存","a successful retry confirms saving on the button");
+    SendMessageW(gWindow,WM_TIMER,SAVE_FEEDBACK_TIMER,0);
+    check(textOf(gSave)==L"保存","success feedback returns to the save action after its timer");
 
     auto tab=selectedTab();
     check(gRichEditModule!=nullptr,"response Rich Edit is available");
@@ -298,6 +490,10 @@ static void runControllerTests() {
     int prompts=closePrompts;count=gTabs.size();closeChoice=IDCANCEL;closeTabRange(gSelectedTab,IDM_TAB_CLOSE_ALL);
     check(closePrompts==prompts+1&&gTabs.size()==count,"batch close asks once and cancels atomically");
     closeChoice=IDNO;closeTabRange(gSelectedTab,IDM_TAB_CLOSE_ALL);check(gTabs.empty()&&!workspaceDirty(),"batch discard restores all target drafts");
+    RECT saveBounds=boundsInWindow(gSave),emptyClient{};GetClientRect(gWindow,&emptyClient);
+    check(IsWindowEnabled(gSave)&&(GetWindowLongPtrW(gSave,GWL_STYLE)&WS_VISIBLE)&&(GetWindowLongPtrW(gSave,GWL_STYLE)&WS_TABSTOP)&&
+          saveBounds.left>=0&&saveBounds.top>=0&&saveBounds.right<=emptyClient.right&&saveBounds.bottom<=emptyClient.bottom&&
+          saveBounds.right>saveBounds.left&&saveBounds.bottom>saveBounds.top,"workspace save remains visible and keyboard-accessible when all request tabs are closed");
 
     auto fresh=std::make_unique<ApiRequest>();fresh->id="new";fresh->name="未保存接口";auto freshPtr=fresh.get();gData.folders[0]->requests.push_back(std::move(fresh));openRequest(freshPtr);
     closeChoice=IDNO;closeTab(gSelectedTab);check(gData.folders[0]->requests.size()==2&&gTabs.empty(),"discarding an unsaved new request removes it");
