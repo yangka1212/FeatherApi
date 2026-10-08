@@ -21,7 +21,24 @@ static wstring localAppData() {
     return result;
 }
 
-wstring win32DataPath() { return localAppData() + L"\\FeatherApi-Win32\\data.json"; }
+wstring win32DataPath() {
+    // An absolute override lets integration runs exercise the production storage path
+    // without reading or replacing the current user's workspace.
+    SetLastError(ERROR_SUCCESS);
+    const DWORD length=GetEnvironmentVariableW(L"FEATHERAPI_DATA_PATH",nullptr,0);
+    if(length==0&&GetLastError()!=ERROR_ENVVAR_NOT_FOUND)return {};
+    if(length>0){
+        if(length>=32768)return {};
+        wstring value(length,L'\0');
+        const DWORD copied=GetEnvironmentVariableW(L"FEATHERAPI_DATA_PATH",value.data(),length);
+        if(copied>0&&copied<length){
+            value.resize(copied);
+            if(std::filesystem::path(value).is_absolute())return value;
+        }
+        return {};
+    }
+    return localAppData()+L"\\FeatherApi-Win32\\data.json";
+}
 
 namespace {
 string getStoredText(const Json& object,const char* name,const string& fallback={}){auto p=object.getInsensitive(name);return p?p->text(fallback):fallback;}
@@ -76,7 +93,9 @@ bool saveAppDataToPath(const AppData& data,const wstring& filePath) {
 }
 
 bool loadAppData(AppData& data,wstring& sourcePath) {
-    auto native=std::filesystem::path(win32DataPath());
+    auto configuredPath=win32DataPath();
+    if(configuredPath.empty()){sourcePath.clear();return false;}
+    auto native=std::filesystem::path(configuredPath);
     if(std::filesystem::exists(native)){
         if(loadAppDataFromPath(native.wstring(),data)){sourcePath=native.wstring();return true;}
         auto now=std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());std::tm local{};localtime_s(&local,&now);wchar_t suffix[64]{};wcsftime(suffix,64,L".corrupt-%Y%m%d-%H%M%S",&local);std::error_code ec;std::filesystem::copy_file(native,native.wstring()+suffix,std::filesystem::copy_options::overwrite_existing,ec);sourcePath.clear();return false;
@@ -84,4 +103,4 @@ bool loadAppData(AppData& data,wstring& sourcePath) {
     sourcePath.clear();return false;
 }
 
-bool saveAppData(const AppData& data){return saveAppDataToPath(data,win32DataPath());}
+bool saveAppData(const AppData& data){auto path=win32DataPath();return !path.empty()&&saveAppDataToPath(data,path);}

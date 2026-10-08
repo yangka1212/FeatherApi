@@ -36,3 +36,6 @@ data.json
 
 # Local interaction regression builds
 build-ux/
+
+# Python test runner cache
+__pycache__/

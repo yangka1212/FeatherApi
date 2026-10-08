@@ -31,7 +31,7 @@ enum : int {
     IDC_SEND,IDC_CANCEL,IDC_EDITOR_TABS,IDC_KV_LIST,IDC_ADD_ROW,IDC_DELETE_ROW,IDC_BODY_TYPE,
     IDC_FORMAT,IDC_COMPRESS,IDC_BODY,IDC_VALIDATION,IDC_SUMMARY,
     IDC_RESPONSE_TABS,IDC_RESPONSE_BODY,IDC_RESPONSE_HEADERS,IDC_RESPONSE_FIND_PANEL,IDC_RESPONSE_FIND_EDIT,IDC_RESPONSE_FIND_PREV,IDC_RESPONSE_FIND_NEXT,IDC_RESPONSE_FIND_CLOSE,IDC_BODY_NONE,IDC_EMPTY_TITLE,IDC_EMPTY_HELP,IDC_SIDEBAR_DIVIDER,IDC_REQUEST_TAB_SCROLL,
-    IDC_RESPONSE_MODE,IDC_RESPONSE_FIND,IDC_FIND_STATUS,IDC_RESPONSE_MODE_DIVIDER,
+    IDC_RESPONSE_MODE,IDC_RESPONSE_FIND,IDC_FIND_STATUS,IDC_RESPONSE_MODE_DIVIDER,IDC_EMPTY_NEW_REQUEST,
     IDC_PROMPT_EDIT=900,IDC_URL_FRAME,IDC_SEARCH_FRAME,
     IDM_FOLDER_ADD_REQUEST=1000,IDM_FOLDER_ADD_CHILD,IDM_FOLDER_IMPORT,IDM_FOLDER_RENAME,IDM_FOLDER_DELETE,
     IDM_REQUEST_OPEN,IDM_REQUEST_RENAME,IDM_REQUEST_DUPLICATE,IDM_REQUEST_MOVE,IDM_REQUEST_DELETE,
@@ -63,6 +63,7 @@ struct TabState {
     std::atomic<bool> cancel=false;
     std::atomic<HINTERNET> activeRequest=nullptr;
     std::atomic<bool> sending=false;
+    std::atomic<bool> workerFinished=true;
     std::thread worker;
     string responseRaw,responsePretty;
     std::vector<KeyValueEntry> responseHeaders;
@@ -91,7 +92,7 @@ HINSTANCE gInstance{};
 HMODULE gRichEditModule{};
 HWND gWindow{},gSearchFrame{},gSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gRequestTabScroll{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
 HWND gEditorTabs{},gKvList{},gBodyType{},gFormat{},gCompress{},gBody{},gValidation{};
-HWND gSummary{},gResponseTabs{},gResponseBody{},gResponseHeaders{},gResponseFindPanel{},gResponseFindEdit{},gResponseFindPrev{},gResponseFindNext{},gResponseFindClose{},gBodyNone{},gEmptyTitle{},gEmptyHelp{};
+HWND gSummary{},gResponseTabs{},gResponseBody{},gResponseHeaders{},gResponseFindPanel{},gResponseFindEdit{},gResponseFindPrev{},gResponseFindNext{},gResponseFindClose{},gBodyNone{},gEmptyTitle{},gEmptyHelp{},gEmptyNewRequest{};
 HWND gResponseMode{},gResponseModeDivider{},gResponseFind{},gFindStatus{},gResponseToolbarHot{},gRequestToolbarHot{};
 HFONT gUiFont{},gCodeFont{},gTitleFont{},gTreeFolderFont{},gTreeMethodFont{},gEntryTypeFont{};
 HBRUSH gSidebarBrush{},gWhiteBrush{};
@@ -103,6 +104,8 @@ std::vector<std::pair<UINT,WPARAM>> gDeferredCompletions;
 std::weak_ptr<TabState> gDisplayedTab;
 std::vector<std::unique_ptr<NodeRef>> gNodeRefs;
 std::vector<std::shared_ptr<TabState>> gTabs;
+// Keep closed tabs owned by the UI thread until their HTTP workers have exited.
+std::vector<std::shared_ptr<TabState>> gRetiredTabs;
 int gSelectedTab=-1;
 int gSelectedEntryRows[3]{-1,-1,-1};
 ApiFolder* gSelectedFolder=nullptr;
@@ -119,7 +122,7 @@ HWND gCellEditor=nullptr;
 int gEditRow=-1,gEditColumn=-1;
 int gFocusedEntryColumn=1;
 bool gImeComposing=false;
-bool gResizeSidebar=false,gResizePanels=false,gAddFolderHot=false;
+bool gResizeSidebar=false,gResizePanels=false,gAddFolderHot=false,gBodyTypeHot=false;
 std::atomic<bool> gImportCancel=false;
 bool gImporting=false;
 wstring gSaveStatus=L"已保存";
@@ -162,6 +165,20 @@ void applyFont(HWND control,HFONT font=nullptr){SendMessageW(control,WM_SETFONT,
 void setVisible(HWND control,bool visible){ShowWindow(control,visible?SW_SHOW:SW_HIDE);}
 void setValidationText(const wstring& value){setText(gValidation,value);setVisible(gValidation,!value.empty());if(gWindow){RECT client{};GetClientRect(gWindow,&client);layout((int)client.right,(int)client.bottom);}}
 std::shared_ptr<TabState> selectedTab(){return gSelectedTab>=0&&gSelectedTab<(int)gTabs.size()?gTabs[(size_t)gSelectedTab]:nullptr;}
+void retireTab(const std::shared_ptr<TabState>& tab) {
+    tab->cancelNow();
+    if(tab->worker.joinable()){
+        gRetiredTabs.push_back(tab);
+        SetTimer(gWindow,REQUEST_TIMER,100,nullptr);
+    }
+}
+void reapRetiredTabs() {
+    for(auto it=gRetiredTabs.begin();it!=gRetiredTabs.end();){
+        if(!(*it)->workerFinished){++it;continue;}
+        if((*it)->worker.joinable())(*it)->worker.join();
+        it=gRetiredTabs.erase(it);
+    }
+}
 int px(int value){return MulDiv(value,(int)gDpi,96);}
 int dip(int value){return MulDiv(value,96,(int)gDpi);}
 void updateSearchFormatting() {
@@ -246,6 +263,14 @@ void fillRoundRect(HDC dc,const RECT& rect,COLORREF color,int radius) {
     auto oldBrush=(HBRUSH)SelectObject(dc,brush);auto oldPen=(HPEN)SelectObject(dc,pen);
     RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,px(radius),px(radius));
     SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(pen);DeleteObject(brush);
+}
+
+void drawFocusRing(HDC dc,RECT rect,int radius=6) {
+    HPEN pen=CreatePen(PS_SOLID,std::max(1,px(1)),COLOR_ACCENT);
+    auto oldPen=(HPEN)SelectObject(dc,pen);
+    auto oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
+    RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,px(radius),px(radius));
+    SelectObject(dc,oldBrush);SelectObject(dc,oldPen);DeleteObject(pen);
 }
 
 void drawFolderGlyph(HDC dc,RECT rect,bool open,bool module) {
@@ -383,7 +408,7 @@ void paintRequestTabs(HWND tab,HDC dc) {
         MoveToEx(dc,x+px(3),y-px(3),nullptr);LineTo(dc,x-px(3)-1,y+px(3)+1);
         SelectObject(dc,oldPen);DeleteObject(pen);
         if(enabled&&GetFocus()==tab&&index==TabCtrl_GetCurFocus(tab)&&!(SendMessageW(tab,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){
-            RECT focus=card;InflateRect(&focus,-px(3),-px(3));DrawFocusRect(dc,&focus);
+            RECT focus=card;InflateRect(&focus,-px(3),-px(3));drawFocusRing(dc,focus,7);
         }
     }
     SelectObject(dc,oldFont);
@@ -407,7 +432,7 @@ void paintSectionTabs(HWND tab,HDC dc) {
             FillRect(dc,&underline,enabled?gAccentBrush:gBorderBrush);
         }
         if(enabled&&GetFocus()==tab&&index==TabCtrl_GetCurFocus(tab)&&!(SendMessageW(tab,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){
-            RECT focus=item;InflateRect(&focus,-px(4),-px(5));DrawFocusRect(dc,&focus);
+            RECT focus=item;InflateRect(&focus,-px(4),-px(5));drawFocusRing(dc,focus);
         }
     }
     SelectObject(dc,oldFont);
@@ -457,8 +482,13 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
     else {background=pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(250,251,253));foreground=COLOR_SECONDARY;}
     if(saved)foreground=RGB(21,128,91);if(failed)foreground=RGB(185,55,65);
     if(disabled)foreground=RGB(156,163,175);
-    FillRect(dc,&rect,(save||more)?gSidebarBrush:gWhiteBrush);
     int savedDc=SaveDC(dc);IntersectClipRect(dc,rect.left,rect.top,rect.right,rect.bottom);
+    if(url&&gUrl){
+        RECT editor{};GetWindowRect(gUrl,&editor);
+        MapWindowPoints(nullptr,draw->hwndItem,(POINT*)&editor,2);
+        ExcludeClipRect(dc,editor.left,editor.top,editor.right,editor.bottom);
+    }
+    FillRect(dc,&rect,(save||more)?gSidebarBrush:gWhiteBrush);
     RECT outline=rect;
     // Clip adjacent native controls into a continuous rounded field or split button.
     if(method||(save&&(GetWindowLongPtrW(gSaveMore,GWL_STYLE)&WS_VISIBLE)))outline.right+=px(10);
@@ -501,7 +531,9 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
     pen=CreatePen(PS_SOLID,px(1),foreground);oldPen=(HPEN)SelectObject(dc,pen);oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
     if(method||more){
         int cx=method?rect.right-px(14):(rect.left+rect.right)/2;
-        MoveToEx(dc,cx-px(3),cy-px(1),nullptr);LineTo(dc,cx,cy+px(2));LineTo(dc,cx+px(3),cy-px(1));
+        MoveToEx(dc,cx-px(3),cy-px(1),nullptr);LineTo(dc,cx,cy+px(2));
+        // LineTo excludes its endpoint; continue one device pixel so the right tip is drawn.
+        LineTo(dc,cx+px(3)+1,cy-px(1)-1);
     }else if(save){
         int cx=saveIconCenter;
         if(saved){MoveToEx(dc,cx-px(5),cy,nullptr);LineTo(dc,cx-px(1),cy+px(4));LineTo(dc,cx+px(6),cy-px(4));}
@@ -515,10 +547,27 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
     }
     SelectObject(dc,oldBrush);SelectObject(dc,oldPen);DeleteObject(pen);SelectObject(dc,oldFont);
     if(save&&gSaveStatus==L"未保存"){RECT dot{saveIconCenter+px(4),cy-px(11),saveIconCenter+px(9),cy-px(6)};fillRoundRect(dc,dot,COLOR_ACCENT,5);}
-    if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){RECT focus=rect;InflateRect(&focus,-px(4),-px(4));DrawFocusRect(dc,&focus);}
+    if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){RECT focus=rect;InflateRect(&focus,-px(4),-px(4));drawFocusRing(dc,focus);}
 }
 
 void drawButton(const DRAWITEMSTRUCT* draw) {
+    if(draw->CtlID==IDC_BODY_TYPE){
+        bool closed=(draw->itemState&ODS_COMBOBOXEDIT)!=0;
+        bool selected=!closed&&(draw->itemState&ODS_SELECTED)!=0;
+        FillRect(draw->hDC,&draw->rcItem,selected?gSelectedBrush:gWhiteBrush);
+        if(draw->itemID!=(UINT)-1){
+            wchar_t label[128]{};SendMessageW(draw->hwndItem,CB_GETLBTEXT,draw->itemID,(LPARAM)label);
+            int saved=SaveDC(draw->hDC);SelectObject(draw->hDC,gUiFont);SetBkMode(draw->hDC,TRANSPARENT);
+            SetTextColor(draw->hDC,(draw->itemState&ODS_DISABLED)?COLOR_SECONDARY:COLOR_PRIMARY);
+            RECT textRect=draw->rcItem;textRect.left+=px(10);textRect.right-=px(8);
+            DrawTextW(draw->hDC,label,-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+            RestoreDC(draw->hDC,saved);
+        }
+        if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){
+            RECT focus=draw->rcItem;InflateRect(&focus,-px(2),-px(2));drawFocusRing(draw->hDC,focus,5);
+        }
+        return;
+    }
     if(draw->CtlID==IDC_SEARCH_FRAME||draw->CtlID==IDC_ADD_FOLDER){
         bool search=draw->CtlID==IDC_SEARCH_FRAME;
         bool focused=GetFocus()==(search?gSearch:gAddFolder);
@@ -568,7 +617,7 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
             int x=cx-px(6);Ellipse(draw->hDC,x,cy-px(6),x+px(10),cy+px(4));MoveToEx(draw->hDC,x+px(8),cy+px(3),nullptr);LineTo(draw->hDC,x+px(13),cy+px(8));
         }
         SelectObject(draw->hDC,oldBrush);SelectObject(draw->hDC,oldPen);DeleteObject(pen);
-        if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){RECT focus=draw->rcItem;InflateRect(&focus,-px(3),-px(3));DrawFocusRect(draw->hDC,&focus);}return;
+        if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){RECT focus=draw->rcItem;InflateRect(&focus,-px(3),-px(3));drawFocusRing(draw->hDC,focus);}return;
     }
     if(draw->CtlID==IDC_RESPONSE_FIND_PANEL){
         HBRUSH background=CreateSolidBrush(RGB(255,255,255));FillRect(draw->hDC,&draw->rcItem,background);DeleteObject(background);
@@ -576,14 +625,11 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
         Rectangle(draw->hDC,draw->rcItem.left,draw->rcItem.top,draw->rcItem.right,draw->rcItem.bottom);SelectObject(draw->hDC,oldBrush);SelectObject(draw->hDC,oldPen);DeleteObject(pen);return;
     }
     if(draw->CtlID==IDC_RESPONSE_FIND_PREV||draw->CtlID==IDC_RESPONSE_FIND_NEXT||draw->CtlID==IDC_RESPONSE_FIND_CLOSE){
-        bool pressed=(draw->itemState&ODS_SELECTED)!=0;bool hot=(draw->itemState&ODS_HOTLIGHT)!=0;
-        COLORREF background=pressed?RGB(229,231,235):(hot?RGB(243,244,246):RGB(255,255,255));
-        HBRUSH backgroundBrush=CreateSolidBrush(background);FillRect(draw->hDC,&draw->rcItem,backgroundBrush);DeleteObject(backgroundBrush);
-        HPEN separator=CreatePen(PS_SOLID,px(1),RGB(229,231,235));auto oldPen=(HPEN)SelectObject(draw->hDC,separator);
-        MoveToEx(draw->hDC,draw->rcItem.left,draw->rcItem.top+px(5),nullptr);LineTo(draw->hDC,draw->rcItem.left,draw->rcItem.bottom-px(5));
-        SelectObject(draw->hDC,oldPen);DeleteObject(separator);
+        bool pressed=(draw->itemState&ODS_SELECTED)!=0,hot=(draw->itemState&ODS_HOTLIGHT)!=0;
+        FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
+        if(hot||pressed){RECT hover=draw->rcItem;InflateRect(&hover,-px(2),-px(2));fillRoundRect(draw->hDC,hover,pressed?RGB(229,234,241):COLOR_HOVER,6);}
         int cx=(draw->rcItem.left+draw->rcItem.right)/2,cy=(draw->rcItem.top+draw->rcItem.bottom)/2+(pressed?px(1):0);
-        HPEN glyph=CreatePen(PS_SOLID,px(2),(draw->itemState&ODS_DISABLED)?RGB(190,195,203):RGB(75,85,99));oldPen=(HPEN)SelectObject(draw->hDC,glyph);
+        HPEN glyph=CreatePen(PS_SOLID,px(2),(draw->itemState&ODS_DISABLED)?RGB(190,195,203):(hot?COLOR_PRIMARY:COLOR_SECONDARY));auto oldPen=(HPEN)SelectObject(draw->hDC,glyph);
         if(draw->CtlID==IDC_RESPONSE_FIND_CLOSE){
             int radius=px(4);MoveToEx(draw->hDC,cx-radius,cy-radius,nullptr);LineTo(draw->hDC,cx+radius,cy+radius);
             MoveToEx(draw->hDC,cx+radius,cy-radius,nullptr);LineTo(draw->hDC,cx-radius,cy+radius);
@@ -592,18 +638,108 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
             MoveToEx(draw->hDC,cx-px(4),cy-tip,nullptr);LineTo(draw->hDC,cx,cy+tip);LineTo(draw->hDC,cx+px(4),cy-tip);
         }
         SelectObject(draw->hDC,oldPen);DeleteObject(glyph);
-        if(draw->itemState&ODS_FOCUS){RECT focus=draw->rcItem;InflateRect(&focus,-px(3),-px(3));DrawFocusRect(draw->hDC,&focus);}return;
+        if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){RECT focus=draw->rcItem;InflateRect(&focus,-px(2),-px(2));drawFocusRing(draw->hDC,focus);}return;
     }
-    bool primary=draw->CtlID==IDC_SEND;bool pressed=(draw->itemState&ODS_SELECTED)!=0;bool disabled=(draw->itemState&ODS_DISABLED)!=0;
-    COLORREF background=primary?(pressed?RGB(29,78,216):COLOR_ACCENT):(pressed?COLOR_HOVER:RGB(255,255,255));
-    HBRUSH brush=CreateSolidBrush(background);FillRect(draw->hDC,&draw->rcItem,brush);DeleteObject(brush);
-    HPEN pen=CreatePen(PS_SOLID,1,primary?COLOR_ACCENT:COLOR_BORDER);HPEN oldPen=(HPEN)SelectObject(draw->hDC,pen);HBRUSH oldBrush=(HBRUSH)SelectObject(draw->hDC,GetStockObject(NULL_BRUSH));
-    Rectangle(draw->hDC,draw->rcItem.left,draw->rcItem.top,draw->rcItem.right,draw->rcItem.bottom);
-    SelectObject(draw->hDC,oldBrush);SelectObject(draw->hDC,oldPen);DeleteObject(pen);
+    if(draw->CtlID==IDC_EMPTY_NEW_REQUEST){
+        bool pressed=(draw->itemState&ODS_SELECTED)!=0;
+        FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
+        fillRoundRect(draw->hDC,draw->rcItem,pressed?RGB(29,78,216):COLOR_ACCENT,9);
+        wchar_t label[64]{};GetWindowTextW(draw->hwndItem,label,64);
+        auto oldFont=(HFONT)SelectObject(draw->hDC,gUiFont);
+        SetBkMode(draw->hDC,TRANSPARENT);SetTextColor(draw->hDC,RGB(255,255,255));
+        RECT textRect=draw->rcItem;DrawTextW(draw->hDC,label,-1,&textRect,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        SelectObject(draw->hDC,oldFont);
+        if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){
+            RECT focus=draw->rcItem;InflateRect(&focus,-px(4),-px(4));
+            HPEN pen=CreatePen(PS_SOLID,std::max(1,px(1)),RGB(255,255,255));
+            auto oldPen=(HPEN)SelectObject(draw->hDC,pen);
+            auto oldBrush=(HBRUSH)SelectObject(draw->hDC,GetStockObject(NULL_BRUSH));
+            RoundRect(draw->hDC,focus.left,focus.top,focus.right,focus.bottom,px(6),px(6));
+            SelectObject(draw->hDC,oldBrush);SelectObject(draw->hDC,oldPen);DeleteObject(pen);
+        }
+        return;
+    }
+    bool pressed=(draw->itemState&ODS_SELECTED)!=0,disabled=(draw->itemState&ODS_DISABLED)!=0;
+    bool hot=!disabled&&(gRequestToolbarHot==draw->hwndItem||(draw->itemState&ODS_HOTLIGHT)!=0);
+    bool focused=(draw->itemState&ODS_FOCUS)!=0;
+    COLORREF background=disabled?RGB(250,251,253):(pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(255,255,255)));
+    COLORREF border=focused?COLOR_ACCENT:(hot?RGB(196,205,217):COLOR_BORDER);
+    FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
+    HPEN pen=CreatePen(PS_SOLID,px(1),border);HPEN oldPen=(HPEN)SelectObject(draw->hDC,pen);
+    HBRUSH brush=CreateSolidBrush(background);HBRUSH oldBrush=(HBRUSH)SelectObject(draw->hDC,brush);
+    RoundRect(draw->hDC,draw->rcItem.left,draw->rcItem.top,draw->rcItem.right,draw->rcItem.bottom,px(8),px(8));
+    SelectObject(draw->hDC,oldBrush);SelectObject(draw->hDC,oldPen);DeleteObject(brush);DeleteObject(pen);
     wchar_t text[128]{};GetWindowTextW(draw->hwndItem,text,128);HFONT oldFont=(HFONT)SelectObject(draw->hDC,gUiFont);
-    SetBkMode(draw->hDC,TRANSPARENT);SetTextColor(draw->hDC,disabled?RGB(156,163,175):(primary?RGB(255,255,255):COLOR_PRIMARY));
+    SetBkMode(draw->hDC,TRANSPARENT);SetTextColor(draw->hDC,disabled?RGB(156,163,175):(hot?COLOR_PRIMARY:COLOR_SECONDARY));
     RECT textRect=draw->rcItem;DrawTextW(draw->hDC,text,-1,&textRect,DT_CENTER|DT_VCENTER|DT_SINGLELINE);SelectObject(draw->hDC,oldFont);
-    if(draw->itemState&ODS_FOCUS){RECT focus=draw->rcItem;InflateRect(&focus,-px(3),-px(3));DrawFocusRect(draw->hDC,&focus);}
+    if(focused&&!(draw->itemState&ODS_NOFOCUSRECT))drawFocusRing(draw->hDC,draw->rcItem,7);
+}
+
+// The multiline editors and response header list keep native text selection and
+// scrolling, but use the same quiet one-pixel border as the other inputs.
+LRESULT CALLBACK flatSurfaceProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_PRINT){
+        LRESULT result=DefSubclassProc(h,message,w,l);
+        if(w&&(l&PRF_NONCLIENT)){
+            RECT bounds{};GetWindowRect(h,&bounds);OffsetRect(&bounds,-bounds.left,-bounds.top);
+            FrameRect((HDC)w,&bounds,GetFocus()==h?gAccentBrush:gBorderBrush);
+        }
+        return result;
+    }
+    if(message==WM_NCPAINT){
+        LRESULT result=DefSubclassProc(h,message,w,l);
+        HDC dc=GetWindowDC(h);
+        if(dc){RECT bounds{};GetWindowRect(h,&bounds);OffsetRect(&bounds,-bounds.left,-bounds.top);
+            FrameRect(dc,&bounds,GetFocus()==h?gAccentBrush:gBorderBrush);ReleaseDC(h,dc);}
+        return result;
+    }
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS)RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_NOERASE);
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(h,flatSurfaceProc,id);
+    return result;
+}
+
+wstring selectedComboText(HWND combo) {
+    int selected=(int)SendMessageW(combo,CB_GETCURSEL,0,0);
+    if(selected<0)return {};
+    LRESULT length=SendMessageW(combo,CB_GETLBTEXTLEN,selected,0);
+    if(length<0)return {};
+    wstring value((size_t)length+1,L'\0');
+    LRESULT copied=SendMessageW(combo,CB_GETLBTEXT,selected,(LPARAM)value.data());
+    if(copied<0)return {};
+    value.resize((size_t)copied);return value;
+}
+void paintBodyType(HWND h,HDC dc) {
+    RECT rect{};GetClientRect(h,&rect);FillRect(dc,&rect,gWhiteBrush);
+    bool disabled=IsWindowEnabled(h)==FALSE,focused=GetFocus()==h;
+    COLORREF border=focused?COLOR_ACCENT:(gBodyTypeHot?RGB(196,205,217):RGB(211,219,230));
+    HBRUSH brush=CreateSolidBrush(disabled?RGB(250,251,253):RGB(255,255,255));
+    HPEN pen=CreatePen(PS_SOLID,std::max(1,px(1)),border);
+    auto oldBrush=(HBRUSH)SelectObject(dc,brush);auto oldPen=(HPEN)SelectObject(dc,pen);
+    RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,px(9),px(9));
+    SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(pen);DeleteObject(brush);
+    wstring label=selectedComboText(h);
+    auto oldFont=(HFONT)SelectObject(dc,gUiFont);SetBkMode(dc,TRANSPARENT);
+    SetTextColor(dc,disabled?RGB(156,163,175):COLOR_PRIMARY);
+    RECT textRect=rect;textRect.left+=px(12);textRect.right-=px(28);
+    DrawTextW(dc,label.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+    SelectObject(dc,oldFont);
+    pen=CreatePen(PS_SOLID,std::max(1,px(1)),disabled?RGB(156,163,175):COLOR_SECONDARY);
+    oldPen=(HPEN)SelectObject(dc,pen);int cx=rect.right-px(15),cy=(rect.top+rect.bottom)/2;
+    MoveToEx(dc,cx-px(4),cy-px(1),nullptr);LineTo(dc,cx,cy+px(3));LineTo(dc,cx+px(4),cy-px(1));
+    SelectObject(dc,oldPen);DeleteObject(pen);
+}
+LRESULT CALLBACK bodyTypeProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT){PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);paintBodyType(h,dc);EndPaint(h,&paint);return 0;}
+    if(message==WM_PRINT||message==WM_PRINTCLIENT){if(w)paintBodyType(h,(HDC)w);return 0;}
+    if(message==WM_MOUSEMOVE&&!gBodyTypeHot){gBodyTypeHot=true;TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,h,0};TrackMouseEvent(&track);InvalidateRect(h,nullptr,FALSE);}
+    if(message==WM_MOUSELEAVE){gBodyTypeHot=false;InvalidateRect(h,nullptr,FALSE);}
+    if(message==WM_NCDESTROY){gBodyTypeHot=false;RemoveWindowSubclass(h,bodyTypeProc,id);return DefSubclassProc(h,message,w,l);}
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_ENABLE||message==CB_SETCURSEL||message==WM_KEYDOWN||message==WM_LBUTTONUP)
+        InvalidateRect(h,nullptr,FALSE);
+    return result;
 }
 
 ApiFolder* findFolderForRequestIn(ApiFolder& folder,ApiRequest* request) {
@@ -632,22 +768,30 @@ HTREEITEM insertTreeItem(HTREEITEM parent,const wstring& label,NodeRef::Kind kin
 }
 bool folderMatches(const ApiFolder& folder,const wstring& query) {
     if(query.empty()||containsText(folder.name,query))return true;
-    for(auto& r:folder.requests)if(containsText(r->name,query)||containsText(r->url,query))return true;
+    for(auto& r:folder.requests){
+        if(containsText(r->name,query)||containsText(r->url,query))return true;
+        for(auto& c:r->cases)if(containsText(c->name,query))return true;
+    }
     for(auto& c:folder.children)if(folderMatches(*c,query))return true;return false;
 }
 void insertFolder(ApiFolder& folder,HTREEITEM parent,const wstring& query,bool parentMatches=false) {
     bool ownMatch=parentMatches||query.empty()||containsText(folder.name,query);if(!ownMatch&&!folderMatches(folder,query))return;
+    bool searching=!query.empty();
     wstring label=toWide(folder.name);
     HTREEITEM item=insertTreeItem(parent,label,NodeRef::Kind::Folder,&folder,&folder,nullptr);
     for(auto& child:folder.children)insertFolder(*child,item,query,ownMatch);
     for(auto& request:folder.requests) {
-        if(!ownMatch&&!containsText(request->name,query)&&!containsText(request->url,query))continue;
+        bool requestMatches=ownMatch||containsText(request->name,query)||containsText(request->url,query);
+        bool caseMatches=false;
+        if(searching)for(auto& c:request->cases)if(containsText(c->name,query)){caseMatches=true;break;}
+        if(!requestMatches&&!caseMatches)continue;
         wstring requestLabel=toWide(request->name);
         HTREEITEM requestItem=insertTreeItem(item,requestLabel,NodeRef::Kind::Request,request.get(),&folder,request.get());
-        for(auto& c:request->cases)insertTreeItem(requestItem,toWide(c->name),NodeRef::Kind::Case,c.get(),&folder,request.get());
-        if(gExpandedRequests.find(request->id)!=gExpandedRequests.end())TreeView_Expand(gTree,requestItem,TVE_EXPAND);
+        for(auto& c:request->cases)if(requestMatches||containsText(c->name,query))
+            insertTreeItem(requestItem,toWide(c->name),NodeRef::Kind::Case,c.get(),&folder,request.get());
+        if(caseMatches||gExpandedRequests.find(request->id)!=gExpandedRequests.end())TreeView_Expand(gTree,requestItem,TVE_EXPAND);
     }
-    if(folder.expanded)TreeView_Expand(gTree,item,TVE_EXPAND);
+    if(searching||folder.expanded)TreeView_Expand(gTree,item,TVE_EXPAND);
 }
 bool treeItemIsRevealed(HTREEITEM item) {
     for(HTREEITEM parent=TreeView_GetParent(gTree,item);parent;parent=TreeView_GetParent(gTree,parent)){
@@ -657,7 +801,7 @@ bool treeItemIsRevealed(HTREEITEM item) {
     return true;
 }
 void syncVisibleFolderExpansionState() {
-    if(!gTree)return;
+    if(!gTree||!trimWide(textOf(gSearch)).empty())return;
     std::function<void(HTREEITEM)> sync=[&](HTREEITEM parent){
         for(HTREEITEM item=TreeView_GetChild(gTree,parent);item;item=TreeView_GetNextSibling(gTree,item)){
             TVITEMW info{};info.hItem=item;info.mask=TVIF_PARAM|TVIF_STATE;info.stateMask=TVIS_EXPANDED;
@@ -717,27 +861,154 @@ void selectTreeTab(const std::shared_ptr<TabState>& tab) {
     if(!tab)return;if(tab->requestCase)selectTreeValue(NodeRef::Kind::Case,tab->requestCase);else selectTreeRequest(tab->request);
 }
 
+constexpr int SMALL_DIALOG_LABEL=910;
+constexpr int SMALL_DIALOG_COMBO=911;
+struct SmallDialogState { FolderPickerContext* folder=nullptr;HFONT body=nullptr,heading=nullptr; };
+int dialogPx(HWND h,int value){return MulDiv(value,(int)GetDpiForWindow(h),96);}
+SmallDialogState* smallDialogState(HWND h){return (SmallDialogState*)GetWindowLongPtrW(h,GWLP_USERDATA);}
+
+void updateSmallDialogFonts(HWND h) {
+    auto* state=smallDialogState(h);if(!state)return;
+    HFONT body=CreateFontW(-dialogPx(h,13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    HFONT heading=CreateFontW(-dialogPx(h,14),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    for(HWND child=GetWindow(h,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))
+        SendMessageW(child,WM_SETFONT,(WPARAM)(GetDlgCtrlID(child)==SMALL_DIALOG_LABEL?heading:body),TRUE);
+    if(state->body)DeleteObject(state->body);if(state->heading)DeleteObject(state->heading);
+    state->body=body;state->heading=heading;
+}
+void layoutSmallDialog(HWND h,bool picker) {
+    RECT client{};GetClientRect(h,&client);int width=client.right,height=client.bottom;
+    int margin=dialogPx(h,28),footerTop=height-dialogPx(h,64);
+    MoveWindow(GetDlgItem(h,SMALL_DIALOG_LABEL),margin,dialogPx(h,25),width-2*margin,dialogPx(h,28),TRUE);
+    if(picker){
+        HWND combo=GetDlgItem(h,SMALL_DIALOG_COMBO);
+        SendMessageW(combo,CB_SETITEMHEIGHT,(WPARAM)-1,dialogPx(h,31));
+        SendMessageW(combo,CB_SETITEMHEIGHT,0,dialogPx(h,28));
+        MoveWindow(combo,margin,dialogPx(h,66),width-2*margin,dialogPx(h,300),TRUE);
+    }else MoveWindow(GetDlgItem(h,IDC_PROMPT_EDIT),margin+dialogPx(h,13),dialogPx(h,75),width-2*margin-dialogPx(h,26),dialogPx(h,25),TRUE);
+    int buttonWidth=dialogPx(h,88),buttonTop=footerTop+dialogPx(h,14),buttonHeight=dialogPx(h,36);
+    MoveWindow(GetDlgItem(h,IDCANCEL),width-margin-buttonWidth,buttonTop,buttonWidth,buttonHeight,TRUE);
+    MoveWindow(GetDlgItem(h,IDOK),width-margin-2*buttonWidth-dialogPx(h,10),buttonTop,buttonWidth,buttonHeight,TRUE);
+    InvalidateRect(h,nullptr,FALSE);
+}
+void paintSmallDialog(HWND h,HDC dc,bool picker) {
+    RECT client{};GetClientRect(h,&client);FillRect(dc,&client,gWhiteBrush);
+    RECT footer{0,client.bottom-dialogPx(h,64),client.right,client.bottom};FillRect(dc,&footer,gSidebarBrush);
+    RECT divider{0,footer.top,client.right,footer.top+std::max(1,dialogPx(h,1))};FillRect(dc,&divider,gBorderBrush);
+    if(!picker){
+        RECT field{dialogPx(h,28),dialogPx(h,66),client.right-dialogPx(h,28),dialogPx(h,108)};
+        HPEN pen=CreatePen(PS_SOLID,std::max(1,dialogPx(h,1)),GetFocus()==GetDlgItem(h,IDC_PROMPT_EDIT)?COLOR_ACCENT:RGB(211,219,230));
+        auto oldPen=(HPEN)SelectObject(dc,pen);auto oldBrush=(HBRUSH)SelectObject(dc,gWhiteBrush);
+        RoundRect(dc,field.left,field.top,field.right,field.bottom,dialogPx(h,9),dialogPx(h,9));
+        SelectObject(dc,oldBrush);SelectObject(dc,oldPen);DeleteObject(pen);
+    }
+}
+LRESULT CALLBACK smallDialogInputProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_NCDESTROY){RemoveWindowSubclass(h,smallDialogInputProc,id);return DefSubclassProc(h,message,w,l);}
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if((message==WM_SETFOCUS||message==WM_KILLFOCUS)&&IsWindow(GetParent(h)))InvalidateRect(GetParent(h),nullptr,FALSE);
+    return result;
+}
+void paintSmallDialogCombo(HWND h,HDC dc) {
+    RECT rect{};GetClientRect(h,&rect);
+    rect.bottom=std::min((int)rect.bottom,(int)SendMessageW(h,CB_GETITEMHEIGHT,(WPARAM)-1,0)+dialogPx(h,5));
+    bool focused=GetFocus()==h,hot=GetWindowLongPtrW(h,GWLP_USERDATA)!=0;
+    HBRUSH background=CreateSolidBrush(RGB(255,255,255));HPEN border=CreatePen(PS_SOLID,std::max(1,dialogPx(h,1)),focused?COLOR_ACCENT:(hot?RGB(196,205,217):RGB(211,219,230)));
+    auto oldBrush=(HBRUSH)SelectObject(dc,background);auto oldPen=(HPEN)SelectObject(dc,border);
+    RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,dialogPx(h,9),dialogPx(h,9));
+    SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(border);DeleteObject(background);
+    wstring label=selectedComboText(h);
+    auto font=(HFONT)SendMessageW(h,WM_GETFONT,0,0);auto oldFont=(HFONT)SelectObject(dc,font?font:gUiFont);
+    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,COLOR_PRIMARY);
+    RECT textRect=rect;textRect.left+=dialogPx(h,12);textRect.right-=dialogPx(h,30);
+    DrawTextW(dc,label.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);SelectObject(dc,oldFont);
+    HPEN arrow=CreatePen(PS_SOLID,std::max(1,dialogPx(h,1)),COLOR_SECONDARY);oldPen=(HPEN)SelectObject(dc,arrow);
+    int cx=rect.right-dialogPx(h,16),cy=(rect.top+rect.bottom)/2;
+    MoveToEx(dc,cx-dialogPx(h,4),cy-dialogPx(h,1),nullptr);LineTo(dc,cx,cy+dialogPx(h,3));LineTo(dc,cx+dialogPx(h,4),cy-dialogPx(h,1));
+    SelectObject(dc,oldPen);DeleteObject(arrow);
+}
+LRESULT CALLBACK smallDialogComboProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT){PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);paintSmallDialogCombo(h,dc);EndPaint(h,&paint);return 0;}
+    if(message==WM_PRINT||message==WM_PRINTCLIENT){if(w)paintSmallDialogCombo(h,(HDC)w);return 0;}
+    if(message==WM_MOUSEMOVE&&GetWindowLongPtrW(h,GWLP_USERDATA)==0){SetWindowLongPtrW(h,GWLP_USERDATA,1);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,h,0};TrackMouseEvent(&track);InvalidateRect(h,nullptr,FALSE);}
+    if(message==WM_MOUSELEAVE){SetWindowLongPtrW(h,GWLP_USERDATA,0);InvalidateRect(h,nullptr,FALSE);}
+    if(message==WM_NCDESTROY){RemoveWindowSubclass(h,smallDialogComboProc,id);return DefSubclassProc(h,message,w,l);}
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_ENABLE||message==WM_SETFONT||message==CB_SETCURSEL||message==WM_KEYDOWN||message==WM_LBUTTONUP)InvalidateRect(h,nullptr,FALSE);
+    return result;
+}
+void paintSmallDialogButton(HWND h,HDC dc) {
+    RECT rect{};GetClientRect(h,&rect);FillRect(dc,&rect,gSidebarBrush);
+    bool primary=GetDlgCtrlID(h)==IDOK,pressed=(SendMessageW(h,BM_GETSTATE,0,0)&BST_PUSHED)!=0;
+    bool hot=GetWindowLongPtrW(h,GWLP_USERDATA)!=0,focused=GetFocus()==h;
+    COLORREF background=primary?(pressed?RGB(29,78,216):(hot?RGB(32,87,218):COLOR_ACCENT)):(pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(255,255,255)));
+    COLORREF border=primary?background:(focused?COLOR_ACCENT:(hot?RGB(196,205,217):COLOR_BORDER));
+    HPEN pen=CreatePen(PS_SOLID,std::max(1,dialogPx(h,1)),border);HBRUSH brush=CreateSolidBrush(background);
+    auto oldPen=(HPEN)SelectObject(dc,pen);auto oldBrush=(HBRUSH)SelectObject(dc,brush);
+    RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,dialogPx(h,8),dialogPx(h,8));
+    SelectObject(dc,oldBrush);SelectObject(dc,oldPen);DeleteObject(brush);DeleteObject(pen);
+    wchar_t label[64]{};GetWindowTextW(h,label,64);auto font=(HFONT)SendMessageW(h,WM_GETFONT,0,0);
+    auto oldFont=(HFONT)SelectObject(dc,font?font:gUiFont);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,primary?RGB(255,255,255):COLOR_PRIMARY);
+    DrawTextW(dc,label,-1,&rect,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,oldFont);
+    if(focused&&!(SendMessageW(h,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){
+        RECT ring=rect;InflateRect(&ring,-dialogPx(h,3),-dialogPx(h,3));
+        HPEN focusPen=CreatePen(PS_SOLID,std::max(1,dialogPx(h,1)),primary?RGB(255,255,255):COLOR_ACCENT);
+        oldPen=(HPEN)SelectObject(dc,focusPen);oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
+        RoundRect(dc,ring.left,ring.top,ring.right,ring.bottom,dialogPx(h,6),dialogPx(h,6));
+        SelectObject(dc,oldBrush);SelectObject(dc,oldPen);DeleteObject(focusPen);
+    }
+}
+LRESULT CALLBACK smallDialogButtonProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_PAINT){PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);paintSmallDialogButton(h,dc);EndPaint(h,&paint);return 0;}
+    if(message==WM_PRINTCLIENT){paintSmallDialogButton(h,(HDC)w);return 0;}
+    if(message==WM_MOUSEMOVE&&GetWindowLongPtrW(h,GWLP_USERDATA)==0){
+        SetWindowLongPtrW(h,GWLP_USERDATA,1);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,h,0};TrackMouseEvent(&track);InvalidateRect(h,nullptr,FALSE);
+    }
+    if(message==WM_MOUSELEAVE){SetWindowLongPtrW(h,GWLP_USERDATA,0);InvalidateRect(h,nullptr,FALSE);}
+    if(message==WM_NCDESTROY){RemoveWindowSubclass(h,smallDialogButtonProc,id);return DefSubclassProc(h,message,w,l);}
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if((message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_ENABLE||message==WM_KEYDOWN||message==WM_KEYUP||message==WM_LBUTTONDOWN||message==WM_LBUTTONUP)&&IsWindow(h))InvalidateRect(h,nullptr,FALSE);
+    return result;
+}
+void destroySmallDialogState(HWND h){auto* state=smallDialogState(h);if(!state)return;SetWindowLongPtrW(h,GWLP_USERDATA,0);if(state->body)DeleteObject(state->body);if(state->heading)DeleteObject(state->heading);delete state;}
+HWND createSmallDialog(const wchar_t* className,const wchar_t* title,void* data) {
+    UINT dpi=GetDpiForWindow(gWindow);DWORD style=WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN;
+    DWORD exStyle=WS_EX_DLGMODALFRAME|WS_EX_CONTROLPARENT;
+    RECT frame{0,0,MulDiv(480,(int)dpi,96),MulDiv(194,(int)dpi,96)};
+    AdjustWindowRectExForDpi(&frame,style,FALSE,exStyle,dpi);
+    int width=frame.right-frame.left,height=frame.bottom-frame.top;RECT owner{};GetWindowRect(gWindow,&owner);
+    return CreateWindowExW(exStyle,className,title,style,owner.left+(owner.right-owner.left-width)/2,owner.top+(owner.bottom-owner.top-height)/2,width,height,gWindow,nullptr,gInstance,data);
+}
+
 wstring promptProcResult;bool promptAccepted=false;
 LRESULT CALLBACK promptProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     if(message==WM_CREATE) {
-        auto create=(CREATESTRUCTW*)l;auto values=(std::vector<wstring>*)create->lpCreateParams;
-        CreateWindowW(L"STATIC",(*values)[1].c_str(),WS_CHILD|WS_VISIBLE,px(18),px(18),px(414),px(24),h,nullptr,gInstance,nullptr);
-        HWND edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",(*values)[2].c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,px(18),px(48),px(414),px(30),h,(HMENU)IDC_PROMPT_EDIT,gInstance,nullptr);
-        CreateWindowW(L"BUTTON",L"确定",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,px(266),px(92),px(80),px(30),h,(HMENU)IDOK,gInstance,nullptr);
-        CreateWindowW(L"BUTTON",L"取消",WS_CHILD|WS_VISIBLE,px(352),px(92),px(80),px(30),h,(HMENU)IDCANCEL,gInstance,nullptr);
-        for(HWND c=GetWindow(h,GW_CHILD);c;c=GetWindow(c,GW_HWNDNEXT))applyFont(c);SetFocus(edit);SendMessageW(edit,EM_SETSEL,0,-1);return 0;
+        auto* values=(std::vector<wstring>*)((CREATESTRUCTW*)l)->lpCreateParams;
+        SetWindowLongPtrW(h,GWLP_USERDATA,(LONG_PTR)new SmallDialogState{});
+        CreateWindowW(L"STATIC",(*values)[1].c_str(),WS_CHILD|WS_VISIBLE,0,0,0,0,h,(HMENU)(INT_PTR)SMALL_DIALOG_LABEL,gInstance,nullptr);
+        HWND edit=CreateWindowW(L"EDIT",(*values)[2].c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,h,(HMENU)(INT_PTR)IDC_PROMPT_EDIT,gInstance,nullptr);
+        HWND accept=CreateWindowW(L"BUTTON",L"确定",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON,0,0,0,0,h,(HMENU)IDOK,gInstance,nullptr);
+        HWND cancel=CreateWindowW(L"BUTTON",L"取消",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,0,0,0,0,h,(HMENU)IDCANCEL,gInstance,nullptr);
+        SetWindowSubclass(edit,smallDialogInputProc,1,0);SetWindowSubclass(accept,smallDialogButtonProc,1,0);SetWindowSubclass(cancel,smallDialogButtonProc,1,0);
+        updateSmallDialogFonts(h);layoutSmallDialog(h,false);SetFocus(edit);SendMessageW(edit,EM_SETSEL,0,-1);return 0;
     }
-    if(message==WM_COMMAND&&HIWORD(w)==BN_CLICKED&&(LOWORD(w)==IDOK||LOWORD(w)==IDCANCEL)) {
+    if(message==WM_COMMAND&&(LOWORD(w)==IDOK||LOWORD(w)==IDCANCEL)&&(HIWORD(w)==BN_CLICKED||l==0)) {
         if(LOWORD(w)==IDOK){promptProcResult=trimWide(textOf(GetDlgItem(h,IDC_PROMPT_EDIT)));if(promptProcResult.empty()){MessageBoxW(h,L"名称不能为空。",L"FeatherApi",MB_OK|MB_ICONINFORMATION);SetFocus(GetDlgItem(h,IDC_PROMPT_EDIT));return 0;}promptAccepted=true;}DestroyWindow(h);return 0;
     }
+    if(message==WM_DPICHANGED){RECT* suggested=(RECT*)l;SetWindowPos(h,nullptr,suggested->left,suggested->top,suggested->right-suggested->left,suggested->bottom-suggested->top,SWP_NOZORDER|SWP_NOACTIVATE);updateSmallDialogFonts(h);layoutSmallDialog(h,false);return 0;}
+    if(message==WM_SIZE){layoutSmallDialog(h,false);return 0;}
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PRINTCLIENT){paintSmallDialog(h,(HDC)w,false);return 0;}
+    if(message==WM_PAINT){PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);paintSmallDialog(h,dc,false);EndPaint(h,&paint);return 0;}
+    if(message==WM_CTLCOLORSTATIC||message==WM_CTLCOLOREDIT){SetBkMode((HDC)w,message==WM_CTLCOLORSTATIC?TRANSPARENT:OPAQUE);SetBkColor((HDC)w,RGB(255,255,255));SetTextColor((HDC)w,COLOR_PRIMARY);return (LRESULT)gWhiteBrush;}
+    if(message==WM_NCDESTROY){destroySmallDialogState(h);return DefWindowProcW(h,message,w,l);}
     if(message==WM_CLOSE){DestroyWindow(h);return 0;}return DefWindowProcW(h,message,w,l);
 }
 bool prompt(const wstring& title,const wstring& message,const wstring& initial,wstring& result) {
-    static bool registered=false;if(!registered){WNDCLASSW wc{};wc.hInstance=gInstance;wc.lpfnWndProc=promptProc;wc.lpszClassName=L"FeatherApiPrompt";wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);RegisterClassW(&wc);registered=true;}
-    std::vector<wstring> values{title,message,initial};RECT owner{};GetWindowRect(gWindow,&owner);
-    promptAccepted=false;promptProcResult.clear();HWND dialog=CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_CONTROLPARENT,L"FeatherApiPrompt",title.c_str(),WS_CAPTION|WS_SYSMENU,
-        owner.left+(owner.right-owner.left-px(466))/2,owner.top+(owner.bottom-owner.top-px(165))/2,px(466),px(165),gWindow,nullptr,gInstance,&values);
-    if(!dialog)return false;
+    static bool registered=false;if(!registered){WNDCLASSW wc{};wc.hInstance=gInstance;wc.lpfnWndProc=promptProc;wc.lpszClassName=L"FeatherApiPrompt";wc.hbrBackground=gWhiteBrush;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);RegisterClassW(&wc);registered=true;}
+    std::vector<wstring> values{title,message,initial};promptAccepted=false;promptProcResult.clear();
+    HWND dialog=createSmallDialog(L"FeatherApiPrompt",title.c_str(),&values);if(!dialog)return false;
     EnableWindow(gWindow,FALSE);ShowWindow(dialog,SW_SHOW);SetForegroundWindow(dialog);MSG msg;
     while(IsWindow(dialog)&&GetMessageW(&msg,nullptr,0,0)>0){if(!IsDialogMessageW(dialog,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
     EnableWindow(gWindow,TRUE);SetForegroundWindow(gWindow);if(promptAccepted)result=promptProcResult;return promptAccepted;
@@ -746,20 +1017,21 @@ bool prompt(const wstring& title,const wstring& message,const wstring& initial,w
 LRESULT CALLBACK folderPickerProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     if(message==WM_CREATE) {
         auto* context=(FolderPickerContext*)((CREATESTRUCTW*)l)->lpCreateParams;
-        SetWindowLongPtrW(h,GWLP_USERDATA,(LONG_PTR)context);
-        CreateWindowW(L"STATIC",L"选择目标目录",WS_CHILD|WS_VISIBLE,px(18),px(16),px(420),px(24),h,nullptr,gInstance,nullptr);
-        HWND combo=CreateWindowExW(WS_EX_CLIENTEDGE,L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,px(18),px(45),px(420),px(300),h,(HMENU)1,gInstance,nullptr);
+        auto* state=new SmallDialogState{};state->folder=context;SetWindowLongPtrW(h,GWLP_USERDATA,(LONG_PTR)state);
+        CreateWindowW(L"STATIC",L"选择目标目录",WS_CHILD|WS_VISIBLE,0,0,0,0,h,(HMENU)(INT_PTR)SMALL_DIALOG_LABEL,gInstance,nullptr);
+        HWND combo=CreateWindowW(L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,0,0,0,0,h,(HMENU)(INT_PTR)SMALL_DIALOG_COMBO,gInstance,nullptr);
         for(const auto& choice:*context->choices)SendMessageW(combo,CB_ADDSTRING,0,(LPARAM)choice.label.c_str());
         SendMessageW(combo,CB_SETCURSEL,0,0);
-        CreateWindowW(L"BUTTON",L"移动",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,px(268),px(92),px(80),px(30),h,(HMENU)IDOK,gInstance,nullptr);
-        CreateWindowW(L"BUTTON",L"取消",WS_CHILD|WS_VISIBLE,px(358),px(92),px(80),px(30),h,(HMENU)IDCANCEL,gInstance,nullptr);
-        for(HWND child=GetWindow(h,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))applyFont(child);
-        SetFocus(combo);return 0;
+        SetWindowSubclass(combo,smallDialogComboProc,1,0);
+        HWND accept=CreateWindowW(L"BUTTON",L"移动",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON,0,0,0,0,h,(HMENU)IDOK,gInstance,nullptr);
+        HWND cancel=CreateWindowW(L"BUTTON",L"取消",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,0,0,0,0,h,(HMENU)IDCANCEL,gInstance,nullptr);
+        SetWindowSubclass(accept,smallDialogButtonProc,1,0);SetWindowSubclass(cancel,smallDialogButtonProc,1,0);
+        updateSmallDialogFonts(h);layoutSmallDialog(h,true);SetFocus(combo);return 0;
     }
-    if(message==WM_COMMAND&&(LOWORD(w)==IDOK||LOWORD(w)==IDCANCEL)) {
-        auto* context=(FolderPickerContext*)GetWindowLongPtrW(h,GWLP_USERDATA);
+    if(message==WM_COMMAND&&(LOWORD(w)==IDOK||LOWORD(w)==IDCANCEL)&&(HIWORD(w)==BN_CLICKED||l==0)) {
+        auto* state=smallDialogState(h);auto* context=state?state->folder:nullptr;
         if(LOWORD(w)==IDOK&&context&&context->choices){
-            int index=(int)SendMessageW(GetDlgItem(h,1),CB_GETCURSEL,0,0);
+            int index=(int)SendMessageW(GetDlgItem(h,SMALL_DIALOG_COMBO),CB_GETCURSEL,0,0);
             if(index<0||index>=(int)context->choices->size()){
                 MessageBoxW(h,L"请选择目标目录。",L"FeatherApi",MB_OK|MB_ICONINFORMATION);
                 return 0;
@@ -768,16 +1040,22 @@ LRESULT CALLBACK folderPickerProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         }
         DestroyWindow(h);return 0;
     }
+    if(message==WM_DPICHANGED){RECT* suggested=(RECT*)l;SetWindowPos(h,nullptr,suggested->left,suggested->top,suggested->right-suggested->left,suggested->bottom-suggested->top,SWP_NOZORDER|SWP_NOACTIVATE);updateSmallDialogFonts(h);layoutSmallDialog(h,true);return 0;}
+    if(message==WM_SIZE){layoutSmallDialog(h,true);return 0;}
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PRINTCLIENT){paintSmallDialog(h,(HDC)w,true);return 0;}
+    if(message==WM_PAINT){PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);paintSmallDialog(h,dc,true);EndPaint(h,&paint);return 0;}
+    if(message==WM_CTLCOLORSTATIC||message==WM_CTLCOLORLISTBOX){SetBkMode((HDC)w,message==WM_CTLCOLORSTATIC?TRANSPARENT:OPAQUE);SetBkColor((HDC)w,RGB(255,255,255));SetTextColor((HDC)w,COLOR_PRIMARY);return (LRESULT)gWhiteBrush;}
+    if(message==WM_NCDESTROY){destroySmallDialogState(h);return DefWindowProcW(h,message,w,l);}
     if(message==WM_CLOSE){DestroyWindow(h);return 0;}
     return DefWindowProcW(h,message,w,l);
 }
 bool pickFolder(const std::vector<FolderChoice>& choices,ApiFolder*& selected) {
     static bool registered=false;
-    if(!registered){WNDCLASSW wc{};wc.hInstance=gInstance;wc.lpfnWndProc=folderPickerProc;wc.lpszClassName=L"FeatherApiFolderPicker";wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);RegisterClassW(&wc);registered=true;}
-    FolderPickerContext context{&choices,nullptr,false};RECT owner{};GetWindowRect(gWindow,&owner);
-    HWND dialog=CreateWindowExW(WS_EX_DLGMODALFRAME,L"FeatherApiFolderPicker",L"移动接口",WS_CAPTION|WS_SYSMENU,
-        owner.left+(owner.right-owner.left-px(470))/2,owner.top+(owner.bottom-owner.top-px(165))/2,px(470),px(165),gWindow,nullptr,gInstance,&context);
-    EnableWindow(gWindow,FALSE);ShowWindow(dialog,SW_SHOW);MSG msg;
+    if(!registered){WNDCLASSW wc{};wc.hInstance=gInstance;wc.lpfnWndProc=folderPickerProc;wc.lpszClassName=L"FeatherApiFolderPicker";wc.hbrBackground=gWhiteBrush;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);RegisterClassW(&wc);registered=true;}
+    FolderPickerContext context{&choices,nullptr,false};
+    HWND dialog=createSmallDialog(L"FeatherApiFolderPicker",L"移动接口",&context);if(!dialog)return false;
+    EnableWindow(gWindow,FALSE);ShowWindow(dialog,SW_SHOW);SetForegroundWindow(dialog);MSG msg;
     while(IsWindow(dialog)&&GetMessageW(&msg,nullptr,0,0)>0){if(!IsDialogMessageW(dialog,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
     EnableWindow(gWindow,TRUE);SetForegroundWindow(gWindow);if(context.accepted){selected=context.selected;return true;}return false;
 }
@@ -1016,11 +1294,127 @@ std::vector<KeyValueEntry> readEntryList(HWND list,bool enabled=true) {
     return result;
 }
 
+// Keep the stored address free of query entries: the HTTP layer appends r.query.
+// An unfinished URL stays as entered so typing '?' or a percent escape survives
+// tab switches and saves instead of being rewritten while the user is editing.
+bool decodeUrlQueryPart(const string& raw,string& decoded) {
+    decoded.clear();decoded.reserve(raw.size());
+    auto digit=[](char c)->int {if(c>='0'&&c<='9')return c-'0';if(c>='A'&&c<='F')return c-'A'+10;if(c>='a'&&c<='f')return c-'a'+10;return -1;};
+    for(size_t i=0;i<raw.size();++i){
+        if(raw[i]=='+')decoded+=' ';
+        else if(raw[i]=='%'){
+            if(i+2>=raw.size())return false;
+            int high=digit(raw[i+1]),low=digit(raw[i+2]);if(high<0||low<0)return false;
+            char value=(char)((high<<4)|low);if(value=='\0')return false;
+            decoded+=value;i+=2;
+        }else decoded+=raw[i];
+    }
+    return toUtf8(toWide(decoded))==decoded;
+}
+struct ParsedUrlQuery {string address;std::vector<KeyValueEntry> entries;bool hasQuery=false,complete=true;};
+ParsedUrlQuery parseUrlQuery(const string& raw) {
+    ParsedUrlQuery parsed;parsed.address=raw;
+    size_t fragmentAt=raw.find('#'),queryAt=raw.find('?');
+    if(queryAt==string::npos||(fragmentAt!=string::npos&&queryAt>fragmentAt))return parsed;
+    parsed.hasQuery=true;
+    string query=raw.substr(queryAt+1,(fragmentAt==string::npos?raw.size():fragmentAt)-queryAt-1);
+    if(query.empty()||query.back()=='&'){parsed.complete=false;return parsed;}
+    for(size_t start=0;start<query.size();){
+        size_t end=query.find('&',start);if(end==string::npos)end=query.size();
+        if(end==start){parsed.complete=false;return parsed;}
+        string pair=query.substr(start,end-start);size_t equals=pair.find('=');
+        string key,value;
+        if(!decodeUrlQueryPart(pair.substr(0,equals),key)||key.empty()||
+           (equals!=string::npos&&!decodeUrlQueryPart(pair.substr(equals+1),value))){parsed.complete=false;return parsed;}
+        parsed.entries.push_back({true,std::move(key),std::move(value)});
+        start=end+1;
+    }
+    parsed.address=raw.substr(0,queryAt)+(fragmentAt==string::npos?string():raw.substr(fragmentAt));
+    return parsed;
+}
+string effectiveRequestUrl(const ApiRequest& request) {
+    ParsedUrlQuery draft=parseUrlQuery(request.url);
+    if(draft.hasQuery&&!draft.complete)return request.url;
+    RequestSnapshot snapshot; snapshot.url=request.url;snapshot.query=request.query;
+    return buildRequestUrl(snapshot);
+}
+void showEffectiveRequestUrl(const ApiRequest& request) {
+    wstring effective=toWide(effectiveRequestUrl(request));if(textOf(gUrl)==effective)return;
+    bool wasLoading=gLoadingEditor;gLoadingEditor=true;setText(gUrl,effective);gLoadingEditor=wasLoading;
+}
+template<class Request>
+void normalizeStoredUrlQuery(Request& request) {
+    ParsedUrlQuery parsed=parseUrlQuery(request.url);
+    if(!parsed.hasQuery||!parsed.complete)return;
+    parsed.entries.insert(parsed.entries.end(),request.query.begin(),request.query.end());
+    request.url=std::move(parsed.address);request.query=std::move(parsed.entries);
+}
+void normalizeWorkspaceUrlQueries(AppData& data) {
+    std::function<void(ApiFolder&)> normalizeFolder=[&](ApiFolder& folder){
+        for(auto& request:folder.requests){
+            normalizeStoredUrlQuery(*request);
+            for(auto& requestCase:request->cases)normalizeStoredUrlQuery(*requestCase);
+        }
+        for(auto& child:folder.children)normalizeFolder(*child);
+    };
+    for(auto& folder:data.folders)normalizeFolder(*folder);
+}
+void acceptEditedUrl(const wstring& visible,ApiRequest& request) {
+    ParsedUrlQuery parsed=parseUrlQuery(toUtf8(visible));
+    if(!parsed.hasQuery){
+        request.url=toUtf8(visible);
+        request.query.erase(std::remove_if(request.query.begin(),request.query.end(),
+            [](const KeyValueEntry& entry){return entry.enabled;}),request.query.end());
+    }
+    else if(!parsed.complete){
+        // Keep the last complete table while the user is still typing a query.
+        // The raw draft is displayed and sent without appending those rows.
+        request.url=toUtf8(visible);
+    }
+    else {
+        // Disabled rows are absent from the URL, so retain them and carry
+        // metadata across edits to visible rows with the same key.
+        std::vector<KeyValueEntry> oldEnabled;
+        for(const auto& entry:request.query)if(entry.enabled)oldEnabled.push_back(entry);
+        std::vector<bool> used(oldEnabled.size(),false);
+        for(size_t row=0;row<parsed.entries.size();++row){
+            auto& entry=parsed.entries[row];
+            size_t match=oldEnabled.size();
+            if(row<oldEnabled.size()&&!used[row]&&oldEnabled[row].key==entry.key)match=row;
+            if(match==oldEnabled.size())for(size_t i=0;i<oldEnabled.size();++i)
+                if(!used[i]&&oldEnabled[i].key==entry.key&&oldEnabled[i].value==entry.value){match=i;break;}
+            if(match==oldEnabled.size())for(size_t i=0;i<oldEnabled.size();++i)
+                if(!used[i]&&oldEnabled[i].key==entry.key){match=i;break;}
+            if(match<oldEnabled.size()){
+                used[match]=true;entry.type=oldEnabled[match].type;entry.description=oldEnabled[match].description;
+            }
+        }
+        std::vector<KeyValueEntry> merged;merged.reserve(request.query.size()+parsed.entries.size());
+        size_t next=0;
+        for(const auto& old:request.query){
+            if(!old.enabled)merged.push_back(old);
+            else if(next<parsed.entries.size())merged.push_back(std::move(parsed.entries[next++]));
+        }
+        while(next<parsed.entries.size())merged.push_back(std::move(parsed.entries[next++]));
+        request.url=std::move(parsed.address);
+        request.query=std::move(merged);
+    }
+    if(gEditorPage==0&&!sameEntries(readEntryList(gKvList),request.query))fillEntryList(gKvList,request.query);
+}
+
 void saveEditor(bool updateBodyType=true) {
     if(gLoadingEditor)return;auto tab=selectedTab();if(!tab)return;auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
     string previousMethod=r.method;wstring method=trimWide(textOf(gMethod));if(!method.empty())r.method=toUtf8(method);
-    r.url=toUtf8(textOf(gUrl));if(updateBodyType){int bodyType=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(bodyType>=0&&bodyType<5)r.bodyType=types[bodyType];}r.body=toUtf8(textOf(gBody));
-    if(gEditorPage==0)r.query=readEntryList(gKvList);else if(gEditorPage==1)r.headers=readEntryList(gKvList);else if(gEditorPage==2&&(r.bodyType=="Form URL Encoded"||r.bodyType=="Multipart Form Data"))r.formFields=readEntryList(gKvList);
+    if(updateBodyType){int bodyType=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(bodyType>=0&&bodyType<5)r.bodyType=types[bodyType];}r.body=toUtf8(textOf(gBody));
+    if(gEditorPage==0){auto entries=readEntryList(gKvList);if(!sameEntries(r.query,entries)){
+        ParsedUrlQuery draft=parseUrlQuery(r.url);
+        if(draft.hasQuery&&!draft.complete){
+            size_t queryAt=r.url.find('?'),fragmentAt=r.url.find('#');
+            r.url=r.url.substr(0,queryAt)+(fragmentAt==string::npos?string():r.url.substr(fragmentAt));
+        }
+        r.query=std::move(entries);showEffectiveRequestUrl(r);
+    }}
+    else if(gEditorPage==1)r.headers=readEntryList(gKvList);else if(gEditorPage==2&&(r.bodyType=="Form URL Encoded"||r.bodyType=="Multipart Form Data"))r.formFields=readEntryList(gKvList);
     if(previousMethod!=r.method)refreshRequestTabs();
 }
 bool saveNow(bool feedback=false) {
@@ -1077,7 +1471,7 @@ void displayResponse(const wstring& value,bool pretty) {
     gResponseHighlights.clear();gResponseHighlightLength=0;gResponseHighlightCurrent=wstring::npos;
     SendMessageW(gResponseBody,WM_SETREDRAW,FALSE,0);setText(gResponseBody,value);
     if(gRichEditModule){
-        CHARFORMAT2W format{};format.cbSize=sizeof(format);format.dwMask=CFM_COLOR|CFM_BOLD|CFM_BACKCOLOR;format.crTextColor=RGB(51,65,85);format.dwEffects=CFE_AUTOBACKCOLOR;
+        CHARFORMAT2W format{};format.cbSize=sizeof(format);format.dwMask=CFM_COLOR|CFM_BOLD|CFM_BACKCOLOR;format.crTextColor=COLOR_PRIMARY;format.dwEffects=CFE_AUTOBACKCOLOR;
         SendMessageW(gResponseBody,EM_SETCHARFORMAT,SCF_ALL,(LPARAM)&format);
         format.dwMask=CFM_COLOR|CFM_BOLD;format.dwEffects=0;
         PARAFORMAT2 paragraph{};paragraph.cbSize=sizeof(paragraph);paragraph.dwMask=PFM_LINESPACING;paragraph.bLineSpacingRule=5;paragraph.dyLineSpacing=24;
@@ -1138,13 +1532,14 @@ void showResponsePage() {
 void loadEditor() {
     captureView();gLoadingEditor=true;auto tab=selectedTab();bool active=tab!=nullptr;
     for(HWND control:{gRequestTabs,gMethod,gUrlFrame,gUrl,gSave,gSaveMore,gSend,gCancel,gEditorTabs,gSummary,gResponseTabs})EnableWindow(control,active);
-    setVisible(gEmptyTitle,!active);setVisible(gEmptyHelp,!active);
+    setVisible(gEmptyTitle,!active);setVisible(gEmptyHelp,!active);setVisible(gEmptyNewRequest,!active);
     for(HWND control:{gMethod,gUrlFrame,gUrl,gSaveMore,gEditorTabs,gKvList,gBodyType,gFormat,gCompress,gBody,gValidation,gSummary,gResponseTabs,gResponseBody,gResponseHeaders,gBodyNone,gResponseMode,gResponseModeDivider,gResponseFind})setVisible(control,active);
     EnableWindow(gSave,TRUE);setVisible(gSave,true);
     if(!active){gDisplayedTab.reset();setVisible(gResponseFindPanel,false);setVisible(gFindStatus,false);setVisible(gSend,false);setVisible(gCancel,false);setText(gUrl,L"");setText(gResponseBody,L"");gLoadingEditor=false;return;}
     gEditorPage=tab->editorPage;gResponsePage=tab->responsePage;gResponseFindVisible=tab->findVisible;gResponseFindQuery=tab->findQuery;gResponseFindPosition=tab->findPosition;
     TabCtrl_SetCurSel(gEditorTabs,gEditorPage);TabCtrl_SetCurSel(gResponseTabs,gResponsePage);setText(gResponseFindEdit,tab->findQuery);setText(gFindStatus,tab->findStatus);
-    auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;setText(gMethod,toWide(r.method));InvalidateRect(gMethod,nullptr,TRUE);setText(gUrl,toWide(r.url));
+    auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;normalizeStoredUrlQuery(r);
+    setText(gMethod,toWide(r.method));InvalidateRect(gMethod,nullptr,TRUE);setText(gUrl,toWide(effectiveRequestUrl(r)));
     int type=0;const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};for(int i=0;i<5;++i)if(r.bodyType==types[i])type=i;SendMessageW(gBodyType,CB_SETCURSEL,type,0);setText(gBody,toWide(r.body));
     setText(gSummary,tab->summary);setValidationText(tab->validation);setVisible(gSend,!tab->sending);setVisible(gCancel,tab->sending);
     showEditorPage();showResponsePage();gDisplayedTab=tab;gLoadingEditor=false;
@@ -1165,7 +1560,7 @@ void closeTab(int index,bool confirm) {
     if(index<0||index>=(int)gTabs.size())return;
     if(confirm){closeTabRange(index,0);return;}
     commitCellEditor();saveEditor();captureView();
-    auto tab=gTabs[(size_t)index];tab->cancelNow();
+    auto tab=gTabs[(size_t)index];retireTab(tab);
     gSelectedTab=tabSelectionAfterClose(gSelectedTab,index,(int)gTabs.size());gTabs.erase(gTabs.begin()+index);
     refreshRequestTabs();loadEditor();selectTreeTab(selectedTab());
 }
@@ -1203,7 +1598,7 @@ void closeTabRange(int contextIndex,int command) {
             }
         }
     }
-    for(const auto& tab:targets)tab->cancelNow();
+    for(const auto& tab:targets)retireTab(tab);
     // Do not reload the discarded editor: its text must never overwrite the restored baseline.
     gTabs.erase(std::remove_if(gTabs.begin(),gTabs.end(),[&](const auto& tab){return std::find(targets.begin(),targets.end(),tab)!=targets.end();}),gTabs.end());
     for(auto request:removeRequests)if(auto folder=findFolderForRequest(request)){
@@ -1220,9 +1615,22 @@ void addFolder(ApiFolder* parent) {
     auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name=toUtf8(name);ApiFolder* pointer=folder.get();if(parent)parent->children.push_back(std::move(folder));else gData.folders.push_back(std::move(folder));gSelectedFolder=pointer;rebuildTree();selectTreeValue(NodeRef::Kind::Folder,pointer);setSaveStatus(L"未保存");
 }
 void addRequest(ApiFolder* folder) {
-    if(!folder){if(gData.folders.empty()){auto f=std::make_unique<ApiFolder>();f->id=newId();f->name="默认目录";gData.folders.push_back(std::move(f));}folder=gData.folders.front().get();}
     wstring name;if(!prompt(L"新增接口",L"请输入接口名称：",L"新接口",name))return;
-    auto request=std::make_unique<ApiRequest>();request->id=newId();request->name=toUtf8(name);ApiRequest* pointer=request.get();folder->requests.push_back(std::move(request));rebuildTree();openRequest(pointer);setSaveStatus(L"未保存");
+    if(!folder){if(gData.folders.empty()){auto f=std::make_unique<ApiFolder>();f->id=newId();f->name="默认目录";gData.folders.push_back(std::move(f));}folder=gData.folders.front().get();}
+    auto request=std::make_unique<ApiRequest>();request->id=newId();request->name=toUtf8(name);ApiRequest* pointer=request.get();folder->requests.push_back(std::move(request));
+    if(!textOf(gSearch).empty())setText(gSearch,L"");
+    rebuildTree();if(auto item=findTreeRequest(pointer))TreeView_EnsureVisible(gTree,item);
+    openRequest(pointer);SetFocus(gUrl);setSaveStatus(L"未保存");
+}
+void showCreateMenu() {
+    HMENU menu=CreatePopupMenu();
+    AppendMenuW(menu,MF_STRING,IDM_FOLDER_ADD_REQUEST,L"新建接口");
+    AppendMenuW(menu,MF_STRING,IDM_FOLDER_ADD_CHILD,L"新建目录");
+    RECT bounds{};GetWindowRect(gAddFolder,&bounds);
+    int choice=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTALIGN,bounds.right,bounds.bottom,0,gWindow,nullptr);
+    DestroyMenu(menu);
+    if(choice==IDM_FOLDER_ADD_REQUEST)addRequest(gSelectedFolder);
+    else if(choice==IDM_FOLDER_ADD_CHILD)addFolder(nullptr);
 }
 void renameFolder(ApiFolder* folder) {
     if(!folder)return;wstring result;
@@ -1386,7 +1794,7 @@ LRESULT drawEntryList(NMLVCUSTOMDRAW* draw) {
         RestoreDC(dc,cellState);
     }
     RECT line{bounds.left+px(12),bounds.bottom-1,bounds.right-px(12),bounds.bottom};HBRUSH lineBrush=CreateSolidBrush(RGB(239,242,246));FillRect(dc,&line,lineBrush);DeleteObject(lineBrush);
-    if(focused){RECT cell=entryCellBounds(row,gFocusedEntryColumn);InflateRect(&cell,-px(3),-px(3));SetTextColor(dc,COLOR_ACCENT);DrawFocusRect(dc,&cell);}
+    if(focused){RECT cell=entryCellBounds(row,gFocusedEntryColumn);InflateRect(&cell,-px(3),-px(3));drawFocusRing(dc,cell);}
     RestoreDC(dc,saved);return CDRF_SKIPDEFAULT;
 }
 void ensureTrailingEntryRow() {
@@ -1459,9 +1867,73 @@ LRESULT CALLBACK kvListProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD
     }
     return DefSubclassProc(h,message,w,l);
 }
+void paintResponseHeader(HWND header,HDC dc) {
+    RECT client{};GetClientRect(header,&client);FillRect(dc,&client,gSidebarBrush);
+    int saved=SaveDC(dc);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,COLOR_SECONDARY);SelectObject(dc,gUiFont);
+    for(int column=0;column<Header_GetItemCount(header);++column){
+        RECT cell{};if(!Header_GetItemRect(header,column,&cell))continue;
+        cell.left+=px(12);cell.right-=px(12);
+        wchar_t label[32]{};HDITEMW item{};item.mask=HDI_TEXT;item.pszText=label;item.cchTextMax=(int)std::size(label);
+        if(Header_GetItem(header,column,&item))DrawTextW(dc,label,-1,&cell,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+    }
+    RECT line{client.left,client.bottom-1,client.right,client.bottom};FillRect(dc,&line,gBorderBrush);RestoreDC(dc,saved);
+}
+LRESULT CALLBACK responseHeaderProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==HDM_LAYOUT){
+        LRESULT result=DefSubclassProc(h,message,w,l);auto info=(HDLAYOUT*)l;
+        info->prc->top+=px(ENTRY_HEADER_HEIGHT)-info->pwpos->cy;info->pwpos->cy=px(ENTRY_HEADER_HEIGHT);return result;
+    }
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT){PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);paintResponseHeader(h,dc);EndPaint(h,&paint);return 0;}
+    if(message==WM_PRINTCLIENT){paintResponseHeader(h,(HDC)w);return 0;}
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(h,responseHeaderProc,id);
+    return DefSubclassProc(h,message,w,l);
+}
+void updateResponseHeaderMetrics(HWND list) {
+    HWND header=ListView_GetHeader(list);if(!header)return;
+    DWORD_PTR refData{};bool relayout=false;
+    if(!GetWindowSubclass(header,responseHeaderProc,18,&refData)){
+        SetWindowSubclass(header,responseHeaderProc,18,0);applyFont(header);relayout=true;
+    }
+    HIMAGELIST current=ListView_GetImageList(list,LVSIL_SMALL);int width=0,height=0;
+    if(!current||!ImageList_GetIconSize(current,&width,&height)||height!=px(ENTRY_ROW_HEIGHT)-1){
+        HIMAGELIST spacing=ImageList_Create(1,px(ENTRY_ROW_HEIGHT)-1,ILC_COLOR32,1,1);
+        if(spacing){HIMAGELIST old=ListView_SetImageList(list,spacing,LVSIL_SMALL);if(old)ImageList_Destroy(old);relayout=true;}
+    }
+    if(relayout)SetWindowPos(list,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+}
+LRESULT drawResponseHeaders(NMLVCUSTOMDRAW* draw) {
+    if(draw->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
+    if(draw->nmcd.dwDrawStage!=CDDS_ITEMPREPAINT)return CDRF_DODEFAULT;
+    HWND list=draw->nmcd.hdr.hwndFrom;int row=(int)draw->nmcd.dwItemSpec;HDC dc=draw->nmcd.hdc;
+    RECT bounds{};if(!ListView_GetItemRect(list,row,&bounds,LVIR_BOUNDS))return CDRF_DODEFAULT;
+    int saved=SaveDC(dc);bool selected=(ListView_GetItemState(list,row,LVIS_SELECTED)&LVIS_SELECTED)!=0;
+    COLORREF background=selected?RGB(242,247,255):((draw->nmcd.uItemState&CDIS_HOT)?RGB(248,250,253):RGB(255,255,255));
+    HBRUSH brush=CreateSolidBrush(background);FillRect(dc,&bounds,brush);DeleteObject(brush);SetBkMode(dc,TRANSPARENT);
+    HWND header=ListView_GetHeader(list);
+    for(int column=0;column<2;++column){
+        RECT cell{};if(!ListView_GetSubItemRect(list,row,column,LVIR_BOUNDS,&cell))continue;
+        if(column==0){RECT first{};Header_GetItemRect(header,0,&first);MapWindowPoints(header,list,(POINT*)&first,2);cell.left=first.left;cell.right=first.right;}
+        int cellSaved=SaveDC(dc);IntersectClipRect(dc,cell.left,cell.top,cell.right,cell.bottom);
+        cell.left+=px(12);cell.right-=px(12);wstring value=listCellText(list,row,column);
+        if(column==0){SelectObject(dc,gTreeFolderFont);SetTextColor(dc,COLOR_PRIMARY);}
+        else {SelectObject(dc,gUiFont);if(value.empty()){value=L"—";SetTextColor(dc,RGB(185,194,206));}else SetTextColor(dc,COLOR_SECONDARY);}
+        DrawTextW(dc,value.c_str(),(int)value.size(),&cell,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+        RestoreDC(dc,cellSaved);
+    }
+    RECT client{};GetClientRect(list,&client);RECT line{client.left+px(12),bounds.bottom-1,client.right-px(12),bounds.bottom};
+    if(line.right>line.left){HBRUSH separator=CreateSolidBrush(RGB(239,242,246));FillRect(dc,&line,separator);DeleteObject(separator);}
+    if(selected&&GetFocus()==list&&!(SendMessageW(list,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){
+        RECT focus=bounds;InflateRect(&focus,-px(3),-px(3));drawFocusRing(dc,focus);
+    }
+    RestoreDC(dc,saved);return CDRF_SKIPDEFAULT;
+}
 LRESULT CALLBACK responseHeadersProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
     if(message==WM_KEYDOWN&&GetKeyState(VK_CONTROL)<0&&w=='C'){copySelectedListRow(h,false);return 0;}
-    return DefSubclassProc(h,message,w,l);
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if(message==WM_SIZE)updateResponseHeaderMetrics(h);
+    if(message==WM_SETFONT){updateResponseHeaderMetrics(h);applyFont(ListView_GetHeader(h));}
+    return result;
 }
 void layoutResponseFindControls() {
     RECT panel{};GetClientRect(gResponseFindPanel,&panel);int width=dip(panel.right);
@@ -1523,7 +1995,7 @@ void paintResponseMatches() {
     }
     format.dwEffects=0;
     for(size_t position:visible){
-        format.crBackColor=position==gResponseFindPosition?RGB(255,203,87):RGB(255,240,171);
+        format.crBackColor=position==gResponseFindPosition?RGB(147,197,253):RGB(219,234,254);
         SendMessageW(gResponseBody,EM_SETSEL,position,position+gResponseFindQuery.size());
         SendMessageW(gResponseBody,EM_SETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);
     }
@@ -1611,8 +2083,8 @@ LRESULT CALLBACK responseFindPanelProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     if(message==WM_ERASEBKGND)return 1;
     if(message==WM_PAINT){
         PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT rect{};GetClientRect(h,&rect);FillRect(dc,&rect,gWhiteBrush);
-        HPEN border=CreatePen(PS_SOLID,px(1),GetFocus()==gResponseFindEdit?COLOR_ACCENT:COLOR_BORDER);auto oldPen=(HPEN)SelectObject(dc,border);auto oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
-        RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,px(6),px(6));SelectObject(dc,oldPen);DeleteObject(border);
+        HPEN border=CreatePen(PS_SOLID,px(1),GetFocus()==gResponseFindEdit?COLOR_ACCENT:RGB(211,219,230));auto oldPen=(HPEN)SelectObject(dc,border);auto oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
+        RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,px(9),px(9));SelectObject(dc,oldPen);DeleteObject(border);
         HPEN icon=CreatePen(PS_SOLID,px(1),COLOR_SECONDARY);oldPen=(HPEN)SelectObject(dc,icon);
         int x=px(8),y=(rect.bottom-px(10))/2;Ellipse(dc,x,y,x+px(9),y+px(9));MoveToEx(dc,x+px(8),y+px(8),nullptr);LineTo(dc,x+px(13),y+px(13));
         SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(icon);EndPaint(h,&paint);return 0;
@@ -1649,7 +2121,7 @@ void editListCell(int row,int column,bool keyboard) {
     RECT bounds{};if(!ListView_GetSubItemRect(gKvList,row,column,LVIR_BOUNDS,&bounds))return;MapWindowPoints(gKvList,gWindow,(POINT*)&bounds,2);
     InflateRect(&bounds,-px(8),-px(4));
     wstring current=entryCellText(row,column);bool combo=column==3;
-    gCellEditor=CreateWindowExW(WS_EX_CLIENTEDGE,combo?L"COMBOBOX":L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|(combo?(CBS_DROPDOWN|WS_VSCROLL):ES_AUTOHSCROLL),
+    gCellEditor=CreateWindowExW(WS_EX_STATICEDGE,combo?L"COMBOBOX":L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|(combo?(CBS_DROPDOWN|WS_VSCROLL):ES_AUTOHSCROLL),
         bounds.left,bounds.top,bounds.right-bounds.left,combo?px(180):bounds.bottom-bounds.top,gWindow,nullptr,gInstance,nullptr);
     if(!gCellEditor)return;applyFont(gCellEditor);
     if(combo){RECT editor{};GetWindowRect(gCellEditor,&editor);SetWindowPos(gCellEditor,nullptr,bounds.left,(bounds.top+bounds.bottom-(editor.bottom-editor.top))/2,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);}
@@ -1664,7 +2136,10 @@ void editListCell(int row,int column,bool keyboard) {
 void toggleEntry(int row){ListView_SetCheckState(gKvList,row,ListView_GetCheckState(gKvList,row)==FALSE);}
 
 RequestSnapshot snapshotCurrent() {
-    commitCellEditor();saveEditor();auto tab=selectedTab();auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;return {r.method,r.url,r.query,r.headers,r.bodyType,r.body,r.formFields};
+    commitCellEditor();saveEditor();auto tab=selectedTab();auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
+    RequestSnapshot snapshot{r.method,r.url,r.query,r.headers,r.bodyType,r.body,r.formFields};
+    ParsedUrlQuery draft=parseUrlQuery(r.url);if(draft.hasQuery&&!draft.complete)snapshot.query.clear();
+    return snapshot;
 }
 void formatCurrentJson(bool compact) {
     auto tab=selectedTab();if(!tab)return;string source=toUtf8(textOf(gBody));
@@ -1697,12 +2172,14 @@ void sendCurrent() {
         setValidationText(error);SetFocus(invalidControl);return;
     }
     if(tab->worker.joinable())tab->worker.join();
-    tab->cancel=false;tab->sending=true;tab->started=std::chrono::steady_clock::now();tab->summary=L"请求中 · 0 ms";
+    tab->cancel=false;tab->sending=true;tab->workerFinished=false;tab->started=std::chrono::steady_clock::now();tab->summary=L"请求中 · 0 ms";
     tab->validation.clear();tab->oldResponse=tab->responseSummary!=L"暂无响应";
     setValidationText(L"");setVisible(gSend,false);setVisible(gCancel,true);EnableWindow(gCancel,TRUE);setText(gCancel,L"取消");showResponsePage();
     SetTimer(gWindow,REQUEST_TIMER,100,nullptr);
     auto keep=tab;tab->worker=std::thread([keep,request=std::move(request)](){
-        auto completion=new HttpCompletion();completion->tab=keep;completion->result=executeHttp(request,keep->cancel,&keep->activeRequest);PostMessageW(gWindow,WM_HTTP_DONE,(WPARAM)completion,0);
+        auto completion=new HttpCompletion();completion->tab=keep;completion->result=executeHttp(request,keep->cancel,&keep->activeRequest);
+        if(!PostMessageW(gWindow,WM_HTTP_DONE,(WPARAM)completion,0))delete completion;
+        keep->workerFinished=true;
     });
 }
 void cancelCurrent() {
@@ -1757,12 +2234,19 @@ LRESULT CALLBACK urlProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PT
     }
     return result;
 }
+void selectRequestMethod(const wchar_t* method) {
+    auto tab=selectedTab();if(!tab)return;
+    auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
+    string chosen=toUtf8(method);if(request.method==chosen)return;
+    request.method=chosen;setText(gMethod,method);
+    refreshRequestTabs();scheduleSave();InvalidateRect(gMethod,nullptr,TRUE);
+}
 void showMethodMenu() {
     static const wchar_t* methods[]={L"GET",L"POST",L"PUT",L"PATCH",L"DELETE",L"HEAD",L"OPTIONS"};
     HMENU menu=CreatePopupMenu();wstring current=textOf(gMethod);
     for(UINT i=0;i<7;++i)AppendMenuW(menu,MF_STRING|(current==methods[i]?MF_CHECKED:0),i+1,methods[i]);
     RECT bounds{};GetWindowRect(gMethod,&bounds);UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_LEFTALIGN|TPM_TOPALIGN,bounds.left,bounds.bottom,0,gWindow,nullptr);DestroyMenu(menu);
-    if(command>=1&&command<=7){setText(gMethod,methods[command-1]);saveEditor();scheduleSave();InvalidateRect(gMethod,nullptr,TRUE);}
+    if(command>=1&&command<=7)selectRequestMethod(methods[command-1]);
 }
 LRESULT CALLBACK requestToolbarButtonProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
     if(message==WM_MOUSEMOVE&&IsWindowEnabled(h)&&gRequestToolbarHot!=h){
@@ -1817,7 +2301,7 @@ void createControls() {
     gRequestTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE,IDC_REQUEST_TABS);SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(REQUEST_TAB_HEIGHT-4)));SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(22),px(4)));SetWindowSubclass(gRequestTabs,requestTabsProc,3,0);
     gRequestTabScroll=child(L"SCROLLBAR",L"",SBS_HORZ,IDC_REQUEST_TAB_SCROLL);SetWindowSubclass(gRequestTabScroll,requestTabScrollProc,8,0);ShowWindow(gRequestTabScroll,SW_HIDE);
     gMethod=child(L"BUTTON",L"GET",BS_OWNERDRAW,IDC_METHOD);
-    gUrlFrame=child(L"STATIC",L"",SS_OWNERDRAW,IDC_URL_FRAME);
+    gUrlFrame=child(L"STATIC",L"",SS_OWNERDRAW|WS_CLIPSIBLINGS,IDC_URL_FRAME);
     const wchar_t* urlClass=gRichEditModule?MSFTEDIT_CLASS:L"EDIT";
     gUrl=child(urlClass,L"",ES_MULTILINE|ES_AUTOHSCROLL,IDC_URL);
     if(gRichEditModule){SendMessageW(gUrl,EM_SETTEXTMODE,TM_PLAINTEXT|TM_MULTILEVELUNDO,0);SendMessageW(gUrl,EM_SETEVENTMASK,0,ENM_CHANGE);}
@@ -1832,21 +2316,25 @@ void createControls() {
     gKvList=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL,IDC_KV_LIST);ListView_SetExtendedListViewStyle(gKvList,LVS_EX_DOUBLEBUFFER|LVS_EX_CHECKBOXES|LVS_EX_LABELTIP);addListColumns(gKvList,true);
     SetWindowSubclass(gKvList,kvListProc,2,0);
     SetWindowSubclass(ListView_GetHeader(gKvList),entryHeaderProc,12,0);updateEntryMetrics();
-    gBodyType=child(L"COMBOBOX",L"",CBS_DROPDOWNLIST,IDC_BODY_TYPE);for(auto type:{L"None",L"JSON",L"Form URL Encoded",L"Multipart Form Data",L"Raw"})SendMessageW(gBodyType,CB_ADDSTRING,0,(LPARAM)type);
+    gBodyType=child(L"COMBOBOX",L"",CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS,IDC_BODY_TYPE);
+    for(auto type:{L"None",L"JSON",L"Form URL Encoded",L"Multipart Form Data",L"Raw"})SendMessageW(gBodyType,CB_ADDSTRING,0,(LPARAM)type);
+    SendMessageW(gBodyType,CB_SETITEMHEIGHT,(WPARAM)-1,px(23));SendMessageW(gBodyType,CB_SETITEMHEIGHT,0,px(26));
+    SetWindowSubclass(gBodyType,bodyTypeProc,17,0);
     gFormat=child(L"BUTTON",L"格式化",BS_OWNERDRAW,IDC_FORMAT);gCompress=child(L"BUTTON",L"压缩",BS_OWNERDRAW,IDC_COMPRESS);
-    gBody=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL,IDC_BODY,WS_EX_CLIENTEDGE);applyFont(gBody,gCodeFont);SendMessageW(gBody,EM_SETLIMITTEXT,2*1024*1024,0);
+    for(HWND button:{gFormat,gCompress})SetWindowSubclass(button,requestToolbarButtonProc,13,0);
+    gBody=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL|WS_BORDER,IDC_BODY);applyFont(gBody,gCodeFont);SendMessageW(gBody,EM_SETLIMITTEXT,2*1024*1024,0);SetWindowSubclass(gBody,flatSurfaceProc,16,0);
     gBodyNone=child(L"STATIC",L"当前请求不发送请求体。",SS_CENTER,IDC_BODY_NONE);
     gValidation=child(L"STATIC",L"",SS_LEFT,IDC_VALIDATION);gSummary=child(L"STATIC",L"暂无响应",SS_LEFT,IDC_SUMMARY);
     gResponseTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE|TCS_FIXEDWIDTH,IDC_RESPONSE_TABS);SendMessageW(gResponseTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));for(auto label:{L"Body",L"Headers"}){TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label;TabCtrl_InsertItem(gResponseTabs,TabCtrl_GetItemCount(gResponseTabs),&item);}
     SetWindowSubclass(gResponseTabs,sectionTabsProc,11,0);
-    gResponseBody=child(gRichEditModule?MSFTEDIT_CLASS:L"EDIT",L"",ES_MULTILINE|ES_READONLY|ES_NOHIDESEL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL,IDC_RESPONSE_BODY,WS_EX_CLIENTEDGE);applyFont(gResponseBody,gCodeFont);SendMessageW(gResponseBody,EM_SETLIMITTEXT,5*1024*1024,0);SetWindowSubclass(gResponseBody,responseBodyProc,7,0);
+    gResponseBody=child(gRichEditModule?MSFTEDIT_CLASS:L"EDIT",L"",ES_MULTILINE|ES_READONLY|ES_NOHIDESEL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL|WS_BORDER,IDC_RESPONSE_BODY);applyFont(gResponseBody,gCodeFont);SendMessageW(gResponseBody,EM_SETLIMITTEXT,5*1024*1024,0);SetWindowSubclass(gResponseBody,responseBodyProc,7,0);SetWindowSubclass(gResponseBody,flatSurfaceProc,16,0);
     if(gRichEditModule){SendMessageW(gResponseBody,EM_SETBKGNDCOLOR,0,RGB(248,250,252));SendMessageW(gResponseBody,EM_SETTARGETDEVICE,0,1);SendMessageW(gResponseBody,EM_SETUNDOLIMIT,0,0);}
     gResponseModeDivider=child(L"STATIC",L"",SS_OWNERDRAW,IDC_RESPONSE_MODE_DIVIDER);
     gResponseMode=child(L"BUTTON",L"格式化",BS_OWNERDRAW,IDC_RESPONSE_MODE);
     gResponseFind=child(L"BUTTON",L"查找",BS_OWNERDRAW,IDC_RESPONSE_FIND);
     for(HWND button:{gResponseMode,gResponseFind})SetWindowSubclass(button,responseToolbarButtonProc,10,0);
-    gResponseHeaders=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL,IDC_RESPONSE_HEADERS,WS_EX_CLIENTEDGE);ListView_SetExtendedListViewStyle(gResponseHeaders,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);addListColumns(gResponseHeaders,false);
-    SetWindowSubclass(gResponseHeaders,responseHeadersProc,4,0);
+    gResponseHeaders=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL|WS_BORDER,IDC_RESPONSE_HEADERS);ListView_SetExtendedListViewStyle(gResponseHeaders,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);addListColumns(gResponseHeaders,false);
+    SetWindowSubclass(gResponseHeaders,responseHeadersProc,4,0);SetWindowSubclass(gResponseHeaders,flatSurfaceProc,16,0);
     gResponseFindPanel=CreateWindowExW(WS_EX_CONTROLPARENT,L"FeatherApiResponseFind",L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,0,0,10,10,gWindow,(HMENU)(INT_PTR)IDC_RESPONSE_FIND_PANEL,gInstance,nullptr);
     gResponseFindEdit=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,10,10,gResponseFindPanel,(HMENU)(INT_PTR)IDC_RESPONSE_FIND_EDIT,gInstance,nullptr);applyFont(gResponseFindEdit);SetWindowSubclass(gResponseFindEdit,responseFindEditProc,9,0);
     SendMessageW(gResponseFindEdit,EM_SETCUEBANNER,TRUE,(LPARAM)L"在响应中查找");
@@ -1860,13 +2348,17 @@ void createControls() {
     tooltip(gMethod,L"选择 HTTP 请求方法");tooltip(gSaveMore,L"更多保存选项");tooltip(gCancel,L"取消当前请求");
     tooltip(gResponseMode,L"响应显示方式：格式化 / 原始");
     tooltip(gResponseFindPrev,L"上一个 (Shift+Enter)");tooltip(gResponseFindNext,L"下一个 (Enter)");tooltip(gResponseFindClose,L"关闭查找 (Esc)");tooltip(gFindStatus,L"当前匹配 / 全部匹配；↻ 表示已循环查找");
-    tooltip(gKvList,L"Tab / Shift+Tab 连续编辑；Enter 提交；Esc 撤销单元格；F2 编辑；Delete 删除行");tooltip(gAddFolder,L"新增目录");
+    tooltip(gKvList,L"Tab / Shift+Tab 连续编辑；Enter 提交；Esc 撤销单元格；F2 编辑；Delete 删除行");tooltip(gAddFolder,L"新建接口或目录");
     gEmptyTitle=child(L"STATIC",L"还没有打开接口",SS_CENTER,IDC_EMPTY_TITLE);applyFont(gEmptyTitle,gTitleFont);
-    gEmptyHelp=child(L"STATIC",L"请在左侧选择接口，或右键点击目录，选择“新增接口”。",SS_CENTER,IDC_EMPTY_HELP);
+    gEmptyHelp=child(L"STATIC",L"从左侧选择接口，或创建一个新接口开始。",SS_CENTER,IDC_EMPTY_HELP);
+    gEmptyNewRequest=child(L"BUTTON",L"新建接口",BS_OWNERDRAW,IDC_EMPTY_NEW_REQUEST);
 }
 
 void layout(int width,int height) {
     width=dip(width);height=dip(height);
+    static int previousWidth=-1;
+    bool windowWidthShrank=previousWidth>=0&&width<previousWidth;
+    previousWidth=width;
     RECT oldTreeBounds{};
     if(gResizeSidebar&&gTree){GetWindowRect(gTree,&oldTreeBounds);MapWindowPoints(nullptr,gWindow,(POINT*)&oldTreeBounds,2);}
     bool freezeLists=gResizeSidebar&&gKvList;
@@ -1887,7 +2379,7 @@ void layout(int width,int height) {
         if(control==gTree)flags|=SWP_NOCOPYBITS;
         if(deferred)deferred=DeferWindowPos(deferred,control,nullptr,px(x),px(y),px(w),px(h),flags);
     };
-    int sidebar=std::clamp(gData.sidebarWidth,180,std::min(420,width-660));int workspaceX=sidebar;int workspaceW=width-workspaceX;
+    int sidebar=std::clamp(gData.sidebarWidth,180,std::max(180,std::min(420,width-660)));int workspaceX=sidebar;int workspaceW=width-workspaceX;
     constexpr int contentInset=10;int contentX=workspaceX+contentInset;int contentW=workspaceW-contentInset*2;
     move(gSearchFrame,12,12,sidebar-64,32);move(gSearch,16,16,sidebar-72,24);move(gAddFolder,sidebar-44,12,32,32);move(gSidebarDivider,0,55,sidebar,1);move(gTree,8,64,sidebar-16,height-72);
     constexpr int requestRowTop=REQUEST_BAR_TOP;constexpr int rowHeight=REQUEST_BAR_HEIGHT;constexpr int commandGap=10;constexpr int saveWidth=88;constexpr int saveMoreWidth=24;constexpr int sendWidth=96;
@@ -1923,11 +2415,14 @@ void layout(int width,int height) {
     move(gResponseBody,contentX,responseBodyTop,contentW,std::max(40,height-responseBodyTop-10));
     move(gResponseHeaders,contentX,responseTop+68,contentW,std::max(40,height-responseTop-78));
     move(gResponseFindPanel,contentX+contentW-findWidth,responseTop+35,findWidth,32);
-    move(gEmptyTitle,workspaceX+(workspaceW-360)/2,height/2-45,360,34);move(gEmptyHelp,workspaceX+(workspaceW-500)/2,height/2,500,28);
+    move(gEmptyTitle,workspaceX+(workspaceW-360)/2,height/2-72,360,34);
+    move(gEmptyHelp,workspaceX+(workspaceW-500)/2,height/2-30,500,28);
+    move(gEmptyNewRequest,workspaceX+(workspaceW-136)/2,height/2+20,136,40);
     if(deferred)EndDeferWindowPos(deferred);
     // Apply the narrower clip before the deferred tab measurements run, so a
     // resize cannot briefly paint or hit-test tabs over the fixed save action.
     positionRequestTabs();
+    if(windowWidthShrank&&gSave)RedrawWindow(gSave,nullptr,nullptr,RDW_INVALIDATE|RDW_NOERASE|RDW_UPDATENOW);
     layoutResponseFindControls();if(!gResizeSidebar)updateSearchFormatting();updateUrlFormatting();updateResponseInsets();
     PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);
     if(gResizeSidebar){
@@ -1974,15 +2469,16 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         ListView_SetBkColor(gKvList,RGB(255,255,255));ListView_SetTextColor(gKvList,COLOR_PRIMARY);ListView_SetTextBkColor(gKvList,CLR_NONE);
         ListView_SetBkColor(gResponseHeaders,RGB(255,255,255));ListView_SetTextColor(gResponseHeaders,COLOR_PRIMARY);ListView_SetTextBkColor(gResponseHeaders,CLR_NONE);
         wstring loadSource;gServices.loadData(gData,loadSource);if(gData.folders.empty()){auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name="默认目录";gData.folders.push_back(std::move(folder));}
+        normalizeWorkspaceUrlQueries(gData);
         gSavedContent=WorkspaceContent::from(gData);
         rebuildTree();if(!gData.folders.empty()){for(auto& folder:gData.folders)if(auto request=firstRequestIn(*folder)){openRequest(request);break;}}refreshRequestTabs();loadEditor();return 0;
     }
-    case WM_SIZE:layout(LOWORD(l),HIWORD(l));return 0;
+    case WM_SIZE:if(w!=SIZE_MINIMIZED&&LOWORD(l)>0&&HIWORD(l)>0)layout(LOWORD(l),HIWORD(l));return 0;
     case WM_GETMINMAXINFO:{auto info=(MINMAXINFO*)l;info->ptMinTrackSize.x=px(980);info->ptMinTrackSize.y=px(640);return 0;}
     case WM_DPICHANGED:{
         commitCellEditor();gEntryHotRow=gEntryHotColumn=-1;
         gDpi=HIWORD(w);recreateFonts();for(HWND control=GetWindow(h,GW_CHILD);control;control=GetWindow(control,GW_HWNDNEXT))applyFont(control);applyFont(gUrl,gCodeFont);applyFont(gBody,gCodeFont);applyFont(gResponseBody,gCodeFont);applyFont(gEmptyTitle,gTitleFont);for(HWND control:{gResponseFindEdit,gResponseFindPrev,gResponseFindNext,gResponseFindClose,gFindStatus})applyFont(control);updateSearchFormatting();TreeView_SetItemHeight(gTree,px(30));
-        updateEntryMetrics();
+        updateEntryMetrics();SendMessageW(gBodyType,CB_SETITEMHEIGHT,(WPARAM)-1,px(23));SendMessageW(gBodyType,CB_SETITEMHEIGHT,0,px(26));
         SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(REQUEST_TAB_HEIGHT-4)));
         SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(22),px(4)));
         gEnsureSelectedRequestTabVisible=true;
@@ -1991,11 +2487,12 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         auto suggested=(RECT*)l;SetWindowPos(h,nullptr,suggested->left,suggested->top,suggested->right-suggested->left,suggested->bottom-suggested->top,SWP_NOZORDER|SWP_NOACTIVATE);return 0;
     }
     case WM_ERASEBKGND:{RECT client{};GetClientRect(h,&client);FillRect((HDC)w,&client,gWhiteBrush);RECT sidebar=client;sidebar.right=px(std::clamp(gData.sidebarWidth,180,420));FillRect((HDC)w,&sidebar,gSidebarBrush);RECT tabs{gRequestTabViewportX,0,client.right-px(10),px(REQUEST_TAB_HEIGHT)};FillRect((HDC)w,&tabs,gSidebarBrush);return 1;}
-    case WM_CTLCOLOREDIT:if((HWND)l==gResponseFindEdit||(HWND)l==gSearch){SetTextColor((HDC)w,COLOR_PRIMARY);SetBkColor((HDC)w,RGB(255,255,255));return (LRESULT)gWhiteBrush;}break;
+    case WM_CTLCOLOREDIT:if((HWND)l==gResponseFindEdit||(HWND)l==gSearch||(HWND)l==gBody){SetTextColor((HDC)w,COLOR_PRIMARY);SetBkColor((HDC)w,RGB(255,255,255));return (LRESULT)gWhiteBrush;}break;
     case WM_CTLCOLORSTATIC:{HDC dc=(HDC)w;SetBkMode(dc,TRANSPARENT);if((HWND)l==gSidebarDivider){SetBkColor(dc,COLOR_BORDER);return (LRESULT)gBorderBrush;}if((HWND)l==gValidation)SetTextColor(dc,RGB(220,38,38));
         else if((HWND)l==gFindStatus)SetTextColor(dc,!gResponseFindQuery.empty()&&gResponseMatches.empty()?RGB(185,28,28):(gResponseFindWrapped?COLOR_ACCENT:COLOR_SECONDARY));
         else if((HWND)l==gSummary){auto tab=selectedTab();COLORREF color=COLOR_PRIMARY;if(tab){if(tab->sending||tab->summary.find(L"已取消")==0)color=COLOR_SECONDARY;else if(tab->summary.find(L"网络错误")==0||tab->statusCode>=400)color=RGB(185,28,28);else if(tab->statusCode>=200&&tab->statusCode<300)color=RGB(21,128,61);}SetTextColor(dc,color);}
-        else SetTextColor(dc,RGB(31,41,55));return (LRESULT)gWhiteBrush;}
+        else if((HWND)l==gBodyNone||(HWND)l==gEmptyHelp)SetTextColor(dc,COLOR_SECONDARY);
+        else SetTextColor(dc,COLOR_PRIMARY);return (LRESULT)gWhiteBrush;}
     case WM_DRAWITEM:drawButton((DRAWITEMSTRUCT*)l);return TRUE;
     case WM_COMMAND: {
         int id=LOWORD(w),notification=HIWORD(w);
@@ -2005,7 +2502,12 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
             captureView();return 0;
         }
         if(id==IDC_SEARCH&&notification==EN_CHANGE){PostMessageW(h,WM_SEARCH_REFRESH,0,0);return 0;}
-        if(id==IDC_URL&&notification==EN_CHANGE&&!gLoadingEditor){saveEditor();scheduleSave();}
+        if(id==IDC_URL&&notification==EN_CHANGE&&!gLoadingEditor){
+            if(auto tab=selectedTab()){
+                auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
+                acceptEditedUrl(textOf(gUrl),request);saveEditor();scheduleSave();
+            }
+        }
         if(id==IDC_BODY&&notification==EN_CHANGE&&!gLoadingEditor){saveEditor();scheduleSave();}
         switch(id) {
         case IDC_RESPONSE_MODE:{
@@ -2018,7 +2520,9 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDC_RESPONSE_FIND_PREV:if(notification==BN_CLICKED)findInResponseBody(false);break;
         case IDC_RESPONSE_FIND_NEXT:if(notification==BN_CLICKED)findInResponseBody(true);break;
         case IDC_RESPONSE_FIND_CLOSE:if(notification==BN_CLICKED)showResponseFind(false);break;
-        case IDC_ADD_FOLDER:addFolder(nullptr);break;case IDC_SAVE:if(notification==BN_CLICKED)saveNow(true);break;
+        case IDC_ADD_FOLDER:if(notification==BN_CLICKED)showCreateMenu();break;
+        case IDC_EMPTY_NEW_REQUEST:if(notification==BN_CLICKED)addRequest(gSelectedFolder);break;
+        case IDC_SAVE:if(notification==BN_CLICKED)saveNow(true);break;
         case IDC_METHOD:if(notification==BN_CLICKED&&selectedTab())showMethodMenu();break;
         case IDC_SEND:sendCurrent();break;case IDC_CANCEL:cancelCurrent();break;
         case IDC_BODY_TYPE:if(notification==CBN_SELCHANGE&&!gLoadingEditor){saveEditor(false);auto tab=selectedTab();if(tab){auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;int selected=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(selected>=0&&selected<5)request.bodyType=types[selected];}showEditorPage();scheduleSave();}break;
@@ -2042,14 +2546,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         auto header=(LPNMHDR)l;
         if(header->idFrom==IDC_TREE&&header->code==NM_CUSTOMDRAW)return drawTreeItem((NMTVCUSTOMDRAW*)l);
         if(header->idFrom==IDC_KV_LIST&&header->code==NM_CUSTOMDRAW)return drawEntryList((NMLVCUSTOMDRAW*)l);
-        if(header->idFrom==IDC_RESPONSE_HEADERS&&header->code==NM_CUSTOMDRAW){
-            auto draw=(NMLVCUSTOMDRAW*)l;
-            if(draw->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
-            if(draw->nmcd.dwDrawStage==CDDS_ITEMPREPAINT){
-                draw->nmcd.uItemState&=~(CDIS_SELECTED|CDIS_FOCUS);
-                draw->clrTextBk=(draw->nmcd.uItemState&CDIS_HOT)?COLOR_HOVER:RGB(255,255,255);draw->clrText=COLOR_PRIMARY;return CDRF_NEWFONT;
-            }
-        }
+        if(header->idFrom==IDC_RESPONSE_HEADERS&&header->code==NM_CUSTOMDRAW)return drawResponseHeaders((NMLVCUSTOMDRAW*)l);
         if(header->idFrom==IDC_TREE&&header->code==TVN_SELCHANGEDW){auto info=(NMTREEVIEWW*)l;gTreeSelection=(NodeRef*)info->itemNew.lParam;if(gTreeSelection){gSelectedFolder=gTreeSelection->ownerFolder;if(!gSelectingTree&&!gRebuildingTree&&gTreeSelection->kind==NodeRef::Kind::Request)openRequest((ApiRequest*)gTreeSelection->value);else if(!gSelectingTree&&!gRebuildingTree&&gTreeSelection->kind==NodeRef::Kind::Case)openRequest(gTreeSelection->ownerRequest,(ApiRequestCase*)gTreeSelection->value);}return 0;}
         if(header->idFrom==IDC_TREE&&header->code==TVN_BEGINDRAGW){
             auto info=(NMTREEVIEWW*)l;auto ref=(NodeRef*)info->itemNew.lParam;
@@ -2058,8 +2555,10 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         }
         if(header->idFrom==IDC_TREE&&header->code==TVN_ITEMEXPANDEDW){
             auto info=(NMTREEVIEWW*)l;auto ref=(NodeRef*)info->itemNew.lParam;
-            if(ref&&ref->kind==NodeRef::Kind::Folder&&!gRebuildingTree&&!gSelectingTree){((ApiFolder*)ref->value)->expanded=info->action==TVE_EXPAND;}
-            else if(ref&&ref->kind==NodeRef::Kind::Request){auto request=(ApiRequest*)ref->value;if(info->action==TVE_EXPAND)gExpandedRequests.insert(request->id);else gExpandedRequests.erase(request->id);}
+            if(!gRebuildingTree&&!gSelectingTree&&trimWide(textOf(gSearch)).empty()){
+                if(ref&&ref->kind==NodeRef::Kind::Folder)((ApiFolder*)ref->value)->expanded=info->action==TVE_EXPAND;
+                else if(ref&&ref->kind==NodeRef::Kind::Request){auto request=(ApiRequest*)ref->value;if(info->action==TVE_EXPAND)gExpandedRequests.insert(request->id);else gExpandedRequests.erase(request->id);}
+            }
             return 0;
         }
         if(header->idFrom==IDC_TREE&&header->code==NM_RCLICK){POINT point{};GetCursorPos(&point);POINT local=point;ScreenToClient(gTree,&local);TVHITTESTINFO hit{};hit.pt=local;TreeView_HitTest(gTree,&hit);if(hit.hItem){TreeView_SelectItem(gTree,hit.hItem);showTreeMenu(point);}return 0;}
@@ -2084,7 +2583,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     }
     case WM_EDIT_ENTRY_CELL:{auto tab=selectedTab();string bodyType=tab?(tab->caseSnapshot?tab->caseSnapshot->bodyType:tab->request->bodyType):string();bool listPage=tab&&(gEditorPage<2||(gEditorPage==2&&(bodyType=="Form URL Encoded"||bodyType=="Multipart Form Data")));int row=(int)w,column=(int)l;if(listPage&&IsWindowVisible(gKvList)&&row>=0&&row<ListView_GetItemCount(gKvList)&&column>=1&&column<=4)editListCell(row,column);return 0;}
     case WM_MOUSEMOVE:
-        if(gResizeSidebar){RECT client{};GetClientRect(h,&client);gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::min(420,dip((int)client.right)-660));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return 0;}
+        if(gResizeSidebar){RECT client{};GetClientRect(h,&client);gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::max(180,std::min(420,dip((int)client.right)-660)));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return 0;}
         if(gResizePanels){RECT client{};GetClientRect(h,&client);int editorTop=REQUEST_EDITOR_TOP;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZENS));return 0;}
         if(gDragRequest){
             POINT point{(short)LOWORD(l),(short)HIWORD(l)};MapWindowPoints(h,gTree,&point,1);TVHITTESTINFO hit{};hit.pt=point;TreeView_HitTest(gTree,&hit);
@@ -2092,7 +2591,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
             if(hit.hItem!=gDragHover){TreeView_SelectDropTarget(gTree,hit.hItem);gDragHover=hit.hItem;}SetCursor(LoadCursorW(nullptr,gDragTarget&&gDragTarget!=findFolderForRequest(gDragRequest)?IDC_SIZEALL:IDC_NO));return 0;
         }break;
     case WM_LBUTTONUP:
-        if(gResizeSidebar||gResizePanels){RECT client{};GetClientRect(h,&client);if(gResizeSidebar)gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::min(420,dip((int)client.right)-660));if(gResizePanels){int editorTop=REQUEST_EDITOR_TOP;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));}gResizeSidebar=gResizePanels=false;ReleaseCapture();layout((int)client.right,(int)client.bottom);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);setSaveStatus(L"未保存");SetCursor(LoadCursorW(nullptr,IDC_ARROW));return 0;}
+        if(gResizeSidebar||gResizePanels){RECT client{};GetClientRect(h,&client);if(gResizeSidebar)gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::max(180,std::min(420,dip((int)client.right)-660)));if(gResizePanels){int editorTop=REQUEST_EDITOR_TOP;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));}gResizeSidebar=gResizePanels=false;ReleaseCapture();layout((int)client.right,(int)client.bottom);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);setSaveStatus(L"未保存");SetCursor(LoadCursorW(nullptr,IDC_ARROW));return 0;}
         if(gDragRequest){ReleaseCapture();TreeView_SelectDropTarget(gTree,nullptr);auto request=gDragRequest;auto target=gDragTarget;gDragRequest=nullptr;gDragTarget=nullptr;gDragHover=nullptr;if(target)moveRequestDirect(request,target);return 0;}break;
     case WM_LBUTTONDOWN: {
         POINT point{dip((short)LOWORD(l)),dip((short)HIWORD(l))};RECT client{};GetClientRect(h,&client);client.right=dip(client.right);client.bottom=dip(client.bottom);
@@ -2119,7 +2618,8 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(w==SAVE_FEEDBACK_TIMER){KillTimer(h,SAVE_FEEDBACK_TIMER);if(!gSaveFailed&&textOf(gSave)==L"已保存"){setText(gSave,L"保存");InvalidateRect(gSave,nullptr,FALSE);}return 0;}
         if(w==DIRTY_TIMER){KillTimer(h,DIRTY_TIMER);updateDirtyStatus();return 0;}
         if(w==REQUEST_TIMER){
-            bool sending=false;for(const auto& tab:gTabs)if(tab->sending){
+            reapRetiredTabs();
+            bool sending=!gRetiredTabs.empty();for(const auto& tab:gTabs)if(tab->sending){
                 sending=true;auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-tab->started).count();
                 tab->summary=(tab->cancel?L"正在取消 · ":L"请求中 · ")+std::to_wstring(elapsed)+L" ms";
                 if(tab==selectedTab())setText(gSummary,tab->summary+(tab->oldResponse?L" · 正在显示上次响应":L""));
@@ -2128,6 +2628,11 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         }break;
     case WM_HTTP_DONE:{
         std::unique_ptr<HttpCompletion> completion((HttpCompletion*)w);auto tab=completion->tab;auto& result=completion->result;
+        auto retired=std::find(gRetiredTabs.begin(),gRetiredTabs.end(),tab);
+        if(retired!=gRetiredTabs.end()){
+            if(tab->worker.joinable())tab->worker.join();
+            gRetiredTabs.erase(retired);return 0;
+        }
         // Closed/deleted requests can still finish asynchronously; their model pointers are no longer valid.
         if(std::find(gTabs.begin(),gTabs.end(),tab)==gTabs.end())return 0;
         if(gClosingPrompt){gDeferredCompletions.emplace_back(WM_HTTP_DONE,(WPARAM)completion.release());return 0;}
@@ -2176,9 +2681,13 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
             if(choice==IDCANCEL)return 0;
             if(choice==IDYES&&!saveNow(true))return 0;
         }else if(!saveNow())return 0;
-        gImportCancel=true;{HINTERNET handle=gImportRequest.exchange(nullptr);if(handle)WinHttpCloseHandle(handle);}if(gImportWorker.joinable())gImportWorker.join();for(auto& tab:gTabs)tab->cancelNow();for(auto& tab:gTabs)if(tab->worker.joinable())tab->worker.join();
+        gImportCancel=true;{HINTERNET handle=gImportRequest.exchange(nullptr);if(handle)WinHttpCloseHandle(handle);}if(gImportWorker.joinable())gImportWorker.join();
+        for(auto& tab:gTabs)tab->cancelNow();for(auto& tab:gRetiredTabs)tab->cancelNow();
+        for(auto& tab:gTabs)if(tab->worker.joinable())tab->worker.join();
+        for(auto& tab:gRetiredTabs)if(tab->worker.joinable())tab->worker.join();
         {MSG pending{};while(PeekMessageW(&pending,h,WM_HTTP_DONE,WM_HTTP_DONE,PM_REMOVE))delete reinterpret_cast<HttpCompletion*>(pending.wParam);
         while(PeekMessageW(&pending,h,WM_IMPORT_DONE,WM_IMPORT_DONE,PM_REMOVE))delete reinterpret_cast<ImportDownload*>(pending.wParam);}
+        gRetiredTabs.clear();
         DestroyWindow(h);return 0;
     case WM_DESTROY:DeleteObject(gUiFont);DeleteObject(gCodeFont);DeleteObject(gTitleFont);DeleteObject(gTreeFolderFont);DeleteObject(gTreeMethodFont);DeleteObject(gEntryTypeFont);DeleteObject(gSidebarBrush);DeleteObject(gWhiteBrush);DeleteObject(gAccentBrush);DeleteObject(gSelectedBrush);DeleteObject(gHoverBrush);DeleteObject(gBorderBrush);PostQuitMessage(0);return 0;
     }return DefWindowProcW(h,message,w,l);

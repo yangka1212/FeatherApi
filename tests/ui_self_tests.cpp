@@ -197,14 +197,148 @@ static void runEntryTableTests(ApiRequest* request) {
     gFocusedEntryColumn=1;ListView_SetItemState(gKvList,-1,0,LVIS_SELECTED|LVIS_FOCUSED);updateDirtyStatus();
     check(RequestContent::from(*request)==originalContent,"parameter table checks restore the original request fixture");
 }
+static void runUrlParamSyncTests(ApiRequest* request,ApiRequest* second) {
+    const RequestContent original=RequestContent::from(*request);
+    const int previousSaveCalls=saveCalls;
+    ApiRequest legacy;legacy.url="https://example.invalid/legacy?from_url=a%2Fb#anchor";
+    legacy.query={{true,"from_grid","2"}};normalizeStoredUrlQuery(legacy);normalizeStoredUrlQuery(legacy);
+    check(legacy.url=="https://example.invalid/legacy#anchor"&&legacy.query.size()==2&&
+          buildRequestUrl({"GET",legacy.url,legacy.query})==
+              "https://example.invalid/legacy?from_url=a%2Fb&from_grid=2#anchor",
+          "opening an older URL merges raw and table query entries once");
+    AppData legacyWorkspace;auto legacyFolder=std::make_unique<ApiFolder>();
+    auto legacyRequest=std::make_unique<ApiRequest>();legacyRequest->url="https://example.invalid/old?request=1";
+    auto legacyCase=std::make_unique<ApiRequestCase>();legacyCase->url="https://example.invalid/old?case=2";
+    legacyRequest->cases.push_back(std::move(legacyCase));legacyFolder->requests.push_back(std::move(legacyRequest));
+    legacyWorkspace.folders.push_back(std::move(legacyFolder));normalizeWorkspaceUrlQueries(legacyWorkspace);
+    const WorkspaceContent normalizedBaseline=WorkspaceContent::from(legacyWorkspace);
+    normalizeWorkspaceUrlQueries(legacyWorkspace);
+    check(legacyWorkspace.folders[0]->requests[0]->query.size()==1&&
+          legacyWorkspace.folders[0]->requests[0]->cases[0]->query.size()==1&&
+          WorkspaceContent::from(legacyWorkspace)==normalizedBaseline,
+          "startup normalizes older requests and cases once before establishing the saved baseline");
+    ApiRequest repeatedKey;repeatedKey.url="https://example.invalid/duplicates";
+    repeatedKey.query={{true,"tag","a","","first note"},{true,"tag","b","","second note"}};
+    int previousPage=gEditorPage;gEditorPage=1;
+    acceptEditedUrl(L"https://example.invalid/duplicates?tag=b&tag=b",repeatedKey);
+    gEditorPage=previousPage;
+    check(repeatedKey.query.size()==2&&repeatedKey.query[0].description=="first note"&&
+          repeatedKey.query[1].description=="second note",
+          "editing duplicate parameter values keeps each row's description in place");
+    const wstring pasted=L"https://example.invalid/items?tag=one&tag=two&empty=&flag&word=%E4%B8%AD%E6%96%87&space=a+b#part";
+    setText(gUrl,pasted);
+    check(textOf(gUrl)==pasted&&request->url=="https://example.invalid/items#part"&&request->query.size()==6&&
+          request->query[0].key=="tag"&&request->query[1].key=="tag"&&request->query[2].value.empty()&&
+          request->query[3].key=="flag"&&request->query[4].value=="中文"&&request->query[5].value=="a b"&&
+          ListView_GetItemCount(gKvList)==7,
+          "pasting a URL exposes duplicate, empty, bare and encoded query entries in Params");
+    check(buildRequestUrl(snapshotCurrent())==
+          "https://example.invalid/items?tag=one&tag=two&empty=&flag=&word=%E4%B8%AD%E6%96%87&space=a%20b#part",
+          "the request sends parsed entries once and keeps the URL fragment (bare flags normalize to flag=)");
+    ListView_SetCheckState(gKvList,1,FALSE);
+    check(!request->query[1].enabled&&textOf(gUrl).find(L"tag=two")==wstring::npos&&
+          buildRequestUrl(snapshotCurrent()).find("tag=two")==string::npos,
+          "disabling a pasted parameter removes it from the displayed and sent URL");
+    editListCell(0,2,true);setText(gCellEditor,L"changed value");commitCellEditor();
+    check(request->query[0].value=="changed value"&&textOf(gUrl).find(L"tag=changed%20value")!=wstring::npos&&
+          buildRequestUrl(snapshotCurrent()).find("tag=changed%20value")!=string::npos,
+          "editing a parameter updates the displayed and sent URL with encoding");
+    request->query[0].description="keep enabled note";
+    request->query[1].description="keep disabled note";loadEditor();
+    wstring editedVisible=textOf(gUrl);
+    size_t changedAt=editedVisible.find(L"tag=changed%20value");
+    check(changedAt!=wstring::npos,"URL fixture contains the enabled parameter to edit");
+    if(changedAt!=wstring::npos)editedVisible.replace(changedAt,wcslen(L"tag=changed%20value"),L"tag=updated");
+    setText(gUrl,editedVisible);
+    check(request->query.size()==6&&request->query[0].value=="updated"&&
+          request->query[0].description=="keep enabled note"&&!request->query[1].enabled&&
+          request->query[1].description=="keep disabled note"&&
+          ListView_GetItemCount(gKvList)==7,
+          "editing a visible URL parameter keeps disabled Params rows and row descriptions");
+    setText(gUrl,L"https://example.invalid/items?tag=updated&");
+    check(request->query.size()==6&&!request->query[1].enabled&&
+          buildRequestUrl(snapshotCurrent())=="https://example.invalid/items?tag=updated&",
+          "an unfinished query keeps Params rows without appending them to the sent draft");
+    openRequest(second);openRequest(request);
+    check(textOf(gUrl)==L"https://example.invalid/items?tag=updated&"&&request->query.size()==6,
+          "switching tabs preserves the unfinished query and its last complete Params rows");
+    setText(gUrl,editedVisible);
+    check(request->query.size()==6&&!request->query[1].enabled&&
+          request->query[1].description=="keep disabled note",
+          "finishing a query edit restores its disabled Params rows");
+    const string finalUrl=buildRequestUrl(snapshotCurrent());
+    openRequest(second);openRequest(request);
+    check(buildRequestUrl(snapshotCurrent())==finalUrl&&request->query.size()==6&&
+          textOf(gUrl)==toWide(finalUrl),"switching request tabs keeps Params synchronized without duplicate query entries");
+    check(saveNow()&&request->url=="https://example.invalid/items#part"&&request->query.size()==6,
+          "saving stores the address and query separately without duplicating the URL query");
+    for(int row=0;row<6;++row)ListView_SetCheckState(gKvList,row,FALSE);
+    setText(gUrl,L"https://example.invalid/renamed#part");
+    bool allDisabled=request->query.size()==6;
+    for(const auto& entry:request->query)allDisabled=allDisabled&&!entry.enabled;
+    check(allDisabled&&request->url=="https://example.invalid/renamed#part"&&
+          buildRequestUrl(snapshotCurrent())=="https://example.invalid/renamed#part",
+          "editing the path keeps query rows when every parameter is disabled");
+    ListView_SetCheckState(gKvList,0,TRUE);
+    setText(gUrl,L"https://example.invalid/renamed#part");
+    bool keptDisabled=request->query.size()==5;
+    for(const auto& entry:request->query)keptDisabled=keptDisabled&&!entry.enabled;
+    check(keptDisabled&&buildRequestUrl(snapshotCurrent())=="https://example.invalid/renamed#part",
+          "removing the visible query clears enabled parameters but keeps disabled rows");
+    setText(gUrl,L"https://example.invalid/draft?");openRequest(second);openRequest(request);
+    check(textOf(gUrl)==L"https://example.invalid/draft?"&&request->query.size()==5,
+          "switching tabs preserves an unfinished question mark in the URL");
+    setText(gUrl,L"https://example.invalid/draft?term=%");openRequest(second);openRequest(request);
+    check(textOf(gUrl)==L"https://example.invalid/draft?term=%"&&request->query.size()==5,
+          "switching tabs preserves an unfinished percent escape in the URL");
+    setText(gUrl,L"https://example.invalid/draft?term=%20");
+    check(request->url=="https://example.invalid/draft"&&request->query.size()==6&&request->query.back().value==" "&&
+          buildRequestUrl(snapshotCurrent())=="https://example.invalid/draft?term=%20",
+          "finishing a percent escape creates an editable Params row, keeps disabled rows, and sends it once");
+    ApiRequestCase* requestCase=request->cases.front().get();const CaseContent originalCase=CaseContent::from(*requestCase);
+    openRequest(request,requestCase);setText(gUrl,L"https://example.invalid/case?case=one&case=two#result");
+    check(selectedTab()->caseSnapshot->url=="https://example.invalid/case#result"&&
+          selectedTab()->caseSnapshot->query.size()==2&&
+          buildRequestUrl(snapshotCurrent())=="https://example.invalid/case?case=one&case=two#result",
+          "a case URL populates its own Params rows and sends duplicate names once");
+    openRequest(second);openRequest(request,requestCase);
+    check(textOf(gUrl)==L"https://example.invalid/case?case=one&case=two#result"&&
+          selectedTab()->caseSnapshot->query.size()==2&&saveNow()&&
+          requestCase->url=="https://example.invalid/case#result"&&requestCase->query.size()==2,
+          "switching and saving a case keeps its URL and Params synchronized");
+    originalCase.apply(*requestCase);originalCase.request.apply(*selectedTab()->caseSnapshot);loadEditor();
+    openRequest(request);
+    original.apply(*request);loadEditor();saveNow();saveCalls=previousSaveCalls;
+    check(RequestContent::from(*request)==original,"URL/Params checks restore the original request fixture");
+}
 static void runRequestToolbarTests(ApiRequest* request) {
-    const auto originalContent=RequestContent::from(*request);const wstring originalUrl=textOf(gUrl);
+    const auto originalContent=RequestContent::from(*request);const wstring originalUrl=textOf(gUrl),originalMethod=textOf(gMethod);
     const UINT originalDpi=gDpi;const int originalSidebar=gData.sidebarWidth;RECT originalWindow{};GetWindowRect(gWindow,&originalWindow);
     const wstring address=L"https://example.invalid/接口?name=中文&query="+wstring(180,L'x');
     SendMessageW(gUrl,EM_SETSEL,0,-1);SendMessageW(gUrl,EM_REPLACESEL,TRUE,(LPARAM)address.c_str());
-    check(textOf(gUrl)==address&&request->url==toUtf8(address),"native URL editing preserves Unicode and long queries and updates the request");
+    check(textOf(gUrl)==address&&request->url=="https://example.invalid/接口"&&request->query.size()==2&&
+          request->query[0].value=="中文"&&buildRequestUrl(snapshotCurrent()).find("name=%E4%B8%AD%E6%96%87")!=string::npos,
+          "native URL editing keeps Unicode and long queries visible and sends each parameter once");
     SendMessageW(gUrl,WM_CHAR,VK_RETURN,0);
     check(textOf(gUrl)==address,"Enter in the URL field never inserts a newline");
+    SetFocus(gUrl);SetFocus(gMethod);
+    check(textOf(gUrl)==address&&request->url=="https://example.invalid/接口"&&request->query.size()==2,
+          "focusing the method selector preserves URL text and request address");
+    selectRequestMethod(L"PATCH");
+    check(textOf(gUrl)==address&&request->url=="https://example.invalid/接口"&&request->method=="PATCH",
+          "switching request method preserves the visible URL and request address");
+    RECT frameBounds{},urlBounds{};GetClientRect(gUrlFrame,&frameBounds);GetWindowRect(gUrl,&urlBounds);
+    MapWindowPoints(nullptr,gUrlFrame,(POINT*)&urlBounds,2);
+    HDC screen=GetDC(gUrlFrame),buffer=CreateCompatibleDC(screen);
+    HBITMAP bitmap=CreateCompatibleBitmap(screen,frameBounds.right,frameBounds.bottom);
+    auto oldBitmap=SelectObject(buffer,bitmap);FillRect(buffer,&frameBounds,gWhiteBrush);
+    int urlCenterX=(urlBounds.left+urlBounds.right)/2,urlCenterY=(urlBounds.top+urlBounds.bottom)/2;
+    SetPixelV(buffer,urlCenterX,urlCenterY,RGB(255,0,255));
+    DRAWITEMSTRUCT frameDraw{};frameDraw.CtlID=IDC_URL_FRAME;frameDraw.hwndItem=gUrlFrame;
+    frameDraw.hDC=buffer;frameDraw.rcItem=frameBounds;drawRequestControl(&frameDraw);
+    check(GetPixel(buffer,urlCenterX,urlCenterY)==RGB(255,0,255),
+          "URL frame repaint does not cover pixels inside the URL editor");
+    SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);ReleaseDC(gUrlFrame,screen);
     const DWORD selectedStart=10,selectedEnd=24;SendMessageW(gUrl,EM_SETSEL,selectedStart,selectedEnd);
     for(UINT dpi:{96u,144u,192u}){
         gData.sidebarWidth=420;RECT proposed{0,0,MulDiv(980,(int)dpi,96),MulDiv(640,(int)dpi,96)};
@@ -229,12 +363,13 @@ static void runRequestToolbarTests(ApiRequest* request) {
               format.right>format.left&&format.bottom-format.top>=fontTextHeight(gUrl,gCodeFont),
               "the native URL text rectangle fits its editor without clipping at every DPI");
         DWORD start=0,end=0;SendMessageW(gUrl,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
-        check(textOf(gUrl)==address&&request->url==toUtf8(address)&&start==selectedStart&&end==selectedEnd,
+        check(textOf(gUrl)==address&&request->url=="https://example.invalid/接口"&&start==selectedStart&&end==selectedEnd,
               "toolbar relayout preserves the native URL text and selection");
     }
     gData.sidebarWidth=originalSidebar;SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
-    setText(gUrl,originalUrl);updateDirtyStatus();
-    check(RequestContent::from(*request)==originalContent,"request toolbar checks restore the original request fixture");
+    selectRequestMethod(originalMethod.c_str());originalContent.apply(*request);loadEditor();updateDirtyStatus();
+    check(RequestContent::from(*request)==originalContent&&textOf(gUrl)==originalUrl,
+          "request toolbar checks restore the original request fixture");
 }
 static CHARFORMAT2W responseFormatAt(size_t position) {
     DWORD start=0,end=0;POINT scroll{};SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);SendMessageW(gResponseBody,EM_GETSCROLLPOS,0,(LPARAM)&scroll);
@@ -408,16 +543,64 @@ static void runResponseFindTests(const std::shared_ptr<TabState>& tab,ApiRequest
         SendMessageW(gResponseFindClose,BM_CLICK,0,0);
     }
 }
+static void runSidebarSearchTests() {
+    auto& root=*gData.folders[0];
+    auto nested=std::make_unique<ApiFolder>();nested->id="search-folder";nested->name="Billing archive";nested->expanded=false;
+    auto request=std::make_unique<ApiRequest>();request->id="search-request";request->name="Billing upload";
+    request->url="https://example.invalid/search-by-url";
+    auto match=std::make_unique<ApiRequestCase>();match->id="search-case";match->name="Refund hidden-only";
+    auto other=std::make_unique<ApiRequestCase>();other->id="search-other-case";other->name="Unrelated scenario";
+    auto nestedPtr=nested.get();auto requestPtr=request.get();
+    auto matchPtr=match.get();auto otherPtr=other.get();
+    request->cases.push_back(std::move(match));request->cases.push_back(std::move(other));
+    nested->requests.push_back(std::move(request));root.children.push_back(std::move(nested));rebuildTree();
+    HTREEITEM initialRequestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
+    check(initialRequestItem&&!treeItemIsRevealed(initialRequestItem),
+          "sidebar fixture request starts hidden inside a collapsed folder");
+
+    setText(gSearch,L"Refund hidden-only");rebuildTree();
+    HTREEITEM folderItem=findTreeValue(NodeRef::Kind::Folder,nestedPtr);
+    HTREEITEM requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
+    HTREEITEM caseItem=findTreeValue(NodeRef::Kind::Case,matchPtr);
+    check(folderItem&&requestItem&&caseItem&&treeItemIsRevealed(caseItem)&&
+          (TreeView_GetItemState(gTree,folderItem,TVIS_EXPANDED)&TVIS_EXPANDED)&&
+          (TreeView_GetItemState(gTree,requestItem,TVIS_EXPANDED)&TVIS_EXPANDED),
+          "searching a case name reveals its folder, request, and case");
+    check(!findTreeValue(NodeRef::Kind::Case,otherPtr),"case search excludes unrelated cases");
+    syncVisibleFolderExpansionState();
+    check(!nestedPtr->expanded&&!gExpandedRequests.count(requestPtr->id),
+          "search expansion does not overwrite the saved folder or request state");
+
+    setText(gSearch,L"Billing upload");rebuildTree();
+    requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
+    check(requestItem&&treeItemIsRevealed(requestItem),"request name search reveals a nested request");
+    setText(gSearch,L"search-by-url");rebuildTree();
+    requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
+    check(requestItem&&treeItemIsRevealed(requestItem),"URL search reveals a nested request");
+
+    setText(gSearch,L"");rebuildTree();
+    folderItem=findTreeValue(NodeRef::Kind::Folder,nestedPtr);
+    requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
+    check(folderItem&&requestItem&&!treeItemIsRevealed(requestItem)&&!nestedPtr->expanded&&
+          !gExpandedRequests.count(requestPtr->id),
+          "clearing search restores the user's collapsed tree state");
+    root.children.pop_back();rebuildTree();
+}
 static void runControllerTests() {
     auto request=gData.folders[0]->requests[0].get();auto second=gData.folders[0]->requests[1].get();auto c=request->cases[0].get();
     check(!workspaceDirty(),"fixture starts clean");
+    runSidebarSearchTests();
     runRequestTabTests(request,second);
     runEntryTableTests(request);
+    runUrlParamSyncTests(request,second);
     runRequestToolbarTests(request);
-    setText(gUrl,L"http://127.0.0.1/edited");updateDirtyStatus();check(tabDirty(*selectedTab())&&gSaveStatus==L"未保存","URL edits immediately mark the tab and workspace dirty");
+    const wstring savedVisibleUrl=textOf(gUrl);
+    const size_t queryStart=savedVisibleUrl.find(L'?');
+    const wstring visibleQuery=queryStart==wstring::npos?L"":savedVisibleUrl.substr(queryStart);
+    setText(gUrl,L"http://127.0.0.1/edited"+visibleQuery);updateDirtyStatus();check(tabDirty(*selectedTab())&&gSaveStatus==L"未保存","URL edits immediately mark the tab and workspace dirty");
     TreeView_Expand(gTree,TreeView_GetRoot(gTree),TVE_COLLAPSE);check(saveCalls==0,"expanding or collapsing a folder never saves pending request edits");
     TreeView_Expand(gTree,TreeView_GetRoot(gTree),TVE_EXPAND);
-    setText(gUrl,toWide(gSavedContent.requests.at("request").url));updateDirtyStatus();check(!workspaceDirty(),"restoring original URL clears dirty state");
+    setText(gUrl,savedVisibleUrl);updateDirtyStatus();check(!workspaceDirty(),"restoring original URL clears dirty state");
 
     editListCell(0,1,true);setText(gCellEditor,L"changed");navigateEntry(false);
     check(gEditRow==0&&gEditColumn==2&&request->query[0].key=="changed","Tab commits and enters next column");
@@ -461,7 +644,7 @@ static void runControllerTests() {
     check(rendered.substr(start,end-start)==L"hello","double click stops at punctuation inside JSON strings");
     tab->rawView=true;showResponsePage();check(responseText()==toWide(tab->responseRaw),"raw view preserves the original JSON text");
     SendMessageW(gResponseBody,EM_SETSEL,0,-1);CHARFORMAT2W rawFormat{};rawFormat.cbSize=sizeof(rawFormat);SendMessageW(gResponseBody,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&rawFormat);
-    check((rawFormat.dwMask&CFM_COLOR)&&rawFormat.crTextColor==RGB(51,65,85)&&!(rawFormat.dwEffects&CFE_BOLD),"raw view clears syntax formatting");
+    check((rawFormat.dwMask&CFM_COLOR)&&rawFormat.crTextColor==COLOR_PRIMARY&&!(rawFormat.dwEffects&CFE_BOLD),"raw view clears syntax formatting");
     tab->rawView=false;showResponsePage();
     setText(gUrl,L"not-a-url");const auto oldBody=tab->responseRaw;sendCurrent();
     check(!tab->sending&&tab->responseRaw==oldBody&&!tab->validation.empty(),"invalid URL is rejected without removing the last response");
@@ -494,8 +677,14 @@ static void runControllerTests() {
     check(IsWindowEnabled(gSave)&&(GetWindowLongPtrW(gSave,GWL_STYLE)&WS_VISIBLE)&&(GetWindowLongPtrW(gSave,GWL_STYLE)&WS_TABSTOP)&&
           saveBounds.left>=0&&saveBounds.top>=0&&saveBounds.right<=emptyClient.right&&saveBounds.bottom<=emptyClient.bottom&&
           saveBounds.right>saveBounds.left&&saveBounds.bottom>saveBounds.top,"workspace save remains visible and keyboard-accessible when all request tabs are closed");
+    RECT createBounds=boundsInWindow(gEmptyNewRequest),treeBounds=boundsInWindow(gTree);
+    check((GetWindowLongPtrW(gEmptyNewRequest,GWL_STYLE)&WS_VISIBLE)&&IsWindowEnabled(gEmptyNewRequest)&&textOf(gEmptyNewRequest)==L"新建接口"&&
+          createBounds.left>=treeBounds.right&&createBounds.right<=emptyClient.right&&
+          createBounds.top>=0&&createBounds.bottom<=emptyClient.bottom,
+          "empty workspace offers a visible new-request action inside the main panel");
 
     auto fresh=std::make_unique<ApiRequest>();fresh->id="new";fresh->name="未保存接口";auto freshPtr=fresh.get();gData.folders[0]->requests.push_back(std::move(fresh));openRequest(freshPtr);
+    check(!(GetWindowLongPtrW(gEmptyNewRequest,GWL_STYLE)&WS_VISIBLE),"new-request empty action hides while an editor is open");
     closeChoice=IDNO;closeTab(gSelectedTab);check(gData.folders[0]->requests.size()==2&&gTabs.empty(),"discarding an unsaved new request removes it");
     openRequest(request);setText(gUrl,L"http://127.0.0.1/exit");closeChoice=IDCANCEL;SendMessageW(gWindow,WM_CLOSE,0,0);
     check(IsWindow(gWindow)&&workspaceDirty(),"cancel exit preserves the session");

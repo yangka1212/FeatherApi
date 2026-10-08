@@ -27,7 +27,7 @@ FeatherApi is an ultra-lightweight API debugging tool for Windows.
 | UI technology | **Native Windows Win32 API + Common Controls** |
 | HTTP implementation | Windows WinHTTP |
 | Third-party runtime | No Electron / No .NET Runtime required |
-| Package size | **Approximately 435 KB** |
+| Package size | **v1.1.2: ZIP approximately 528 KiB; EXE approximately 921 KiB** |
 | Idle memory usage | **Approximately 18.9 MB** |
 
 FeatherApi stays lightweight by relying only on Windows system components, so no additional dependencies are required.
@@ -45,6 +45,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Action Te
 ```
 
 The script discovers the Visual Studio C++ toolchain and writes artifacts to `build/release`. See the [architecture and development guide](docs/architecture.md) (Chinese) for module boundaries, Debug builds, and packaging.
+
+To test the production EXE against live APIs, exercise core catalog workflows, and capture its actual UI styling on an interactive Windows desktop:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-real.ps1
+```
+
+See the [real scenario test guide](docs/real-testing.md) (Chinese) for scope, requirements, and how to select your own live API.
 
 ## Data Location
 

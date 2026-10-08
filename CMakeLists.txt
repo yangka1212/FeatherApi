@@ -57,6 +57,12 @@ if(BUILD_TESTING)
     FeatherApplication FeatherInfrastructure FeatherJson FeatherPlatform comctl32 ws2_32)
   add_test(NAME FeatherApiSelfTests COMMAND FeatherApiSelfTests)
 
+  # Runs only from scripts/test-real.ps1: it calls a live remote service and
+  # must not make the offline CTest suite depend on internet availability.
+  add_executable(FeatherApiLiveHttpTests tests/live_http_tests.cpp)
+  target_link_libraries(FeatherApiLiveHttpTests PRIVATE
+    FeatherApplication FeatherInfrastructure FeatherJson FeatherPlatform)
+
   # White-box controller tests compile the UI once in the test translation unit.
   add_executable(FeatherApiUiTests tests/ui_self_tests.cpp resources.rc app.manifest)
   target_include_directories(FeatherApiUiTests PRIVATE "${PROJECT_SOURCE_DIR}")

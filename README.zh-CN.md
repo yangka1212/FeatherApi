@@ -27,7 +27,7 @@ FeatherApi 是一款面向 Windows 的极致轻量级 API 调试工具。
 | UI 技术 | **Windows 原生 Win32 API + Common Controls** |
 | HTTP 实现 | Windows WinHTTP |
 | 第三方运行时 | 无 Electron / 无 .NET Runtime 要求 |
-| 安装包大小 | **约 435 KB** |
+| 安装包大小 | **v1.1.2：ZIP 约 528 KiB；EXE 约 921 KiB** |
 | 空闲内存占用 | **约 18.9 MB** |
 
 FeatherApi 的轻量来自架构选择：只依赖 Windows 系统组件，无需安装额外依赖即可使用。
@@ -45,6 +45,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Action Te
 ```
 
 构建脚本自动发现 Visual Studio 工具链；产物位于 `build/release`。模块职责、Debug 构建与打包流程见 [开发架构](docs/architecture.md)。
+
+要运行正式 EXE、真实公网 API、目录与接口核心流程，以及实际窗口样式截图测试，请在可交互的 Windows 桌面执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-real.ps1
+```
+
+测试范围、可配置的真实 API 地址与环境要求见 [真实场景测试](docs/real-testing.md)。
 
 ## 数据位置
 
