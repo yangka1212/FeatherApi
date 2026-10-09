@@ -12,9 +12,12 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <richedit.h>
+#include <richole.h>
+#include <tom.h>
 #include <shlwapi.h>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <sstream>
@@ -47,6 +50,7 @@ constexpr UINT_PTR SAVE_FEEDBACK_TIMER=1;
 constexpr UINT_PTR REQUEST_TIMER=2;
 constexpr UINT_PTR DIRTY_TIMER=3;
 constexpr UINT_PTR FIND_WRAP_TIMER=4;
+constexpr UINT_PTR BODY_STYLE_TIMER=5;
 constexpr int SECTION_TAB_WIDTH=68;
 constexpr int REQUEST_TAB_HEIGHT=44;
 constexpr int ENTRY_ROW_HEIGHT=32;
@@ -115,6 +119,7 @@ int gEditorTabHot=-1,gResponseTabHot=-1;
 int gRequestTabHot=-1,gRequestTabCloseHot=-1;
 int gEntryHotRow=-1,gEntryHotColumn=-1;
 bool gLoadingEditor=false,gLoadingEntryList=false;
+bool gStylingBody=false,gBodyImeComposing=false;
 ApiRequest* gDragRequest=nullptr;
 ApiFolder* gDragTarget=nullptr;
 HTREEITEM gDragHover=nullptr;
@@ -154,6 +159,7 @@ void refreshResponseFind(bool selectFirst);
 void paintResponseMatches();
 void layoutResponseFindControls();
 void refreshRequestTabs();
+void updateBodyAppearance();
 void updateDirtyStatus();
 void captureView();
 void moveFocus(HWND from,bool backwards);
@@ -678,6 +684,13 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
 // The multiline editors and response header list keep native text selection and
 // scrolling, but use the same quiet one-pixel border as the other inputs.
 LRESULT CALLBACK flatSurfaceProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_NCCALCSIZE){
+        LRESULT result=DefSubclassProc(h,message,w,l);
+        // Reserve our own one-pixel frame. A native WS_BORDER Rich Edit can
+        // repaint a sunken edge after WM_NCPAINT, obscuring a custom overlay.
+        auto rect=w?&((NCCALCSIZE_PARAMS*)l)->rgrc[0]:(RECT*)l;
+        InflateRect(rect,-1,-1);return result;
+    }
     if(message==WM_PRINT){
         LRESULT result=DefSubclassProc(h,message,w,l);
         if(w&&(l&PRF_NONCLIENT)){
@@ -697,6 +710,12 @@ LRESULT CALLBACK flatSurfaceProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR 
     if(message==WM_SETFOCUS||message==WM_KILLFOCUS)RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_NOERASE);
     if(message==WM_NCDESTROY)RemoveWindowSubclass(h,flatSurfaceProc,id);
     return result;
+}
+void attachFlatSurface(HWND control) {
+    SetWindowLongPtrW(control,GWL_STYLE,GetWindowLongPtrW(control,GWL_STYLE)&~(LONG_PTR)WS_BORDER);
+    SetWindowLongPtrW(control,GWL_EXSTYLE,GetWindowLongPtrW(control,GWL_EXSTYLE)&~(LONG_PTR)(WS_EX_CLIENTEDGE|WS_EX_STATICEDGE));
+    SetWindowSubclass(control,flatSurfaceProc,16,0);
+    SetWindowPos(control,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
 }
 
 wstring selectedComboText(HWND combo) {
@@ -800,6 +819,26 @@ bool treeItemIsRevealed(HTREEITEM item) {
     }
     return true;
 }
+void rememberTreeExpansion(HTREEITEM item) {
+    if(!item||gRebuildingTree||gSelectingTree||!trimWide(textOf(gSearch)).empty())return;
+    TVITEMW info{};info.hItem=item;info.mask=TVIF_PARAM|TVIF_STATE;info.stateMask=TVIS_EXPANDED;
+    if(!TreeView_GetItem(gTree,&info))return;
+    auto ref=(NodeRef*)info.lParam;if(!ref)return;
+    const bool expanded=(info.state&TVIS_EXPANDED)!=0;
+    if(ref->kind==NodeRef::Kind::Folder)((ApiFolder*)ref->value)->expanded=expanded;
+    else if(ref->kind==NodeRef::Kind::Request){
+        auto request=(ApiRequest*)ref->value;
+        if(expanded)gExpandedRequests.insert(request->id);else gExpandedRequests.erase(request->id);
+    }
+}
+LRESULT CALLBACK treeExpansionProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_NCDESTROY){RemoveWindowSubclass(h,treeExpansionProc,id);return DefSubclassProc(h,message,w,l);}
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    // Once TVIS_EXPANDEDONCE is set, TVM_EXPAND can skip expansion notifications.
+    // Record the actual result for sidebar toggles as well as native keyboard notifications.
+    if(message==TVM_EXPAND)rememberTreeExpansion((HTREEITEM)l);
+    return result;
+}
 void syncVisibleFolderExpansionState() {
     if(!gTree||!trimWide(textOf(gSearch)).empty())return;
     std::function<void(HTREEITEM)> sync=[&](HTREEITEM parent){
@@ -817,6 +856,8 @@ void syncVisibleFolderExpansionState() {
 void rebuildTree() {
     NodeRef::Kind preserveKind=NodeRef::Kind::Folder;void* preserveValue=nullptr;
     if(gTreeSelection){preserveKind=gTreeSelection->kind;preserveValue=gTreeSelection->value;}
+    const bool visible=(GetWindowLongPtrW(gTree,GWL_STYLE)&WS_VISIBLE)!=0;
+    if(visible)SendMessageW(gTree,WM_SETREDRAW,FALSE,0);
     gRebuildingTree=true;
     gTreeSelection=nullptr;TreeView_DeleteAllItems(gTree);gNodeRefs.clear();wstring query=trimWide(textOf(gSearch));
     for(auto& folder:gData.folders)insertFolder(*folder,TVI_ROOT,query,false);
@@ -831,6 +872,10 @@ void rebuildTree() {
         if(auto found=find(TVI_ROOT);found&&treeItemIsRevealed(found)){TreeView_SelectItem(gTree,found);TreeView_EnsureVisible(gTree,found);}
     }
     gRebuildingTree=false;
+    if(visible){
+        SendMessageW(gTree,WM_SETREDRAW,TRUE,0);
+        RedrawWindow(gTree,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME);
+    }
 }
 
 HTREEITEM findTreeRequest(ApiRequest* request) {
@@ -1454,52 +1499,109 @@ void captureView() {
 }
 // Rich Edit character positions use a single CR for each paragraph. Read that
 // same representation for coloring, hit testing and search selection offsets.
-wstring responseText() {
-    if(!gRichEditModule)return textOf(gResponseBody);
+wstring codeEditorText(HWND editor) {
+    if(!gRichEditModule)return textOf(editor);
     GETTEXTLENGTHEX length{GTL_NUMCHARS|GTL_PRECISE,1200};
-    auto count=(size_t)SendMessageW(gResponseBody,EM_GETTEXTLENGTHEX,(WPARAM)&length,0);
+    auto count=(size_t)SendMessageW(editor,EM_GETTEXTLENGTHEX,(WPARAM)&length,0);
     wstring value(count+1,L'\0');GETTEXTEX get{};get.cb=(DWORD)(value.size()*sizeof(wchar_t));get.codepage=1200;
-    auto copied=SendMessageW(gResponseBody,EM_GETTEXTEX,(WPARAM)&get,(LPARAM)value.data());
+    auto copied=SendMessageW(editor,EM_GETTEXTEX,(WPARAM)&get,(LPARAM)value.data());
     value.resize((size_t)copied);return value;
 }
-void updateResponseInsets() {
-    RECT rect{};GetClientRect(gResponseBody,&rect);
+wstring responseText(){return codeEditorText(gResponseBody);}
+void updateCodeEditorInsets(HWND editor) {
+    RECT rect{};GetClientRect(editor,&rect);
     rect.left+=px(12);rect.top+=px(9);rect.right=std::max(rect.left+1,rect.right-px(12));rect.bottom=std::max(rect.top+1,rect.bottom-px(9));
-    SendMessageW(gResponseBody,EM_SETRECTNP,0,(LPARAM)&rect);
+    SendMessageW(editor,EM_SETRECTNP,0,(LPARAM)&rect);
+}
+void styleCodeEditor(HWND editor,bool json) {
+    if(!gRichEditModule)return;
+    CHARFORMAT2W format{};format.cbSize=sizeof(format);format.dwMask=CFM_COLOR|CFM_BOLD|CFM_BACKCOLOR;format.crTextColor=COLOR_PRIMARY;format.dwEffects=CFE_AUTOBACKCOLOR;
+    SendMessageW(editor,EM_SETCHARFORMAT,SCF_ALL,(LPARAM)&format);
+    format.dwMask=CFM_COLOR|CFM_BOLD;format.dwEffects=0;
+    PARAFORMAT2 paragraph{};paragraph.cbSize=sizeof(paragraph);paragraph.dwMask=PFM_LINESPACING;paragraph.bLineSpacingRule=5;paragraph.dyLineSpacing=24;
+    SendMessageW(editor,EM_SETSEL,0,-1);SendMessageW(editor,EM_SETPARAFORMAT,0,(LPARAM)&paragraph);
+    // Bound per-token native messages for large request and response bodies.
+    if(json&&GetWindowTextLengthW(editor)<=512*1024){
+        wstring text=codeEditorText(editor);size_t first=text.find_first_not_of(L" \t\r\n");
+        if(first!=wstring::npos&&(text[first]==L'{'||text[first]==L'[')){
+            size_t spans=0;
+            for(size_t i=0;i<text.size()&&spans<20000;){
+                size_t start=i;COLORREF color=RGB(100,116,139);bool bold=false;
+                if(text[i]==L'"'){
+                    ++i;while(i<text.size()){if(text[i]==L'\\'){i=std::min(text.size(),i+2);continue;}if(text[i++]==L'"')break;}
+                    size_t next=text.find_first_not_of(L" \t\r\n",i);bold=next!=wstring::npos&&text[next]==L':';color=bold?RGB(29,78,160):RGB(21,128,61);
+                }else if(text[i]==L'-'||(text[i]>=L'0'&&text[i]<=L'9')){
+                    ++i;while(i<text.size()&&((text[i]>=L'0'&&text[i]<=L'9')||text[i]==L'.'||text[i]==L'e'||text[i]==L'E'||text[i]==L'+'||text[i]==L'-'))++i;color=RGB(180,83,9);
+                }else if(text.compare(i,4,L"true")==0||text.compare(i,4,L"null")==0){i+=4;color=RGB(126,34,206);}
+                else if(text.compare(i,5,L"false")==0){i+=5;color=RGB(126,34,206);}
+                else {++i;continue;}
+                format.crTextColor=color;format.dwEffects=bold?CFE_BOLD:0;
+                SendMessageW(editor,EM_SETSEL,(WPARAM)start,(LPARAM)i);SendMessageW(editor,EM_SETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);++spans;
+            }
+        }
+    }
+}
+void updateBodyAppearance() {
+    KillTimer(gWindow,BODY_STYLE_TIMER);
+    if(!gRichEditModule||gStylingBody||gBodyImeComposing)return;
+    auto tab=selectedTab();if(!tab)return;
+    IUnknown* richEdit=nullptr;ITextDocument* document=nullptr;
+    SendMessageW(gBody,EM_GETOLEINTERFACE,0,(LPARAM)&richEdit);
+    if(richEdit){richEdit->QueryInterface(__uuidof(ITextDocument),(void**)&document);richEdit->Release();}
+    if(!document)return;
+    // Syntax colors are presentation, not edits: keep the user's undo/redo history intact.
+    if(FAILED(document->Undo(tomSuspend,nullptr))){document->Release();return;}
+    gStylingBody=true;
+    CHARRANGE selection{};POINT scroll{};
+    SendMessageW(gBody,EM_EXGETSEL,0,(LPARAM)&selection);SendMessageW(gBody,EM_GETSCROLLPOS,0,(LPARAM)&scroll);
+    const LRESULT modified=SendMessageW(gBody,EM_GETMODIFY,0,0);
+    const LRESULT eventMask=SendMessageW(gBody,EM_SETEVENTMASK,0,0);
+    const bool visible=(GetWindowLongPtrW(gBody,GWL_STYLE)&WS_VISIBLE)!=0;
+    if(visible)SendMessageW(gBody,WM_SETREDRAW,FALSE,0);
+    auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
+    styleCodeEditor(gBody,request.bodyType=="JSON");
+    SendMessageW(gBody,EM_EXSETSEL,0,(LPARAM)&selection);SendMessageW(gBody,EM_SETSCROLLPOS,0,(LPARAM)&scroll);
+    SendMessageW(gBody,EM_SETMODIFY,modified,0);SendMessageW(gBody,EM_SETEVENTMASK,0,eventMask);
+    document->Undo(tomResume,nullptr);document->Release();gStylingBody=false;
+    if(visible){SendMessageW(gBody,WM_SETREDRAW,TRUE,0);InvalidateRect(gBody,nullptr,FALSE);}
+}
+struct PlainBodyStream {const char* data;size_t remaining;};
+DWORD CALLBACK readPlainBody(DWORD_PTR cookie,LPBYTE buffer,LONG count,LONG* copied) {
+    auto& source=*(PlainBodyStream*)cookie;*copied=(LONG)std::min(source.remaining,(size_t)count);
+    std::memcpy(buffer,source.data,(size_t)*copied);source.data+=*copied;source.remaining-=(size_t)*copied;return 0;
+}
+LRESULT CALLBACK bodyEditorProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_IME_STARTCOMPOSITION){gBodyImeComposing=true;KillTimer(gWindow,BODY_STYLE_TIMER);}
+    if(message==WM_IME_ENDCOMPOSITION){
+        LRESULT result=DefSubclassProc(h,message,w,l);gBodyImeComposing=false;
+        SetTimer(gWindow,BODY_STYLE_TIMER,160,nullptr);return result;
+    }
+    if(gRichEditModule&&message==WM_SETTEXT){
+        // Explicit plain-text streaming keeps Raw RTF headers literal and loads
+        // existing bodies without truncating them to the interactive input limit.
+        const wchar_t* value=l?(const wchar_t*)l:L"";size_t length=wcslen(value);
+        const LRESULT limit=SendMessageW(h,EM_GETLIMITTEXT,0,0);
+        if(length>(size_t)limit)SendMessageW(h,EM_EXLIMITTEXT,0,(LPARAM)length);
+        PlainBodyStream source{(const char*)value,length*sizeof(wchar_t)};EDITSTREAM stream{};
+        stream.dwCookie=(DWORD_PTR)&source;stream.pfnCallback=readPlainBody;
+        SendMessageW(h,EM_STREAMIN,SF_TEXT|SF_UNICODE,(LPARAM)&stream);
+        if(length>(size_t)limit)SendMessageW(h,EM_EXLIMITTEXT,0,limit);
+        SendMessageW(h,EM_SETSEL,0,0);SendMessageW(h,EM_EMPTYUNDOBUFFER,0,0);SendMessageW(h,EM_SETMODIFY,FALSE,0);return stream.dwError==0;
+    }
+    if(gRichEditModule&&message==WM_PASTE)return SendMessageW(h,EM_PASTESPECIAL,CF_UNICODETEXT,0);
+    if(message==WM_KEYDOWN&&GetKeyState(VK_CONTROL)<0&&w=='A'){SendMessageW(h,EM_SETSEL,0,-1);return 0;}
+    if(message==WM_NCDESTROY){KillTimer(gWindow,BODY_STYLE_TIMER);RemoveWindowSubclass(h,bodyEditorProc,id);}
+    return DefSubclassProc(h,message,w,l);
 }
 void displayResponse(const wstring& value,bool pretty) {
     gResponseHighlights.clear();gResponseHighlightLength=0;gResponseHighlightCurrent=wstring::npos;
     SendMessageW(gResponseBody,WM_SETREDRAW,FALSE,0);setText(gResponseBody,value);
+    styleCodeEditor(gResponseBody,pretty);
     if(gRichEditModule){
-        CHARFORMAT2W format{};format.cbSize=sizeof(format);format.dwMask=CFM_COLOR|CFM_BOLD|CFM_BACKCOLOR;format.crTextColor=COLOR_PRIMARY;format.dwEffects=CFE_AUTOBACKCOLOR;
-        SendMessageW(gResponseBody,EM_SETCHARFORMAT,SCF_ALL,(LPARAM)&format);
-        format.dwMask=CFM_COLOR|CFM_BOLD;format.dwEffects=0;
-        PARAFORMAT2 paragraph{};paragraph.cbSize=sizeof(paragraph);paragraph.dwMask=PFM_LINESPACING;paragraph.bLineSpacingRule=5;paragraph.dyLineSpacing=24;
-        SendMessageW(gResponseBody,EM_SETSEL,0,-1);SendMessageW(gResponseBody,EM_SETPARAFORMAT,0,(LPARAM)&paragraph);
-        // Bound per-token native messages for very large responses.
-        if(pretty&&value.size()<=512*1024){
-            wstring text=responseText();size_t first=text.find_first_not_of(L" \t\r\n");
-            if(first!=wstring::npos&&(text[first]==L'{'||text[first]==L'[')){
-                size_t spans=0;
-                for(size_t i=0;i<text.size()&&spans<20000;){
-                    size_t start=i;COLORREF color=RGB(100,116,139);bool bold=false;
-                    if(text[i]==L'"'){
-                        ++i;while(i<text.size()){if(text[i]==L'\\'){i=std::min(text.size(),i+2);continue;}if(text[i++]==L'"')break;}
-                        size_t next=text.find_first_not_of(L" \t\r\n",i);bold=next!=wstring::npos&&text[next]==L':';color=bold?RGB(29,78,160):RGB(21,128,61);
-                    }else if(text[i]==L'-'||(text[i]>=L'0'&&text[i]<=L'9')){
-                        ++i;while(i<text.size()&&((text[i]>=L'0'&&text[i]<=L'9')||text[i]==L'.'||text[i]==L'e'||text[i]==L'E'||text[i]==L'+'||text[i]==L'-'))++i;color=RGB(180,83,9);
-                    }else if(text.compare(i,4,L"true")==0||text.compare(i,4,L"null")==0){i+=4;color=RGB(126,34,206);}
-                    else if(text.compare(i,5,L"false")==0){i+=5;color=RGB(126,34,206);}
-                    else {++i;continue;}
-                    format.crTextColor=color;format.dwEffects=bold?CFE_BOLD:0;
-                    SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)start,(LPARAM)i);SendMessageW(gResponseBody,EM_SETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);++spans;
-                }
-            }
-        }
         SendMessageW(gResponseBody,EM_SETSEL,0,0);SendMessageW(gResponseBody,EM_EMPTYUNDOBUFFER,0,0);
     }
     gResponseSearchText=responseText();for(auto& c:gResponseSearchText)c=static_cast<wchar_t>(towlower(c));
-    updateResponseInsets();SendMessageW(gResponseBody,WM_SETREDRAW,TRUE,0);InvalidateRect(gResponseBody,nullptr,TRUE);
+    updateCodeEditorInsets(gResponseBody);SendMessageW(gResponseBody,WM_SETREDRAW,TRUE,0);InvalidateRect(gResponseBody,nullptr,TRUE);
 }
 void showResponsePage() {
     auto tab=selectedTab();if(!tab)return;
@@ -1540,7 +1642,7 @@ void loadEditor() {
     TabCtrl_SetCurSel(gEditorTabs,gEditorPage);TabCtrl_SetCurSel(gResponseTabs,gResponsePage);setText(gResponseFindEdit,tab->findQuery);setText(gFindStatus,tab->findStatus);
     auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;normalizeStoredUrlQuery(r);
     setText(gMethod,toWide(r.method));InvalidateRect(gMethod,nullptr,TRUE);setText(gUrl,toWide(effectiveRequestUrl(r)));
-    int type=0;const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};for(int i=0;i<5;++i)if(r.bodyType==types[i])type=i;SendMessageW(gBodyType,CB_SETCURSEL,type,0);setText(gBody,toWide(r.body));
+    int type=0;const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};for(int i=0;i<5;++i)if(r.bodyType==types[i])type=i;SendMessageW(gBodyType,CB_SETCURSEL,type,0);setText(gBody,toWide(r.body));updateBodyAppearance();
     setText(gSummary,tab->summary);setValidationText(tab->validation);setVisible(gSend,!tab->sending);setVisible(gCancel,tab->sending);
     showEditorPage();showResponsePage();gDisplayedTab=tab;gLoadingEditor=false;
     setText(gCancel,tab->cancel?L"正在取消":L"取消");EnableWindow(gCancel,!tab->cancel);
@@ -1584,9 +1686,10 @@ void closeTabRange(int contextIndex,int command) {
         if(choice==IDCANCEL)return;
         if(choice==IDYES&&!saveNow(true))return;
     }
-    std::unordered_set<ApiRequest*> removeRequests;
+    std::unordered_set<ApiRequest*> removeRequests;bool treeChanged=false;
     if(choice==IDNO){
         for(const auto& tab:targets){
+            if(tabDirty(*tab))treeChanged=true;
             if(tab->requestCase){
                 auto found=gSavedContent.cases.find(tab->requestCase->id);
                 if(found!=gSavedContent.cases.end())found->second.apply(*tab->requestCase);
@@ -1607,7 +1710,9 @@ void closeTabRange(int contextIndex,int command) {
     auto found=std::find(gTabs.begin(),gTabs.end(),previous);
     gSelectedTab=found!=gTabs.end()?(int)std::distance(gTabs.begin(),found):gTabs.empty()?-1:std::min(contextIndex,(int)gTabs.size()-1);
     gDisplayedTab.reset();for(int& row:gSelectedEntryRows)row=-1;
-    rebuildTree();refreshRequestTabs();loadEditor();selectTreeTab(selectedTab());updateDirtyStatus();
+    // Closing tabs alone leaves the catalog intact. Only discarded edits need a tree refresh.
+    if(treeChanged)rebuildTree();
+    refreshRequestTabs();loadEditor();selectTreeTab(selectedTab());updateDirtyStatus();
 }
 
 void addFolder(ApiFolder* parent) {
@@ -2152,7 +2257,11 @@ void formatCurrentJson(bool compact) {
         for(size_t i=0;i<formatted.size();++i){if(formatted[i]==L'\n'&&(i==0||formatted[i-1]!=L'\r'))windowsText+=L'\r';windowsText+=formatted[i];}
         formatted=std::move(windowsText);
     }
-    tab->validation.clear();setValidationText(L"");setText(gBody,formatted);SendMessageW(gBody,EM_SETSEL,0,0);SetFocus(gBody);saveEditor();scheduleSave();
+    const LRESULT limit=SendMessageW(gBody,EM_GETLIMITTEXT,0,0);
+    if(formatted.size()>(size_t)limit)SendMessageW(gBody,EM_SETLIMITTEXT,formatted.size(),0);
+    tab->validation.clear();setValidationText(L"");SendMessageW(gBody,EM_SETSEL,0,-1);SendMessageW(gBody,EM_REPLACESEL,TRUE,(LPARAM)formatted.c_str());
+    if(formatted.size()>(size_t)limit)SendMessageW(gBody,EM_SETLIMITTEXT,(WPARAM)limit,0);
+    SendMessageW(gBody,EM_SETSEL,0,0);updateBodyAppearance();SetFocus(gBody);saveEditor();scheduleSave();
 }
 void sendCurrent() {
     auto tab=selectedTab();if(!tab||tab->sending||gClosingPrompt)return;
@@ -2295,6 +2404,7 @@ void createControls() {
     gAddFolder=child(L"BUTTON",L"+",BS_OWNERDRAW,IDC_ADD_FOLDER);SetWindowSubclass(gAddFolder,addFolderProc,14,0);
     gSidebarDivider=child(L"STATIC",L"",SS_LEFT,IDC_SIDEBAR_DIVIDER);
     gTree=child(WC_TREEVIEWW,L"",TVS_SHOWSELALWAYS|TVS_FULLROWSELECT|TVS_TRACKSELECT|TVS_NOHSCROLL,IDC_TREE,0);TreeView_SetExtendedStyle(gTree,TVS_EX_DOUBLEBUFFER,TVS_EX_DOUBLEBUFFER);
+    SetWindowSubclass(gTree,treeExpansionProc,1,0);
     // Keep the tab control and its custom scrollbar in adjacent rectangles.
     // Overlapping sibling windows can briefly expose one another while the tab
     // window moves on every drag frame, which makes the thumb appear to flash.
@@ -2322,19 +2432,20 @@ void createControls() {
     SetWindowSubclass(gBodyType,bodyTypeProc,17,0);
     gFormat=child(L"BUTTON",L"格式化",BS_OWNERDRAW,IDC_FORMAT);gCompress=child(L"BUTTON",L"压缩",BS_OWNERDRAW,IDC_COMPRESS);
     for(HWND button:{gFormat,gCompress})SetWindowSubclass(button,requestToolbarButtonProc,13,0);
-    gBody=child(L"EDIT",L"",ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL|WS_BORDER,IDC_BODY);applyFont(gBody,gCodeFont);SendMessageW(gBody,EM_SETLIMITTEXT,2*1024*1024,0);SetWindowSubclass(gBody,flatSurfaceProc,16,0);
+    gBody=child(gRichEditModule?MSFTEDIT_CLASS:L"EDIT",L"",ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL|ES_WANTRETURN|WS_VSCROLL|WS_HSCROLL,IDC_BODY);applyFont(gBody,gCodeFont);SendMessageW(gBody,EM_SETLIMITTEXT,2*1024*1024,0);SetWindowSubclass(gBody,bodyEditorProc,18,0);attachFlatSurface(gBody);
+    if(gRichEditModule){SendMessageW(gBody,EM_SETBKGNDCOLOR,0,RGB(248,250,252));SendMessageW(gBody,EM_SETTARGETDEVICE,0,1);SendMessageW(gBody,EM_SETEVENTMASK,0,ENM_CHANGE);}
     gBodyNone=child(L"STATIC",L"当前请求不发送请求体。",SS_CENTER,IDC_BODY_NONE);
     gValidation=child(L"STATIC",L"",SS_LEFT,IDC_VALIDATION);gSummary=child(L"STATIC",L"暂无响应",SS_LEFT,IDC_SUMMARY);
     gResponseTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE|TCS_FIXEDWIDTH,IDC_RESPONSE_TABS);SendMessageW(gResponseTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));for(auto label:{L"Body",L"Headers"}){TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label;TabCtrl_InsertItem(gResponseTabs,TabCtrl_GetItemCount(gResponseTabs),&item);}
     SetWindowSubclass(gResponseTabs,sectionTabsProc,11,0);
-    gResponseBody=child(gRichEditModule?MSFTEDIT_CLASS:L"EDIT",L"",ES_MULTILINE|ES_READONLY|ES_NOHIDESEL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL|WS_BORDER,IDC_RESPONSE_BODY);applyFont(gResponseBody,gCodeFont);SendMessageW(gResponseBody,EM_SETLIMITTEXT,5*1024*1024,0);SetWindowSubclass(gResponseBody,responseBodyProc,7,0);SetWindowSubclass(gResponseBody,flatSurfaceProc,16,0);
+    gResponseBody=child(gRichEditModule?MSFTEDIT_CLASS:L"EDIT",L"",ES_MULTILINE|ES_READONLY|ES_NOHIDESEL|ES_AUTOHSCROLL|WS_VSCROLL|WS_HSCROLL,IDC_RESPONSE_BODY);applyFont(gResponseBody,gCodeFont);SendMessageW(gResponseBody,EM_SETLIMITTEXT,5*1024*1024,0);SetWindowSubclass(gResponseBody,responseBodyProc,7,0);attachFlatSurface(gResponseBody);
     if(gRichEditModule){SendMessageW(gResponseBody,EM_SETBKGNDCOLOR,0,RGB(248,250,252));SendMessageW(gResponseBody,EM_SETTARGETDEVICE,0,1);SendMessageW(gResponseBody,EM_SETUNDOLIMIT,0,0);}
     gResponseModeDivider=child(L"STATIC",L"",SS_OWNERDRAW,IDC_RESPONSE_MODE_DIVIDER);
     gResponseMode=child(L"BUTTON",L"格式化",BS_OWNERDRAW,IDC_RESPONSE_MODE);
     gResponseFind=child(L"BUTTON",L"查找",BS_OWNERDRAW,IDC_RESPONSE_FIND);
     for(HWND button:{gResponseMode,gResponseFind})SetWindowSubclass(button,responseToolbarButtonProc,10,0);
-    gResponseHeaders=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL|WS_BORDER,IDC_RESPONSE_HEADERS);ListView_SetExtendedListViewStyle(gResponseHeaders,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);addListColumns(gResponseHeaders,false);
-    SetWindowSubclass(gResponseHeaders,responseHeadersProc,4,0);SetWindowSubclass(gResponseHeaders,flatSurfaceProc,16,0);
+    gResponseHeaders=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL,IDC_RESPONSE_HEADERS);ListView_SetExtendedListViewStyle(gResponseHeaders,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);addListColumns(gResponseHeaders,false);
+    SetWindowSubclass(gResponseHeaders,responseHeadersProc,4,0);attachFlatSurface(gResponseHeaders);
     gResponseFindPanel=CreateWindowExW(WS_EX_CONTROLPARENT,L"FeatherApiResponseFind",L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,0,0,10,10,gWindow,(HMENU)(INT_PTR)IDC_RESPONSE_FIND_PANEL,gInstance,nullptr);
     gResponseFindEdit=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,10,10,gResponseFindPanel,(HMENU)(INT_PTR)IDC_RESPONSE_FIND_EDIT,gInstance,nullptr);applyFont(gResponseFindEdit);SetWindowSubclass(gResponseFindEdit,responseFindEditProc,9,0);
     SendMessageW(gResponseFindEdit,EM_SETCUEBANNER,TRUE,(LPARAM)L"在响应中查找");
@@ -2423,7 +2534,7 @@ void layout(int width,int height) {
     // resize cannot briefly paint or hit-test tabs over the fixed save action.
     positionRequestTabs();
     if(windowWidthShrank&&gSave)RedrawWindow(gSave,nullptr,nullptr,RDW_INVALIDATE|RDW_NOERASE|RDW_UPDATENOW);
-    layoutResponseFindControls();if(!gResizeSidebar)updateSearchFormatting();updateUrlFormatting();updateResponseInsets();
+    layoutResponseFindControls();if(!gResizeSidebar)updateSearchFormatting();updateUrlFormatting();updateCodeEditorInsets(gBody);updateCodeEditorInsets(gResponseBody);
     PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);
     if(gResizeSidebar){
         // Repaint the parent surface exposed by all right-side children moving.
@@ -2508,7 +2619,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
                 acceptEditedUrl(textOf(gUrl),request);saveEditor();scheduleSave();
             }
         }
-        if(id==IDC_BODY&&notification==EN_CHANGE&&!gLoadingEditor){saveEditor();scheduleSave();}
+        if(id==IDC_BODY&&notification==EN_CHANGE&&!gLoadingEditor&&!gStylingBody){saveEditor();scheduleSave();if(!gBodyImeComposing)SetTimer(gWindow,BODY_STYLE_TIMER,160,nullptr);}
         switch(id) {
         case IDC_RESPONSE_MODE:{
             auto tab=selectedTab();if(!tab)break;HMENU menu=CreatePopupMenu();
@@ -2525,7 +2636,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDC_SAVE:if(notification==BN_CLICKED)saveNow(true);break;
         case IDC_METHOD:if(notification==BN_CLICKED&&selectedTab())showMethodMenu();break;
         case IDC_SEND:sendCurrent();break;case IDC_CANCEL:cancelCurrent();break;
-        case IDC_BODY_TYPE:if(notification==CBN_SELCHANGE&&!gLoadingEditor){saveEditor(false);auto tab=selectedTab();if(tab){auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;int selected=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(selected>=0&&selected<5)request.bodyType=types[selected];}showEditorPage();scheduleSave();}break;
+        case IDC_BODY_TYPE:if(notification==CBN_SELCHANGE&&!gLoadingEditor){saveEditor(false);auto tab=selectedTab();if(tab){auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;int selected=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(selected>=0&&selected<5)request.bodyType=types[selected];}updateBodyAppearance();showEditorPage();scheduleSave();}break;
         case IDC_FORMAT:if(notification==BN_CLICKED)formatCurrentJson(false);break;
         case IDC_COMPRESS:if(notification==BN_CLICKED)formatCurrentJson(true);break;
         case IDC_SAVE_MORE:{HMENU menu=CreatePopupMenu();auto tab=selectedTab();AppendMenuW(menu,tab&&!tab->requestCase?MF_STRING:MF_GRAYED,IDM_SAVE_CASE,L"保存用例");RECT r{};GetWindowRect(gSaveMore,&r);TrackPopupMenu(menu,TPM_RIGHTBUTTON,r.left,r.bottom,0,h,nullptr);DestroyMenu(menu);break;}
@@ -2554,11 +2665,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
             return 0;
         }
         if(header->idFrom==IDC_TREE&&header->code==TVN_ITEMEXPANDEDW){
-            auto info=(NMTREEVIEWW*)l;auto ref=(NodeRef*)info->itemNew.lParam;
-            if(!gRebuildingTree&&!gSelectingTree&&trimWide(textOf(gSearch)).empty()){
-                if(ref&&ref->kind==NodeRef::Kind::Folder)((ApiFolder*)ref->value)->expanded=info->action==TVE_EXPAND;
-                else if(ref&&ref->kind==NodeRef::Kind::Request){auto request=(ApiRequest*)ref->value;if(info->action==TVE_EXPAND)gExpandedRequests.insert(request->id);else gExpandedRequests.erase(request->id);}
-            }
+            rememberTreeExpansion(((NMTREEVIEWW*)l)->itemNew.hItem);
             return 0;
         }
         if(header->idFrom==IDC_TREE&&header->code==NM_RCLICK){POINT point{};GetCursorPos(&point);POINT local=point;ScreenToClient(gTree,&local);TVHITTESTINFO hit{};hit.pt=local;TreeView_HitTest(gTree,&hit);if(hit.hItem){TreeView_SelectItem(gTree,hit.hItem);showTreeMenu(point);}return 0;}
@@ -2614,6 +2721,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     case WM_SEARCH_REFRESH:rebuildTree();return 0;
     case WM_UPDATE_TAB_SCROLL:updateRequestTabScroll();return 0;
     case WM_TIMER:
+        if(w==BODY_STYLE_TIMER){updateBodyAppearance();return 0;}
         if(w==FIND_WRAP_TIMER){KillTimer(h,FIND_WRAP_TIMER);gResponseFindWrapped=false;updateResponseFindStatus();return 0;}
         if(w==SAVE_FEEDBACK_TIMER){KillTimer(h,SAVE_FEEDBACK_TIMER);if(!gSaveFailed&&textOf(gSave)==L"已保存"){setText(gSave,L"保存");InvalidateRect(gSave,nullptr,FALSE);}return 0;}
         if(w==DIRTY_TIMER){KillTimer(h,DIRTY_TIMER);updateDirtyStatus();return 0;}

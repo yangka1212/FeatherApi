@@ -570,6 +570,10 @@ static void runSidebarSearchTests() {
     syncVisibleFolderExpansionState();
     check(!nestedPtr->expanded&&!gExpandedRequests.count(requestPtr->id),
           "search expansion does not overwrite the saved folder or request state");
+    TreeView_Expand(gTree,folderItem,TVE_COLLAPSE);TreeView_Expand(gTree,folderItem,TVE_EXPAND);
+    TreeView_Expand(gTree,requestItem,TVE_COLLAPSE);TreeView_Expand(gTree,requestItem,TVE_EXPAND);
+    check(!nestedPtr->expanded&&!gExpandedRequests.count(requestPtr->id),
+          "toggling search results does not replace the user's unfiltered expansion state");
 
     setText(gSearch,L"Billing upload");rebuildTree();
     requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
@@ -586,14 +590,171 @@ static void runSidebarSearchTests() {
           "clearing search restores the user's collapsed tree state");
     root.children.pop_back();rebuildTree();
 }
+struct TreeRedrawProbe {bool redrawEnabled=true;int resets=0,unbatchedResets=0;};
+static LRESULT CALLBACK observeTreeRedraw(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR data) {
+    auto& probe=*(TreeRedrawProbe*)data;
+    if(message==WM_SETREDRAW)probe.redrawEnabled=w!=FALSE;
+    if(message==TVM_DELETEITEM&&(HTREEITEM)l==TVI_ROOT){++probe.resets;if(probe.redrawEnabled)++probe.unbatchedResets;}
+    return DefSubclassProc(h,message,w,l);
+}
+static void runTreeExpansionTests(ApiRequest* request,ApiRequest* second) {
+    auto folder=gData.folders[0].get();const int saves=saveCalls;
+    auto folderItem=[&](){return findTreeValue(NodeRef::Kind::Folder,folder);};
+    auto expanded=[](HTREEITEM item){return (TreeView_GetItemState(gTree,item,TVIS_EXPANDED)&TVIS_EXPANDED)!=0;};
+    TreeRedrawProbe probe;SetWindowSubclass(gTree,observeTreeRedraw,72,(DWORD_PTR)&probe);
+
+    openRequest(second);openRequest(request);auto active=selectedTab();
+    // Match the sidebar's toggle message after initial tree construction has expanded the folder once.
+    TreeView_Expand(gTree,folderItem(),TVE_TOGGLE);
+    check(!expanded(folderItem())&&!folder->expanded,"collapsing an already-expanded folder immediately records its actual state");
+    closeTab(1);
+    check(gTabs.size()==1&&selectedTab()==active&&!expanded(folderItem()),
+          "closing an inactive tab preserves the collapsed folder and active request");
+
+    TreeView_Expand(gTree,folderItem(),TVE_EXPAND);openRequest(second);
+    TreeView_Expand(gTree,folderItem(),TVE_COLLAPSE);closeTab(gSelectedTab);
+    check(gTabs.size()==1&&selectedTab()==active&&!expanded(folderItem()),
+          "closing the active tab does not expand the remaining request's folder");
+
+    TreeView_Expand(gTree,folderItem(),TVE_EXPAND);
+    auto requestItem=findTreeRequest(request);TreeView_Expand(gTree,requestItem,TVE_EXPAND);
+    openRequest(request,request->cases[0].get());TreeView_Expand(gTree,requestItem,TVE_TOGGLE);
+    check(!expanded(requestItem)&&!gExpandedRequests.count(request->id),
+          "collapsing a request records its hidden case list after the first expansion");
+    closeTab(0);
+    check(gTabs.size()==1&&selectedTab()->requestCase==request->cases[0].get()&&!expanded(findTreeRequest(request)),
+          "closing a request tab does not reopen the remaining case tab's collapsed parent");
+
+    TreeView_Expand(gTree,folderItem(),TVE_COLLAPSE);closeTabRange(gSelectedTab,IDM_TAB_CLOSE_ALL);
+    check(gTabs.empty()&&!expanded(folderItem())&&saveCalls==saves,
+          "closing all tabs preserves folder collapse without saving the workspace");
+    check(probe.resets==0,"closing clean active, inactive, and all tabs never clears the sidebar tree");
+    RemoveWindowSubclass(gTree,observeTreeRedraw,72);
+    TreeView_Expand(gTree,folderItem(),TVE_EXPAND);openRequest(request);
+}
+static void runTreeDiscardRedrawTests(ApiRequest* request) {
+    const int previousChoice=closeChoice;closeChoice=IDNO;
+    const auto saved=RequestContent::from(*request);
+    setText(gUrl,L"http://127.0.0.1/discard-tree-filter");saveEditor();
+    setText(gSearch,L"discard-tree-filter");rebuildTree();
+    check(findTreeRequest(request)!=nullptr,"edited request URL appears in sidebar search before discard");
+    TreeRedrawProbe probe;SetWindowSubclass(gTree,observeTreeRedraw,72,(DWORD_PTR)&probe);
+    closeTab(gSelectedTab);
+    check(gTabs.empty()&&RequestContent::from(*request)==saved&&!findTreeRequest(request),
+          "discarding request changes updates sidebar search membership");
+    check(probe.resets==1&&probe.unbatchedResets==0&&probe.redrawEnabled,
+          "discard rebuilds the sidebar once with intermediate painting disabled");
+
+    setText(gSearch,L"");rebuildTree();openRequest(request);
+    auto fresh=std::make_unique<ApiRequest>();fresh->id="discard-tree-new";fresh->name="Discard tree fixture";
+    auto freshPtr=fresh.get();gData.folders[0]->requests.push_back(std::move(fresh));rebuildTree();openRequest(freshPtr);
+    probe={};closeTab(gSelectedTab);
+    check(gTabs.size()==1&&selectedTab()->request==request&&gData.folders[0]->requests.size()==2&&
+          TreeView_GetCount(gTree)==4&&probe.resets==1&&probe.unbatchedResets==0&&probe.redrawEnabled,
+          "discarding a new request removes its tree row in one batched refresh");
+    RemoveWindowSubclass(gTree,observeTreeRedraw,72);closeChoice=previousChoice;
+}
+static void checkFlatEditorBorder(HWND editor) {
+    RECT bounds{},client{};GetWindowRect(editor,&bounds);GetClientRect(editor,&client);
+    POINT origin{};ClientToScreen(editor,&origin);
+    const int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
+    HDC screen=GetDC(editor),buffer=CreateCompatibleDC(screen);
+    HBITMAP bitmap=CreateCompatibleBitmap(screen,width,height);auto previous=SelectObject(buffer,bitmap);
+    PatBlt(buffer,0,0,width,height,BLACKNESS);
+    SendMessageW(editor,WM_PRINT,(WPARAM)buffer,PRF_CLIENT|PRF_NONCLIENT|PRF_ERASEBKGND);
+    const COLORREF border=GetFocus()==editor?COLOR_ACCENT:COLOR_BORDER;
+    bool even=true;
+    for(int x=0;x<width;++x)even=even&&GetPixel(buffer,x,0)==border&&GetPixel(buffer,x,height-1)==border;
+    for(int y=0;y<height;++y)even=even&&GetPixel(buffer,0,y)==border&&GetPixel(buffer,width-1,y)==border;
+    check(even,"code editor paints all four border edges with one uniform color");
+    check(!(GetWindowLongPtrW(editor,GWL_STYLE)&WS_BORDER)&&
+          !(GetWindowLongPtrW(editor,GWL_EXSTYLE)&(WS_EX_CLIENTEDGE|WS_EX_STATICEDGE))&&
+          origin.x-bounds.left==1&&origin.y-bounds.top==1,
+          "code editor reserves a single pixel for its custom border without a native inset edge");
+    SelectObject(buffer,previous);DeleteObject(bitmap);DeleteDC(buffer);ReleaseDC(editor,screen);
+}
+static void runBodyEditorTests(ApiRequest* request,ApiRequest* second) {
+    const auto original=RequestContent::from(*second);const UINT originalDpi=gDpi;
+    RECT originalWindow{};GetWindowRect(gWindow,&originalWindow);
+    openRequest(second);selectedTab()->editorPage=2;
+    second->body="{\r\n  \"message\": \"中文\",\r\n  \"count\": 12,\r\n  \"ok\": true,\r\n  \"empty\": null\r\n}";
+    loadEditor();const auto initialText=textOf(gBody);const auto initialContent=RequestContent::from(*second);
+    wchar_t bodyClass[64]{},responseClass[64]{};GetClassNameW(gBody,bodyClass,64);GetClassNameW(gResponseBody,responseClass,64);
+    check(gRichEditModule&&wstring(bodyClass)==responseClass,"request and response bodies use the same native code editor");
+    auto formatAt=[&](const wstring& needle){
+        const auto text=codeEditorText(gBody);const auto start=text.find(needle);
+        SendMessageW(gBody,EM_SETSEL,start,start+needle.size());CHARFORMAT2W format{};format.cbSize=sizeof(format);
+        SendMessageW(gBody,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);return format;
+    };
+    auto key=formatAt(L"message"),value=formatAt(L"中文"),number=formatAt(L"12"),boolean=formatAt(L"true");
+    check(key.crTextColor==RGB(29,78,160)&&(key.dwEffects&CFE_BOLD)&&value.crTextColor==RGB(21,128,61)&&
+          !(value.dwEffects&CFE_BOLD)&&number.crTextColor==RGB(180,83,9)&&boolean.crTextColor==RGB(126,34,206),
+          "request JSON keys, strings, numbers, and literals match the response palette");
+    SendMessageW(gBody,EM_SETSEL,3,11);CHARRANGE before{},after{};POINT scrollBefore{},scrollAfter{};
+    SendMessageW(gBody,EM_EXGETSEL,0,(LPARAM)&before);SendMessageW(gBody,EM_GETSCROLLPOS,0,(LPARAM)&scrollBefore);
+    SendMessageW(gBody,EM_SETMODIFY,FALSE,0);updateBodyAppearance();
+    SendMessageW(gBody,EM_EXGETSEL,0,(LPARAM)&after);SendMessageW(gBody,EM_GETSCROLLPOS,0,(LPARAM)&scrollAfter);
+    check(before.cpMin==after.cpMin&&before.cpMax==after.cpMax&&scrollBefore.x==scrollAfter.x&&scrollBefore.y==scrollAfter.y&&
+          !SendMessageW(gBody,EM_GETMODIFY,0,0)&&!SendMessageW(gBody,EM_CANUNDO,0,0)&&textOf(gBody)==initialText&&
+          RequestContent::from(*second)==initialContent,"syntax styling preserves selection, scroll, text, dirty state, and empty undo history");
+
+    SendMessageW(gBody,EM_SETSEL,(WPARAM)-1,-1);SendMessageW(gBody,EM_REPLACESEL,TRUE,(LPARAM)L" ");
+    const auto edited=textOf(gBody);SendMessageW(gWindow,WM_TIMER,BODY_STYLE_TIMER,0);
+    SendMessageW(gBody,EM_UNDO,0,0);updateBodyAppearance();
+    check(textOf(gBody)==initialText&&SendMessageW(gBody,EM_CANREDO,0,0),"JSON highlighting leaves the text edit undoable and preserves redo");
+    SendMessageW(gBody,EM_REDO,0,0);updateBodyAppearance();
+    check(textOf(gBody)==edited&&second->body==toUtf8(edited),"redo restores body text and the request model after highlighting");
+
+    setText(gBody,L"{\"kk\":1,\"message\":\"中文\"}");const auto compact=textOf(gBody);
+    formatCurrentJson(false);check(textOf(gBody).find(L'\n')!=wstring::npos,"request JSON still formats as editable multiline text");
+    SendMessageW(gBody,EM_UNDO,0,0);updateBodyAppearance();
+    check(textOf(gBody)==compact,"formatting JSON is one undoable text edit");
+    setText(gBody,L"{\r\n  \"中文\": tru");SendMessageW(gWindow,WM_TIMER,BODY_STYLE_TIMER,0);
+    check(second->body==toUtf8(textOf(gBody)),"incomplete Unicode JSON remains editable and synchronized");
+    gBodyImeComposing=true;SendMessageW(gBody,EM_SETSEL,(WPARAM)-1,-1);SendMessageW(gBody,EM_REPLACESEL,TRUE,(LPARAM)L"e");
+    SendMessageW(gBody,EM_EXGETSEL,0,(LPARAM)&before);updateBodyAppearance();SendMessageW(gBody,EM_EXGETSEL,0,(LPARAM)&after);
+    check(gBodyImeComposing&&before.cpMin==after.cpMin&&before.cpMax==after.cpMax,"body styling waits until IME composition finishes");
+    SendMessageW(gBody,WM_IME_ENDCOMPOSITION,0,0);SendMessageW(gWindow,WM_TIMER,BODY_STYLE_TIMER,0);
+    check(!gBodyImeComposing,"body styling resumes after IME composition");
+
+    SendMessageW(gBodyType,CB_SETCURSEL,4,0);SendMessageW(gWindow,WM_COMMAND,MAKEWPARAM(IDC_BODY_TYPE,CBN_SELCHANGE),(LPARAM)gBodyType);
+    auto rawFormat=formatAt(L"中文");check(rawFormat.crTextColor==COLOR_PRIMARY&&!(rawFormat.dwEffects&CFE_BOLD),"Raw body mode clears JSON syntax coloring");
+    const wstring raw=L"{\\rtf1\\ansi literal payload}\r\n中文";setText(gBody,raw);updateBodyAppearance();saveEditor();
+    check(textOf(gBody)==raw&&second->body==toUtf8(raw),"Raw payloads containing an RTF header stay literal text");
+    openRequest(request);openRequest(second);
+    check(textOf(gBody)==raw&&!SendMessageW(gBody,EM_CANUNDO,0,0),"switching tabs preserves raw body data and does not mix undo histories");
+    const wstring large(2*1024*1024+16,L'x');setText(gBody,large);updateBodyAppearance();
+    check(textOf(gBody)==large&&SendMessageW(gBody,EM_GETLIMITTEXT,0,0)==2*1024*1024,
+          "loading an existing large body preserves all text and restores the interactive input limit");
+    const wstring payload(2*1024*1024-16,L'x');setText(gBody,L"{\"payload\":\""+payload+L"\"}");
+    const wstring largeCompact=textOf(gBody);formatCurrentJson(false);
+    check(textOf(gBody)==L"{\r\n  \"payload\": \""+payload+L"\"\r\n}"&&SendMessageW(gBody,EM_GETLIMITTEXT,0,0)==2*1024*1024,
+          "formatting near the input limit keeps the complete expanded JSON body");
+    SendMessageW(gBody,EM_UNDO,0,0);check(textOf(gBody)==largeCompact,"large JSON formatting remains undoable without truncation");
+    setText(gBody,raw);
+    for(UINT dpi:{96u,144u,192u}){
+        RECT proposed{0,0,MulDiv(1100,(int)dpi,96),MulDiv(760,(int)dpi,96)};
+        SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
+        RECT bodyRect{},responseRect{};SendMessageW(gBody,EM_GETRECT,0,(LPARAM)&bodyRect);SendMessageW(gResponseBody,EM_GETRECT,0,(LPARAM)&responseRect);
+        check(bodyRect.left==responseRect.left&&bodyRect.top==responseRect.top&&bodyRect.left>=px(10)&&bodyRect.top>=px(7),
+              "request and response editor insets match at 100/150/200 percent DPI");
+        SetFocus(gUrl);checkFlatEditorBorder(gBody);checkFlatEditorBorder(gResponseBody);
+        SetFocus(gBody);checkFlatEditorBorder(gBody);
+    }
+    original.apply(*second);loadEditor();gDpi=originalDpi;SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
+    openRequest(request);
+}
 static void runControllerTests() {
     auto request=gData.folders[0]->requests[0].get();auto second=gData.folders[0]->requests[1].get();auto c=request->cases[0].get();
     check(!workspaceDirty(),"fixture starts clean");
     runSidebarSearchTests();
+    runTreeExpansionTests(request,second);
+    runTreeDiscardRedrawTests(request);
     runRequestTabTests(request,second);
     runEntryTableTests(request);
     runUrlParamSyncTests(request,second);
     runRequestToolbarTests(request);
+    runBodyEditorTests(request,second);
     const wstring savedVisibleUrl=textOf(gUrl);
     const size_t queryStart=savedVisibleUrl.find(L'?');
     const wstring visibleQuery=queryStart==wstring::npos?L"":savedVisibleUrl.substr(queryStart);
