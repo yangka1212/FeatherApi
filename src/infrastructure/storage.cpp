@@ -53,7 +53,12 @@ std::vector<KeyValueEntry> readEntries(const Json* json) {
 ApiRequestCase readCase(const Json& json) {
     ApiRequestCase c; c.id=normalizedId(getStoredText(json,"Id")); c.name=normalizedName(getStoredText(json,"Name"),"请求用例"); c.method=normalizedMethod(getStoredText(json,"Method")); c.url=getStoredText(json,"Url");
     c.query=readEntries(json.getInsensitive("QueryParams")); c.headers=readEntries(json.getInsensitive("Headers")); c.bodyType=getStoredText(json,"BodyType","None");if(trimText(c.bodyType).empty())c.bodyType="None";c.body=getStoredText(json,"BodyContent"); c.formFields=readEntries(json.getInsensitive("FormFields"));
-    c.responseSummary=getStoredText(json,"ResponseSummary","暂无响应"); c.responseRaw=getStoredText(json,"ResponseRawBody"); c.responsePretty=getStoredText(json,"ResponsePrettyBody"); c.responseHeaders=readEntries(json.getInsensitive("ResponseHeaders")); return c;
+    c.responseSummary=getStoredText(json,"ResponseSummary");
+    if(c.responseSummary=="暂无响应")c.responseSummary.clear();
+    // Older saved cases appended a byte count after the duration.
+    auto durationEnd=c.responseSummary.find(" ms");
+    if(durationEnd!=string::npos){bool truncated=c.responseSummary.find("响应已截断",durationEnd)!=string::npos;c.responseSummary.resize(durationEnd+3);if(truncated)c.responseSummary+=" · 响应已截断";}
+    c.responseRaw=getStoredText(json,"ResponseRawBody"); c.responsePretty=getStoredText(json,"ResponsePrettyBody"); c.responseHeaders=readEntries(json.getInsensitive("ResponseHeaders")); return c;
 }
 
 std::unique_ptr<ApiRequest> readRequest(const Json& json) {

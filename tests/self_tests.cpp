@@ -113,9 +113,6 @@ int main() {
     check(listCheckboxStateChanged(0x1000,0x2000),"checking an entry is detected as a checkbox change");
     check(listCheckboxStateChanged(0x2000,0x1000),"unchecking an entry is detected as a checkbox change");
     check(!listCheckboxStateChanged(0x2002,0x2003)&&!listCheckboxStateChanged(0,0),"selection and empty state notifications do not mimic checkbox changes");
-    check(formatBytes(1023)==L"1023 B"&&formatBytes(1024)==L"1 KB","response sizes use WPF byte and integer-KB formatting");
-    check(formatBytes(1536)==L"1.5 KB"&&formatBytes(1290)==L"1.26 KB","response sizes omit insignificant decimal zeroes like WPF");
-    check(formatBytes(1024*1024)==L"1 MB"&&formatBytes(1572864)==L"1.5 MB","response sizes use WPF MB formatting");
 
     auto tempRoot=std::filesystem::temp_directory_path()/std::filesystem::path(L"FeatherApi-SelfTests")/toWide(newId());
     auto dataPath=tempRoot/L"data.json";AppData stored;stored.sidebarWidth=275;stored.requestPanelHeight=360;
@@ -306,7 +303,7 @@ int main() {
         check(loopback.request.find("one")!=std::string::npos&&loopback.request.find("two")!=std::string::npos,"HTTP preserves multiple values for a request header");
         const bool hasPayload=loopback.request.size()>=7&&loopback.request.compare(loopback.request.size()-7,7,"payload")==0;
         check(loopback.request.find("Content-Type: text/plain; charset=utf-8")!=std::string::npos&&hasPayload,"HTTP sends Raw body like WPF");
-        check(liveResult.rawBody==R"({"ok":true})"&&liveResult.prettyBody.find("\r\n")!=std::string::npos&&liveResult.sizeBytes==11&&responseHeader,"HTTP reads status, headers, size and Windows-formatted JSON body");
+        check(liveResult.rawBody==R"({"ok":true})"&&liveResult.prettyBody.find("\r\n")!=std::string::npos&&liveResult.durationMs>=0&&responseHeader,"HTTP reads status, headers, duration and Windows-formatted JSON body");
         check(orderedHeaders==std::vector<std::string>({"first","second"}),"HTTP preserves repeated response header order like WPF");
         closesocket(loopback.listener);loopback.listener=INVALID_SOCKET;
     }

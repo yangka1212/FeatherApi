@@ -14,7 +14,7 @@ FeatherApi is an ultra-lightweight API debugging tool for Windows.
 - **Fast and portable**: A native single-file application that is convenient to carry on a USB drive, in a developer toolkit, or on a CI workstation.
 - **API organization**: Manage folders, subfolders, APIs, request examples, and copy, move, or rename APIs.
 - **Complete request editing**: Supports GET, POST, PUT, PATCH, and DELETE, with editable query parameters, headers, JSON, raw, and form requests.
-- **Readable responses**: View the status code, elapsed time, response size, response headers, and raw or formatted response body.
+- **Readable responses**: View elapsed time, response headers, and raw or formatted response bodies; hover over the duration to see the status code.
 - **JSON tools**: Built-in JSON validation, formatting, and minification, with errors located as precisely as possible by line and column.
 - **OpenAPI / Swagger**: Import OpenAPI 3 and Swagger 2 documents to automatically generate folders, request parameters, and JSON examples.
 - **Local-first**: API data is stored locally, with no login or cloud account required.
@@ -27,7 +27,7 @@ FeatherApi is an ultra-lightweight API debugging tool for Windows.
 | UI technology | **Native Windows Win32 API + Common Controls** |
 | HTTP implementation | Windows WinHTTP |
 | Third-party runtime | No Electron / No .NET Runtime required |
-| Package size | **v1.1.3: ZIP approximately 529 KiB; EXE approximately 924 KiB** |
+| Package size | **v1.1.4: ZIP approximately 527 KiB; EXE approximately 914 KiB** |
 | Idle memory usage | **Approximately 18.9 MB** |
 
 FeatherApi stays lightweight by relying only on Windows system components, so no additional dependencies are required.

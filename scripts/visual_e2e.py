@@ -532,7 +532,7 @@ def check_loaded_ui(native: Native, window: Win32Window, shot: Screenshot,
         "url_frame": IDC_URL_FRAME, "url": IDC_URL,
         "save": IDC_SAVE, "save_more": IDC_SAVE_MORE, "send": IDC_SEND,
         "editor_tabs": IDC_EDITOR_TABS, "kv_list": IDC_KV_LIST,
-        "summary": IDC_SUMMARY, "response_tabs": IDC_RESPONSE_TABS,
+        "response_tabs": IDC_RESPONSE_TABS,
         "response_body": IDC_RESPONSE_BODY,
         "response_mode": IDC_RESPONSE_MODE, "response_find": IDC_RESPONSE_FIND,
     }
@@ -553,8 +553,16 @@ def check_loaded_ui(native: Native, window: Win32Window, shot: Screenshot,
     above(rects["request_tabs"], rects["method"], "请求标签/请求栏")
     above(rects["method"], rects["editor_tabs"], "请求栏/编辑标签")
     above(rects["editor_tabs"], rects["kv_list"], "编辑标签/参数列表")
-    above(rects["kv_list"], rects["summary"], "参数列表/响应摘要")
-    above(rects["summary"], rects["response_tabs"], "响应摘要/标签")
+    above(rects["kv_list"], rects["response_tabs"], "参数列表/响应标签")
+    if native.user32.IsWindowVisible(window.control(IDC_SUMMARY)):
+        duration = control_rect(native, window, IDC_SUMMARY, "响应耗时")
+        separated(rects["response_mode"], duration, "响应模式/耗时")
+        separated(duration, rects["response_find"], "响应耗时/查找")
+        require(duration.top >= rects["response_tabs"].top and
+                duration.bottom <= rects["response_tabs"].bottom,
+                "响应耗时应与响应标签位于同一行")
+    else:
+        require(not window.text(IDC_SUMMARY), "未请求时不应显示响应占位文案")
     above(rects["response_tabs"], rects["response_body"], "响应标签/正文")
     require(window.text(IDC_METHOD) == "GET", "预置真实请求的 GET 方法未显示")
     dpi = native.user32.GetDpiForWindow(window.hwnd)
@@ -564,9 +572,9 @@ def check_loaded_ui(native: Native, window: Win32Window, shot: Screenshot,
     color_near(shot.pixel(rects["send"].left + dpi_scale(dpi, 8),
                           (rects["send"].top + rects["send"].bottom) // 2),
                (37, 99, 235), "发送按钮品牌蓝")
-    color_near(shot.pixel(rects["method"].left + dpi_scale(dpi, 12),
+    color_near(shot.pixel(rects["method"].left + dpi_scale(dpi, 7),
                           (rects["method"].top + rects["method"].bottom) // 2),
-               (225, 244, 235), "GET 方法绿色徽标")
+               (255, 255, 255), "请求方式下拉框白色底面")
     selected_tab_underline(native, window, shot, IDC_EDITOR_TABS, "编辑标签")
     selected_tab_underline(native, window, shot, IDC_RESPONSE_TABS, "响应标签")
     # WM_GETTEXT and IsWindowVisible can both pass while the owner-drawn Save

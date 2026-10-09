@@ -204,7 +204,6 @@ HttpResult executeHttp(const RequestSnapshot& input,std::atomic<bool>& cancel,st
         setFailureBody(normalizedHttpError(result.errorCode));
     }
     if(result.transportSuccess){
-        result.sizeBytes=result.rawBody.size();string contentLength=headerValue(result.headers,"Content-Length");if(!contentLength.empty())try{result.sizeBytes=(size_t)std::stoull(trimAscii(contentLength));}catch(const std::exception&){}
         result.rawBody=toUtf8(decodeBody(result.rawBody,result.headers));
         result.prettyBody=result.rawBody.size()<=2*1024*1024?formatResponseBody(result.rawBody,result.headers):result.rawBody;
         if(result.truncated)result.prettyBody+="\r\n\r\n[响应超过 5 MB，内容已截断]";

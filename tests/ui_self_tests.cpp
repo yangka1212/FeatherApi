@@ -324,7 +324,7 @@ static void runRequestToolbarTests(ApiRequest* request) {
     SetFocus(gUrl);SetFocus(gMethod);
     check(textOf(gUrl)==address&&request->url=="https://example.invalid/接口"&&request->query.size()==2,
           "focusing the method selector preserves URL text and request address");
-    selectRequestMethod(L"PATCH");
+    SendMessageW(gMethod,CB_SETCURSEL,3,0);SendMessageW(gWindow,WM_COMMAND,MAKEWPARAM(IDC_METHOD,CBN_SELCHANGE),(LPARAM)gMethod);
     check(textOf(gUrl)==address&&request->url=="https://example.invalid/接口"&&request->method=="PATCH",
           "switching request method preserves the visible URL and request address");
     RECT frameBounds{},urlBounds{};GetClientRect(gUrlFrame,&frameBounds);GetWindowRect(gUrl,&urlBounds);
@@ -537,6 +537,9 @@ static void runResponseFindTests(const std::shared_ptr<TabState>& tab,ApiRequest
         check(EqualRect(&closedMode,&openMode),"opening inline response search does not move the response mode at 100/150/200 percent");
         check(find.left>=openMode.right&&find.right>find.left,
               "inline response search opens to the right without overlapping the response mode at 100/150/200 percent");
+        RECT duration=boundsInWindow(gSummary);
+        check(duration.left>=openMode.right&&duration.right<=find.left&&duration.top>=toolbar.top&&duration.bottom<=toolbar.bottom,
+              "response duration shares the tab row without overlapping search at 100/150/200 percent");
         check(find.top>=toolbar.top&&find.bottom<=toolbar.bottom&&find.left>=0&&find.right<=client.right&&find.right>find.left,
               "minimum-window response search stays compact inside the existing toolbar at 100/150/200 percent");
         check(textOf(gResponseFindEdit)==L"match","opening search outside the response body does not seed from an old body selection");
@@ -814,7 +817,7 @@ static void runControllerTests() {
     setText(gBody,L"{}");finish(tab,false,true);
     check(tab->summary.find(L"已取消")==0&&tab->responseRaw==oldBody&&tab->oldResponse,"cancelled requests retain explicitly labelled previous response");
     finish(tab,false);check(tab->summary.find(L"网络错误")==0&&tab->responseRaw==oldBody,"network failures preserve previous response");
-    finish(tab,true,false,500);check(tab->responseRaw=="{\"new\":true}"&&tab->statusCode==500&&!tab->oldResponse,"HTTP 500 replaces response normally");
+    finish(tab,true,false,500);check(tab->responseRaw=="{\"new\":true}"&&tab->statusCode==500&&!tab->oldResponse&&responseDurationText(textOf(gSummary))==L"耗时 42 ms","HTTP 500 replaces response normally and the toolbar shows only duration");
     runLargeResponseFindTests(tab);runResponseFindTests(tab,request,c,second);
     tab->rawView=true;captureView();showResponsePage();
     openRequest(second);finish(tab,true,false,201);check(textOf(gUrl)==toWide(second->url),"background completion does not replace the selected request editor");
@@ -823,7 +826,7 @@ static void runControllerTests() {
 
     tab->sending=true;tab->cancel=false;tab->started=std::chrono::steady_clock::now()-std::chrono::milliseconds(200);
     SendMessageW(gWindow,WM_TIMER,REQUEST_TIMER,0);check(tab->summary.find(L"请求中")!=wstring::npos,"request timer updates elapsed status");
-    cancelCurrent();check(tab->cancel&&tab->summary==L"正在取消","cancel button immediately enters cancelling state");finish(tab,false,true);
+    cancelCurrent();check(tab->cancel&&tab->summary.find(L"正在取消")==0&&responseDurationText(textOf(gSummary)).find(L"耗时 ")==0,"cancel button immediately enters cancelling state and keeps elapsed time");finish(tab,false,true);
     check(saveNow(),"request activity does not invalidate saving response content");
 
     setText(gUrl,L"http://127.0.0.1/unsaved");size_t count=gTabs.size();closeChoice=IDCANCEL;closeTab(gSelectedTab);

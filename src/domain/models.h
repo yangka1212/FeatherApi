@@ -23,7 +23,7 @@ struct ApiRequestCase {
     std::string bodyType = "None";
     std::string body;
     std::vector<KeyValueEntry> formFields;
-    std::string responseSummary = "暂无响应";
+    std::string responseSummary;
     std::string responseRaw;
     std::string responsePretty;
     std::vector<KeyValueEntry> responseHeaders;
@@ -74,7 +74,6 @@ struct HttpResult {
     std::wstring statusText;
     unsigned long errorCode = 0;
     long long durationMs = 0;
-    size_t sizeBytes = 0;
     bool truncated = false;
     std::string rawBody;
     std::string prettyBody;

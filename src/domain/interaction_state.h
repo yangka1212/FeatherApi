@@ -85,4 +85,3 @@ struct ResponseMatches {
 
 int tabSelectionAfterClose(int selectedIndex, int closedIndex, int tabCountBeforeClose);
 bool listCheckboxStateChanged(unsigned oldState, unsigned newState);
-std::wstring formatBytes(size_t bytes);

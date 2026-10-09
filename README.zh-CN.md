@@ -14,7 +14,7 @@ FeatherApi 是一款面向 Windows 的极致轻量级 API 调试工具。
 - **轻巧启动**：单文件原生应用形态，适合放在 U 盘、开发工具箱或 CI 工作机中使用。
 - **接口管理**：支持目录、子目录、接口、请求用例和接口复制、移动、重命名。
 - **完整请求编辑**：支持 GET、POST、PUT、PATCH、DELETE 等常见方法，查询参数、请求头、JSON、Raw 和表单请求均可编辑。
-- **响应可读**：显示状态码、耗时、响应大小、响应头和原始或格式化后的响应体。
+- **响应可读**：显示请求耗时、响应头和原始或格式化后的响应体，悬停耗时可查看状态码。
 - **JSON 工具**：内置 JSON 校验、格式化和压缩，错误信息尽量定位到行列。
 - **OpenAPI / Swagger**：可导入 OpenAPI 3 和 Swagger 2 文档，自动生成目录、请求参数与 JSON 示例。
 - **本地优先**：接口数据保存到本机，不要求登录或云端账号。
@@ -27,7 +27,7 @@ FeatherApi 是一款面向 Windows 的极致轻量级 API 调试工具。
 | UI 技术 | **Windows 原生 Win32 API + Common Controls** |
 | HTTP 实现 | Windows WinHTTP |
 | 第三方运行时 | 无 Electron / 无 .NET Runtime 要求 |
-| 安装包大小 | **v1.1.3：ZIP 约 529 KiB；EXE 约 924 KiB** |
+| 安装包大小 | **v1.1.4：ZIP 约 527 KiB；EXE 约 914 KiB** |
 | 空闲内存占用 | **约 18.9 MB** |
 
 FeatherApi 的轻量来自架构选择：只依赖 Windows 系统组件，无需安装额外依赖即可使用。
