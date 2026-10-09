@@ -2490,7 +2490,7 @@ void createControls() {
     tooltip(gResponseMode,L"响应显示方式：格式化 / 原始");
     tooltip(gSummary,L"");
     tooltip(gResponseFindPrev,L"上一个 (Shift+Enter)");tooltip(gResponseFindNext,L"下一个 (Enter)");tooltip(gResponseFindClose,L"关闭查找 (Esc)");tooltip(gFindStatus,L"当前匹配 / 全部匹配；↻ 表示已循环查找");
-    tooltip(gKvList,L"Tab / Shift+Tab 连续编辑；Enter 提交；Esc 撤销单元格；F2 编辑；Delete 删除行");tooltip(gAddFolder,L"新建接口或目录");
+    tooltip(gAddFolder,L"新建接口或目录");
     gEmptyTitle=child(L"STATIC",L"还没有打开接口",SS_CENTER,IDC_EMPTY_TITLE);applyFont(gEmptyTitle,gTitleFont);
     gEmptyHelp=child(L"STATIC",L"从左侧选择接口，或创建一个新接口开始。",SS_CENTER,IDC_EMPTY_HELP);
     gEmptyNewRequest=child(L"BUTTON",L"新建接口",BS_OWNERDRAW,IDC_EMPTY_NEW_REQUEST);
