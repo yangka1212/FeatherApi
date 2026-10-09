@@ -27,7 +27,7 @@ FeatherApi 是一款面向 Windows 的极致轻量级 API 调试工具。
 | UI 技术 | **Windows 原生 Win32 API + Common Controls** |
 | HTTP 实现 | Windows WinHTTP |
 | 第三方运行时 | 无 Electron / 无 .NET Runtime 要求 |
-| 安装包大小 | **v1.1.2：ZIP 约 528 KiB；EXE 约 921 KiB** |
+| 安装包大小 | **v1.1.3：ZIP 约 529 KiB；EXE 约 924 KiB** |
 | 空闲内存占用 | **约 18.9 MB** |
 
 FeatherApi 的轻量来自架构选择：只依赖 Windows 系统组件，无需安装额外依赖即可使用。

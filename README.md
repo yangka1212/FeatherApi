@@ -27,7 +27,7 @@ FeatherApi is an ultra-lightweight API debugging tool for Windows.
 | UI technology | **Native Windows Win32 API + Common Controls** |
 | HTTP implementation | Windows WinHTTP |
 | Third-party runtime | No Electron / No .NET Runtime required |
-| Package size | **v1.1.2: ZIP approximately 528 KiB; EXE approximately 921 KiB** |
+| Package size | **v1.1.3: ZIP approximately 529 KiB; EXE approximately 924 KiB** |
 | Idle memory usage | **Approximately 18.9 MB** |
 
 FeatherApi stays lightweight by relying only on Windows system components, so no additional dependencies are required.
