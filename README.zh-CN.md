@@ -66,4 +66,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-real.ps1
 
 ## 许可证
 
-许可证文件将在首次公开发布前补充。若你准备直接 fork 或分发，请先确认项目许可证状态。
+FeatherApi 采用 [MIT 许可证](LICENSE)开源。
+
+## Code signing policy（代码签名政策）
+
+Windows 代码签名正在准备中，现有发行文件尚未签名。
+计划接入 SignPath Foundation，维护者职责、签名状态与隐私说明见
+[代码签名政策](docs/code-signing.md)，申请和接入步骤见
+[签名接入说明](docs/signing-setup.zh-CN.md)。

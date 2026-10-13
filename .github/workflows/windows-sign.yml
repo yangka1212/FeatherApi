@@ -1,0 +1,104 @@
+name: Sign Windows release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    if: github.repository == 'yangka1212/FeatherApi' && github.ref_type == 'tag'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      actions: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check signing configuration
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v\d+\.\d+\.\d+(\.\d+)?$') {
+            throw 'Run this workflow on an existing version tag such as v2.0.1.'
+          }
+          foreach ($name in @('SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing $name. Complete SignPath onboarding before requesting a signed release."
+            }
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Build the immutable commit recorded by this workflow run for SignPath.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify signing source commit
+        run: |
+          $sourceCommit = git rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the checked-out commit.' }
+          if ($sourceCommit -cne $env:GITHUB_SHA) {
+            throw 'The checked-out commit does not match the workflow source commit.'
+          }
+      - name: Build and run offline tests
+        run: ./scripts/build.ps1 -Action Test -Configuration Release
+      - name: Check version and prepare signing input
+        run: |
+          ./scripts/package-release.ps1 -ReleaseTag $env:RELEASE_TAG -OutputDirectory build/unsigned-check
+          New-Item -ItemType Directory -Path build/signing-input -Force | Out-Null
+          Copy-Item -LiteralPath build/release/FeatherApi.exe -Destination build/signing-input/FeatherApi.exe
+      - name: Upload input for SignPath provenance verification
+        id: signing-input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FeatherApi-signing-input
+          path: build/signing-input/FeatherApi.exe
+          if-no-files-found: error
+          retention-days: 7
+      - name: Request signature and wait for maintainer approval
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.signing-input.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: build/signed
+      - name: Verify trusted timestamped signature and package
+        run: ./scripts/package-release.ps1 -ExePath build/signed/FeatherApi.exe -ReleaseTag $env:RELEASE_TAG -RequireSignature
+      - name: Save signed artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FeatherApi-windows-x64-signed
+          path: build/packages/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Create draft release for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $notes = @'
+          Windows x64 portable build. The EXE has a valid, timestamped Authenticode signature. The ZIP includes the MIT license. SHA-256 checksums are attached.
+
+          [Code signing policy](https://github.com/yangka1212/FeatherApi/blob/main/docs/code-signing.md)
+
+          Maintainer: add the release changes and review all assets before publishing this draft.
+          '@
+          $notes | Set-Content -LiteralPath build/release-notes.md -Encoding utf8
+          $assets = @(Get-ChildItem -LiteralPath build/packages -File | ForEach-Object { $_.FullName })
+          gh release create $env:RELEASE_TAG @assets --draft --verify-tag --title "FeatherApi $env:RELEASE_TAG" --notes-file build/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed. Existing releases are not overwritten.' }

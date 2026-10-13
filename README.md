@@ -64,4 +64,10 @@ The default data file is located at:
 
 ## License
 
-The license file will be added before the first public release. If you plan to fork or redistribute this project, please confirm its license status first.
+FeatherApi is licensed under the [MIT License](LICENSE).
+
+## Code signing policy
+
+Windows code signing is being prepared; existing releases are unsigned.
+See the [code signing policy and privacy policy](docs/code-signing.md) for the
+planned SignPath Foundation integration, maintainer roles, and signing status.
