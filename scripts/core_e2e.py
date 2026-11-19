@@ -438,13 +438,13 @@ def close_all_tabs(window: Win32Window, process, timeout: float,
     # the same production menu as a user's right click.
     post(window, tabs, WM_CONTEXTMENU, tabs, -1)
     menu = until("请求标签菜单", timeout,
-                 lambda: top_level(window, "#32768"), process)
+                 lambda: top_level(window, "ListBox"), process)
     if before_select is not None:
         before_select()
-    for code in (VK_DOWN, VK_RETURN):  # First item: 关闭全部
+    for code in (0x24, VK_RETURN):  # First item: 关闭全部
         post(window, menu, WM_KEYDOWN, code)
     until("请求标签菜单关闭", timeout,
-          lambda: not top_level(window, "#32768"), process)
+          lambda: not top_level(window, "ListBox"), process)
     until("全部请求标签关闭", timeout,
           lambda: window.send(tabs, TCM_GETITEMCOUNT) == 0, process)
     require(window.text(IDC_URL) == "" and process.poll() is None,

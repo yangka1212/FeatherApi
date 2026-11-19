@@ -84,7 +84,9 @@ bool loadAppDataFromPath(const wstring& path,AppData& data) {
     std::ifstream input(std::filesystem::path(path),std::ios::binary);if(!input)return false;
     string source((std::istreambuf_iterator<char>(input)),{});if(source.size()>=3&&(unsigned char)source[0]==0xEF&&(unsigned char)source[1]==0xBB&&(unsigned char)source[2]==0xBF)source.erase(0,3);
     Json root;if(!Parser(source).parse(root)||!root.object())return false;AppData loaded;
-    if(auto settings=root.getInsensitive("Settings")){if(auto p=settings->getInsensitive("SidebarWidth"))loaded.sidebarWidth=std::clamp(p->integer(320),180,420);if(auto p=settings->getInsensitive("RequestPanelHeight"))loaded.requestPanelHeight=std::max(180,p->integer(330));}
+    if(auto settings=root.getInsensitive("Settings")){if(auto p=settings->getInsensitive("SidebarWidth"))loaded.sidebarWidth=std::clamp(p->integer(320),180,420);if(auto p=settings->getInsensitive("RequestPanelHeight"))loaded.requestPanelHeight=std::max(180,p->integer(330));
+        loaded.requestPanelHeightManual=getStoredBool(*settings,"RequestPanelHeightManual",loaded.requestPanelHeight!=330);
+    }
     if(auto folders=root.getInsensitive("Folders");folders&&folders->array())for(const auto& folder:*folders->array())loaded.folders.push_back(readFolder(folder));
     if(loaded.folders.empty()){auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name="默认目录";loaded.folders.push_back(std::move(folder));}data=std::move(loaded);return true;
 }
@@ -92,7 +94,7 @@ bool loadAppDataFromPath(const wstring& path,AppData& data) {
 bool saveAppDataToPath(const AppData& data,const wstring& filePath) {
     auto path=std::filesystem::path(filePath);std::error_code ec;std::filesystem::create_directories(path.parent_path(),ec);
     auto temporary=path;temporary+=L".tmp";std::ofstream out(temporary,std::ios::binary|std::ios::trunc);if(!out)return false;
-    out<<"{\"Settings\":{\"SidebarWidth\":"<<data.sidebarWidth<<",\"RequestPanelHeight\":"<<data.requestPanelHeight<<"},\"Folders\":[";
+    out<<"{\"Settings\":{\"SidebarWidth\":"<<data.sidebarWidth<<",\"RequestPanelHeight\":"<<data.requestPanelHeight<<",\"RequestPanelHeightManual\":"<<(data.requestPanelHeightManual?"true":"false")<<"},\"Folders\":[";
     for(size_t i=0;i<data.folders.size();++i){if(i)out<<',';writeFolder(out,*data.folders[i]);}out<<"]}";out.close();if(!out)return false;
     return MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=FALSE;
 }

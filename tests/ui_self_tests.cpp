@@ -58,28 +58,29 @@ static LRESULT CALLBACK observeRequestSelection(HWND h,UINT message,WPARAM w,LPA
 }
 static void runRequestTabTests(ApiRequest* request,ApiRequest* second) {
     const UINT originalDpi=gDpi;const int originalSidebar=gData.sidebarWidth;RECT originalWindow{};GetWindowRect(gWindow,&originalWindow);
-    updateRequestTabScroll();
+    updateTabOverflow();
     RECT client{},first{};GetClientRect(gRequestTabs,&client);TabCtrl_GetItemRect(gRequestTabs,0,&first);
     HDC screen=GetDC(gRequestTabs),buffer=CreateCompatibleDC(screen);
     HBITMAP bitmap=CreateCompatibleBitmap(screen,client.right,client.bottom);auto oldBitmap=SelectObject(buffer,bitmap);
     PatBlt(buffer,0,0,client.right,client.bottom,BLACKNESS);
     SendMessageW(gRequestTabs,WM_PRINTCLIENT,(WPARAM)buffer,PRF_CLIENT);
-    int tintedPixels=0;
-    for(int y=0;y<client.bottom;++y)for(int x=first.left;x<first.right;++x){
-        COLORREF color=GetPixel(buffer,x,y);
-        if(GetRValue(color)>160&&GetGValue(color)>GetRValue(color)+8&&GetGValue(color)>GetBValue(color)+5)++tintedPixels;
-    }
-    check(tintedPixels>px(10)*px(5),"request tab WM_PRINTCLIENT paints the GET method badge instead of the native strip");
+    RECT card=requestTabCardRect(gRequestTabs,0),closeButton=requestTabCloseRect(gRequestTabs,0);
+    int titleInk=0;
+    for(int y=card.top+px(5);y<card.bottom-px(5);++y)
+        for(int x=card.left+px(9);x<closeButton.left-px(8);++x)
+            if(GetRValue(GetPixel(buffer,x,y))<100)++titleInk;
+    check(titleInk>10,"request tab paints the interface name before the close button");
     SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);ReleaseDC(gRequestTabs,screen);
 
-    openRequest(second);openRequest(request);updateRequestTabScroll();auto active=selectedTab();
+    openRequest(second);openRequest(request);updateTabOverflow();auto active=selectedTab();
     RECT clean{},dirty{};TabCtrl_GetItemRect(gRequestTabs,0,&clean);
-    const wstring originalUrl=textOf(gUrl);setText(gUrl,L"http://127.0.0.1/keep-current-draft");updateDirtyStatus();updateRequestTabScroll();
+    const wstring originalUrl=textOf(gUrl);setText(gUrl,L"http://127.0.0.1/keep-current-draft");updateDirtyStatus();updateTabOverflow();
     TabCtrl_GetItemRect(gRequestTabs,0,&dirty);
     check(clean.right-clean.left==dirty.right-dirty.left,"dirty status does not shift request tab widths");
     int selectionChanges=0,prompts=closePrompts;const auto count=gTabs.size();
     SetWindowSubclass(gWindow,observeRequestSelection,71,(DWORD_PTR)&selectionChanges);
     RECT close=requestTabCloseRect(gRequestTabs,1);
+    SendMessageW(gRequestTabs,WM_MOUSEMOVE,0,MAKELPARAM((close.left+close.right)/2,(close.top+close.bottom)/2));
     SendMessageW(gRequestTabs,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM((close.left+close.right)/2,(close.top+close.bottom)/2));
     SendMessageW(gRequestTabs,WM_LBUTTONUP,0,MAKELPARAM((close.left+close.right)/2,(close.top+close.bottom)/2));
     RemoveWindowSubclass(gWindow,observeRequestSelection,71);
@@ -93,44 +94,27 @@ static void runRequestTabTests(ApiRequest* request,ApiRequest* second) {
     for(int i=0;i<8;++i){
         auto extra=std::make_unique<ApiRequest>();extra->id="tab-overflow-"+std::to_string(i);
         extra->name="请求标签滚动测试 "+std::to_string(i);extra->url="http://127.0.0.1/test";
+        if(i==7)extra->name="集团数据汇总（0本月、1月环比、2月同比、3本年、4年环比、5本季、6季同比）";
         openRequest(extra.get());overflow.push_back(std::move(extra));
     }
     int baselineHeight=0;
     for(UINT dpi:{96u,144u,192u}){
         gData.sidebarWidth=420;RECT proposed{0,0,MulDiv(980,(int)dpi,96),MulDiv(640,(int)dpi,96)};
         SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
-        updateRequestTabScroll();
-        RECT tabs=boundsInWindow(gRequestTabs),scroll=boundsInWindow(gRequestTabScroll),last{};
+        updateTabOverflow();
+        RECT tabs=boundsInWindow(gRequestTabs),scroll=boundsInWindow(gTabOverflow),last{};
         TabCtrl_GetItemRect(gRequestTabs,TabCtrl_GetItemCount(gRequestTabs)-1,&last);
+        check(last.right-last.left<=px(REQUEST_TAB_MAX_WIDTH),"long request title stays within the tab width limit at every DPI");
         if(dpi==96)baselineHeight=tabs.bottom-tabs.top;
-        check(tabs.bottom-tabs.top==MulDiv(baselineHeight,(int)dpi,96)&&tabs.bottom<=scroll.top,
-              "request strip scales at 100/150/200 percent without overlapping its scrollbar");
-        check((GetWindowLongPtrW(gRequestTabScroll,GWL_STYLE)&WS_VISIBLE)&&last.left>=gRequestTabScrollOffset&&
-              last.right<=gRequestTabScrollOffset+gRequestTabViewportWidth,
-              "selecting an overflow request brings its entire tab into view at every DPI");
-        const RECT fixedSave=boundsInWindow(gSave),fixedMore=boundsInWindow(gSaveMore);
-        auto saveAreaIsProtected=[&](){
-            HRGN region=CreateRectRgn(0,0,0,0);const int regionKind=GetWindowRgn(gRequestTabs,region);
-            RECT clipped{};GetRgnBox(region,&clipped);DeleteObject(region);
-            RECT currentTabs=boundsInWindow(gRequestTabs);OffsetRect(&clipped,currentTabs.left,currentTabs.top);
-            RECT currentSave=boundsInWindow(gSave),currentMore=boundsInWindow(gSaveMore),currentScroll=boundsInWindow(gRequestTabScroll);
-            return regionKind!=ERROR&&regionKind!=NULLREGION&&clipped.right<=fixedSave.left&&currentScroll.right<=fixedSave.left&&
-                EqualRect(&fixedSave,&currentSave)&&EqualRect(&fixedMore,&currentMore);
-        };
-        bool saveProtected=saveAreaIsProtected();
-        auto selected=selectedTab();SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(gRequestTabScroll,SB_CTL,&info);
-        const int pages=(info.nMax-info.nMin+1)/std::max(1,(int)info.nPage)+2;
-        for(int i=0;i<pages;++i)SendMessageW(gWindow,WM_HSCROLL,SB_PAGELEFT,(LPARAM)gRequestTabScroll);
-        const bool reachedStart=gRequestTabScrollOffset==0;saveProtected=saveAreaIsProtected()&&saveProtected;
-        for(int i=0;i<pages;++i)SendMessageW(gWindow,WM_HSCROLL,SB_PAGERIGHT,(LPARAM)gRequestTabScroll);
-        check(reachedStart&&gRequestTabScrollOffset+gRequestTabViewportWidth>=last.right&&selectedTab()==selected,
-              "horizontal scrolling reaches both ends without switching the active request");
-        check(saveAreaIsProtected()&&saveProtected,
-              "the scrolled tab region and scrollbar stay clear of the fixed save controls at both ends");
+        check(tabs.bottom-tabs.top==MulDiv(baselineHeight,(int)dpi,96),"request strip scales with DPI");
+        check((GetWindowLongPtrW(gTabOverflow,GWL_STYLE)&WS_VISIBLE)&&gFirstVisibleTab>0&&gPastVisibleTab==(int)gTabs.size(),
+              "overflow lists hidden tabs while the selected last tab stays visible");
+        check(last.right<=gTabClipStart+gTabClipWidth&&scroll.right<=boundsInWindow(gSave).left,
+              "visible tabs fit completely beside the overflow and save buttons");
     }
     while(gTabs.size()>1)closeTab((int)gTabs.size()-1,false);
     gData.sidebarWidth=originalSidebar;SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
-    openRequest(request);updateRequestTabScroll();updateDirtyStatus();
+    openRequest(request);updateTabOverflow();updateDirtyStatus();
 }
 static void runEntryTableTests(ApiRequest* request) {
     const auto originalQuery=request->query;const auto originalContent=RequestContent::from(*request);
@@ -842,7 +826,7 @@ static void runControllerTests() {
     setText(gBody,L"{}");finish(tab,false,true);
     check(tab->summary.find(L"已取消")==0&&tab->responseRaw==oldBody&&tab->oldResponse,"cancelled requests retain explicitly labelled previous response");
     finish(tab,false);check(tab->summary.find(L"网络错误")==0&&tab->responseRaw==oldBody,"network failures preserve previous response");
-    finish(tab,true,false,500);check(tab->responseRaw=="{\"new\":true}"&&tab->statusCode==500&&!tab->oldResponse&&responseDurationText(textOf(gSummary))==L"耗时 42 ms","HTTP 500 replaces response normally and the toolbar shows only duration");
+    finish(tab,true,false,500);check(tab->responseRaw=="{\"new\":true}"&&tab->statusCode==500&&!tab->oldResponse&&responseToolbarText(textOf(gSummary))==L"500 Test · 耗时 42 ms","HTTP 500 replaces response normally and the toolbar shows status and duration");
     runLargeResponseFindTests(tab);runResponseFindTests(tab,request,c,second);
     tab->rawView=true;captureView();showResponsePage();
     openRequest(second);finish(tab,true,false,201);check(textOf(gUrl)==toWide(second->url),"background completion does not replace the selected request editor");
@@ -850,8 +834,9 @@ static void runControllerTests() {
     check(saveNow(),"case response can be saved");
 
     tab->sending=true;tab->cancel=false;tab->started=std::chrono::steady_clock::now()-std::chrono::milliseconds(200);
-    SendMessageW(gWindow,WM_TIMER,REQUEST_TIMER,0);check(tab->summary.find(L"请求中")!=wstring::npos,"request timer updates elapsed status");
-    cancelCurrent();check(tab->cancel&&tab->summary.find(L"正在取消")==0&&responseDurationText(textOf(gSummary)).find(L"耗时 ")==0,"cancel button immediately enters cancelling state and keeps elapsed time");finish(tab,false,true);
+    tab->summary=L"请求中";updateResponseSummary();
+    SendMessageW(gWindow,WM_TIMER,REQUEST_TIMER,0);check(textOf(gSummary).find(L"请求中")==0&&textOf(gSummary).find(L" ms")==wstring::npos,"pending request shows activity without elapsed time");
+    cancelCurrent();check(tab->cancel&&tab->summary.find(L"正在取消")==0&&textOf(gSummary).find(L" ms")==wstring::npos,"cancel button immediately enters cancelling state without displaying elapsed time");finish(tab,false,true);
     check(saveNow(),"request activity does not invalidate saving response content");
 
     setText(gUrl,L"http://127.0.0.1/unsaved");size_t count=gTabs.size();closeChoice=IDCANCEL;closeTab(gSelectedTab);

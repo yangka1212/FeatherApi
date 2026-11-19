@@ -33,7 +33,7 @@ enum : int {
     IDC_SEARCH=100,IDC_ADD_FOLDER,IDC_TREE,IDC_REQUEST_TABS,IDC_METHOD,IDC_URL,IDC_SAVE,IDC_SAVE_MORE,
     IDC_SEND,IDC_CANCEL,IDC_EDITOR_TABS,IDC_KV_LIST,IDC_ADD_ROW,IDC_DELETE_ROW,IDC_BODY_TYPE,
     IDC_FORMAT,IDC_COMPRESS,IDC_BODY,IDC_VALIDATION,IDC_SUMMARY,
-    IDC_RESPONSE_TABS,IDC_RESPONSE_BODY,IDC_RESPONSE_HEADERS,IDC_RESPONSE_FIND_PANEL,IDC_RESPONSE_FIND_EDIT,IDC_RESPONSE_FIND_PREV,IDC_RESPONSE_FIND_NEXT,IDC_RESPONSE_FIND_CLOSE,IDC_BODY_NONE,IDC_EMPTY_TITLE,IDC_EMPTY_HELP,IDC_SIDEBAR_DIVIDER,IDC_REQUEST_TAB_SCROLL,
+    IDC_RESPONSE_TABS,IDC_RESPONSE_BODY,IDC_RESPONSE_HEADERS,IDC_RESPONSE_FIND_PANEL,IDC_RESPONSE_FIND_EDIT,IDC_RESPONSE_FIND_PREV,IDC_RESPONSE_FIND_NEXT,IDC_RESPONSE_FIND_CLOSE,IDC_BODY_NONE,IDC_EMPTY_TITLE,IDC_EMPTY_HELP,IDC_SIDEBAR_DIVIDER,IDC_TAB_OVERFLOW,
     IDC_RESPONSE_MODE,IDC_RESPONSE_FIND,IDC_FIND_STATUS,IDC_RESPONSE_MODE_DIVIDER,IDC_EMPTY_NEW_REQUEST,
     IDC_PROMPT_EDIT=900,IDC_URL_FRAME,IDC_SEARCH_FRAME,
     IDM_FOLDER_ADD_REQUEST=1000,IDM_FOLDER_ADD_CHILD,IDM_FOLDER_IMPORT,IDM_FOLDER_RENAME,IDM_FOLDER_DELETE,
@@ -45,14 +45,15 @@ constexpr UINT WM_HTTP_DONE=WM_APP+1;
 constexpr UINT WM_SEARCH_REFRESH=WM_APP+2;
 constexpr UINT WM_IMPORT_DONE=WM_APP+3;
 constexpr UINT WM_EDIT_ENTRY_CELL=WM_APP+4;
-constexpr UINT WM_UPDATE_TAB_SCROLL=WM_APP+5;
+constexpr UINT WM_UPDATE_TAB_OVERFLOW=WM_APP+5;
 constexpr UINT_PTR SAVE_FEEDBACK_TIMER=1;
 constexpr UINT_PTR REQUEST_TIMER=2;
 constexpr UINT_PTR DIRTY_TIMER=3;
 constexpr UINT_PTR FIND_WRAP_TIMER=4;
 constexpr UINT_PTR BODY_STYLE_TIMER=5;
 constexpr int SECTION_TAB_WIDTH=62;
-constexpr int REQUEST_TAB_HORIZONTAL_PADDING=16;
+constexpr int REQUEST_TAB_HORIZONTAL_PADDING=13;
+constexpr int REQUEST_TAB_MAX_WIDTH=240;
 constexpr int REQUEST_TAB_HEIGHT=44;
 constexpr int ENTRY_ROW_HEIGHT=32;
 constexpr int ENTRY_HEADER_HEIGHT=32;
@@ -95,7 +96,7 @@ struct FolderPickerContext { const std::vector<FolderChoice>* choices=nullptr;Ap
 MainWindowServices gServices{};
 HINSTANCE gInstance{};
 HMODULE gRichEditModule{};
-HWND gWindow{},gSearchFrame{},gSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gRequestTabScroll{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
+HWND gWindow{},gSearchFrame{},gSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gTabOverflow{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
 HWND gEditorTabs{},gKvList{},gBodyType{},gFormat{},gCompress{},gBody{},gValidation{};
 HWND gSummary{},gResponseTabs{},gResponseBody{},gResponseHeaders{},gResponseFindPanel{},gResponseFindEdit{},gResponseFindPrev{},gResponseFindNext{},gResponseFindClose{},gBodyNone{},gEmptyTitle{},gEmptyHelp{},gEmptyNewRequest{};
 HWND gResponseMode{},gResponseModeDivider{},gResponseFind{},gFindStatus{},gResponseToolbarHot{},gRequestToolbarHot{};
@@ -137,10 +138,9 @@ std::thread gImportWorker;
 std::atomic<HINTERNET> gImportRequest=nullptr;
 bool gSelectingTree=false;
 bool gRebuildingTree=false;
-bool gDraggingRequestTabScroll=false;
-int gRequestTabScrollDragOffset=0;
-int gRequestTabScrollOffset=0,gRequestTabContentWidth=0,gRequestTabViewportX=0,gRequestTabViewportWidth=0;
-bool gEnsureSelectedRequestTabVisible=false;
+int gFirstVisibleTab=0,gPastVisibleTab=0,gTabClipWidth=0;
+int gTabClipStart=0,gRequestTabContentWidth=0,gRequestTabViewportX=0,gRequestTabViewportWidth=0;
+
 bool gResponseFindVisible=false;
 wstring gResponseFindQuery;
 size_t gResponseFindPosition=wstring::npos;
@@ -168,10 +168,13 @@ void moveFocus(HWND from,bool backwards);
 
 void setText(HWND control,const wstring& value){SetWindowTextW(control,value.c_str());}
 wstring textOf(HWND control){int n=GetWindowTextLengthW(control);wstring value((size_t)n+1,L'\0');GetWindowTextW(control,value.data(),n+1);value.resize(n);return value;}
-wstring responseDurationText(const wstring& summary) {
+wstring responseToolbarText(const wstring& summary) {
     auto end=summary.rfind(L" ms");if(end==wstring::npos)return {};
     auto start=end;while(start>0&&summary[start-1]>=L'0'&&summary[start-1]<=L'9')--start;
-    return start<end?L"耗时 "+summary.substr(start,end+3-start):wstring();
+    if(start==end)return {};
+    auto last=summary.find_last_not_of(L" ",start-1);
+    wstring outcome=start>0&&last!=wstring::npos?summary.substr(0,last+1)+L" · ":L"";
+    return outcome+L"耗时 "+summary.substr(start,end+3-start);
 }
 wstring trimWide(wstring value){while(!value.empty()&&iswspace(value.front()))value.erase(value.begin());while(!value.empty()&&iswspace(value.back()))value.pop_back();return value;}
 void applyFont(HWND control,HFONT font=nullptr){SendMessageW(control,WM_SETFONT,(WPARAM)(font?font:gUiFont),TRUE);}
@@ -378,49 +381,58 @@ RECT requestTabCloseRect(HWND tab,int index) {
     return {rect.right-px(27),center-px(11),rect.right-px(5),center+px(11)};
 }
 
+struct MethodStyle { const wchar_t* method; COLORREF text,background; };
+MethodStyle methodStyle(const wstring& method,bool disabled) {
+
+    static constexpr MethodStyle styles[]={
+        {L"GET",RGB(21,128,91),RGB(225,244,235)},
+        {L"POST",RGB(161,98,7),RGB(254,243,210)},
+        {L"PUT",RGB(37,99,235),RGB(231,239,255)},
+        {L"PATCH",RGB(124,58,180),RGB(241,232,252)},
+        {L"DELETE",RGB(190,55,65),RGB(253,233,234)}
+    };
+    if(!disabled)for(const auto& style:styles)if(method==style.method)return style;
+    return {nullptr,COLOR_SECONDARY,RGB(235,238,243)};
+}
+
 void paintRequestTabs(HWND tab,HDC dc) {
-    RECT client{};GetClientRect(tab,&client);FillRect(dc,&client,gSidebarBrush);
+    RECT client{};GetClientRect(tab,&client);FillRect(dc,&client,gWhiteBrush);
     auto oldFont=(HFONT)SelectObject(dc,gUiFont);SetBkMode(dc,TRANSPARENT);
     int selected=TabCtrl_GetCurSel(tab);bool enabled=IsWindowEnabled(tab)!=FALSE;
-    for(int index=0;index<TabCtrl_GetItemCount(tab)&&index<(int)gTabs.size();++index){
+    for(int index=gFirstVisibleTab;index<gPastVisibleTab&&index<(int)gTabs.size();++index){
         RECT card=requestTabCardRect(tab,index);if(!RectVisible(dc,&card))continue;
         bool active=index==selected,hot=enabled&&index==gRequestTabHot;
         if(active){
-            fillRoundRect(dc,card,RGB(255,255,255),9);
-            HBRUSH border=CreateSolidBrush(COLOR_SELECTED_BORDER);
-            HRGN outline=CreateRoundRectRgn(card.left,card.top,card.right,card.bottom,px(9),px(9));
-            FrameRgn(dc,outline,border,px(1),px(1));DeleteObject(outline);DeleteObject(border);
-        }else if(hot)fillRoundRect(dc,card,COLOR_HOVER,9);
+            fillRoundRect(dc,card,RGB(243,247,255),5);
+            RECT accent{card.left,card.top,card.right,card.top+px(2)};
+            FillRect(dc,&accent,gAccentBrush);
+        }else if(hot)fillRoundRect(dc,card,RGB(247,248,250),5);
         else if(index+1!=selected){
             RECT divider{card.right+px(2),card.top+px(9),card.right+px(3),card.bottom-px(9)};
             FillRect(dc,&divider,gBorderBrush);
         }
         const auto& state=*gTabs[(size_t)index];const auto& request=state.caseSnapshot?*state.caseSnapshot:*state.request;
-        COLORREF methodColor=COLOR_SECONDARY,methodBackground=RGB(235,238,243);
-        if(request.method=="GET"){methodColor=RGB(21,128,91);methodBackground=RGB(225,244,235);}
-        else if(request.method=="POST"){methodColor=RGB(161,98,7);methodBackground=RGB(254,243,210);}
-        else if(request.method=="PUT"){methodColor=RGB(37,99,235);methodBackground=RGB(231,239,255);}
-        else if(request.method=="PATCH"){methodColor=RGB(124,58,180);methodBackground=RGB(241,232,252);}
-        else if(request.method=="DELETE"){methodColor=RGB(190,55,65);methodBackground=RGB(253,233,234);}
-        wstring method=toWide(request.method);SelectObject(dc,gTreeMethodFont);SIZE methodSize{};
-        GetTextExtentPoint32W(dc,method.c_str(),(int)method.size(),&methodSize);
-        int center=(card.top+card.bottom)/2;
-        RECT badge{card.left+px(11),center-px(9),card.left+px(23)+methodSize.cx,center+px(9)};
-        fillRoundRect(dc,badge,methodBackground,5);SetTextColor(dc,enabled?methodColor:COLOR_SECONDARY);
-        DrawTextW(dc,method.c_str(),-1,&badge,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
         RECT close=requestTabCloseRect(tab,index);
-        RECT name{badge.right+px(8),card.top,close.left-px(14),card.bottom};
+        int center=(card.top+card.bottom)/2;
+        wstring method=toWide(request.method);
+        SelectObject(dc,gTreeMethodFont);SetTextColor(dc,methodStyle(method,!enabled).text);
+        SIZE methodSize{};GetTextExtentPoint32W(dc,method.c_str(),(int)method.size(),&methodSize);
+        int end=hot?close.left-px(3):card.right-px(8);
+        RECT prefix{card.left+px(8),card.top,std::min<LONG>(card.left+px(8)+methodSize.cx,end),card.bottom};
+        DrawTextW(dc,method.c_str(),-1,&prefix,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        RECT name{prefix.right+px(5),card.top,end-(state.displayedDirty?px(8):0),card.bottom};
         SelectObject(dc,active?gTreeFolderFont:gUiFont);SetTextColor(dc,!enabled?COLOR_SECONDARY:(active?COLOR_PRIMARY:RGB(75,85,99)));
         wstring title=toWide(request.name);DrawTextW(dc,title.c_str(),-1,&name,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
-        // Reserve space for the dirty marker, so editing never shifts the tabs.
-        if(state.displayedDirty){RECT dot{close.left-px(9),center-px(2),close.left-px(5),center+px(2)};fillRoundRect(dc,dot,COLOR_ACCENT,4);}
-        bool closeHot=enabled&&index==gRequestTabCloseHot;
-        if(closeHot)fillRoundRect(dc,close,RGB(222,229,239),6);
-        HPEN pen=CreatePen(PS_SOLID,px(1),closeHot?COLOR_PRIMARY:RGB(148,156,169));auto oldPen=(HPEN)SelectObject(dc,pen);
-        int x=(close.left+close.right)/2,y=(close.top+close.bottom)/2;
-        MoveToEx(dc,x-px(3),y-px(3),nullptr);LineTo(dc,x+px(3)+1,y+px(3)+1);
-        MoveToEx(dc,x+px(3),y-px(3),nullptr);LineTo(dc,x-px(3)-1,y+px(3)+1);
-        SelectObject(dc,oldPen);DeleteObject(pen);
+        if(state.displayedDirty){RECT dot{end-px(4),center-px(2),end,center+px(2)};fillRoundRect(dc,dot,COLOR_ACCENT,4);}
+        if(hot){
+            bool closeHot=enabled&&index==gRequestTabCloseHot;
+            if(closeHot)fillRoundRect(dc,close,RGB(222,229,239),6);
+            HPEN pen=CreatePen(PS_SOLID,px(1),closeHot?COLOR_PRIMARY:RGB(148,156,169));auto oldPen=(HPEN)SelectObject(dc,pen);
+            int x=(close.left+close.right)/2,y=(close.top+close.bottom)/2;
+            MoveToEx(dc,x-px(3),y-px(3),nullptr);LineTo(dc,x+px(3)+1,y+px(3)+1);
+            MoveToEx(dc,x+px(3),y-px(3),nullptr);LineTo(dc,x-px(3)-1,y+px(3)+1);
+            SelectObject(dc,oldPen);DeleteObject(pen);
+        }
         if(enabled&&GetFocus()==tab&&index==TabCtrl_GetCurFocus(tab)&&!(SendMessageW(tab,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){
             RECT focus=card;InflateRect(&focus,-px(3),-px(3));drawFocusRing(dc,focus,7);
         }
@@ -492,7 +504,7 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
     COLORREF background=RGB(255,255,255),border=RGB(218,224,233),foreground=COLOR_PRIMARY;
     if(url)border=inputFocused?COLOR_ACCENT:RGB(211,219,230);
     else if(send){background=disabled?RGB(225,232,244):(pressed?RGB(29,78,216):(hot?RGB(32,87,218):COLOR_ACCENT));border=background;foreground=RGB(255,255,255);}
-    else if(save||more){background=pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(255,255,255));border=hot?RGB(196,205,217):RGB(218,224,233);foreground=hot?COLOR_PRIMARY:COLOR_SECONDARY;}
+    else if(save||more||draw->CtlID==IDC_TAB_OVERFLOW){background=pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(255,255,255));border=hot?RGB(196,205,217):RGB(218,224,233);foreground=hot?COLOR_PRIMARY:COLOR_SECONDARY;}
     else {background=pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(250,251,253));foreground=COLOR_SECONDARY;}
     if(saved)foreground=RGB(21,128,91);if(failed)foreground=RGB(185,55,65);
     if(disabled)foreground=RGB(156,163,175);
@@ -502,7 +514,7 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
         MapWindowPoints(nullptr,draw->hwndItem,(POINT*)&editor,2);
         ExcludeClipRect(dc,editor.left,editor.top,editor.right,editor.bottom);
     }
-    FillRect(dc,&rect,(save||more)?gSidebarBrush:gWhiteBrush);
+    FillRect(dc,&rect,gWhiteBrush);
     RECT outline=rect;
     // Clip adjacent native controls into a continuous rounded field or split button.
     if(save&&(GetWindowLongPtrW(gSaveMore,GWL_STYLE)&WS_VISIBLE))outline.right+=px(10);
@@ -554,6 +566,17 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
     if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){RECT focus=rect;InflateRect(&focus,-px(4),-px(4));drawFocusRing(dc,focus);}
 }
 
+void drawMethodBadge(HDC dc,RECT bounds,const wstring& method,bool disabled) {
+    auto [key,text,background]=methodStyle(method,disabled);
+    int saved=SaveDC(dc);
+    SelectObject(dc,gTreeMethodFont);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,text);
+    int center=(bounds.top+bounds.bottom)/2;
+    bounds.top=center-px(12);bounds.bottom=center+px(12);
+    fillRoundRect(dc,bounds,background,5);
+    DrawTextW(dc,method.c_str(),-1,&bounds,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+    RestoreDC(dc,saved);
+}
+
 void drawButton(const DRAWITEMSTRUCT* draw) {
     if(draw->CtlID==IDC_SUMMARY){
         FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
@@ -563,7 +586,22 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
             else if(tab->statusCode>=200&&tab->statusCode<300)color=RGB(21,128,61);
         }
         int saved=SaveDC(draw->hDC);SelectObject(draw->hDC,gUiFont);SetBkMode(draw->hDC,TRANSPARENT);SetTextColor(draw->hDC,color);
-        RECT rect=draw->rcItem;wstring label=responseDurationText(textOf(draw->hwndItem));
+        RECT rect=draw->rcItem;wstring label=tab&&tab->sending?tab->summary:responseToolbarText(textOf(draw->hwndItem));
+        if(tab&&tab->sending){
+            SIZE size{};GetTextExtentPoint32W(draw->hDC,label.c_str(),(int)label.size(),&size);
+            int x=rect.right-size.cx-px(13),y=(rect.top+rect.bottom)/2;
+            auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-tab->started).count();
+            int frame=(int)((elapsed/100)%8);
+            constexpr POINT offsets[]={{0,-5},{4,-4},{5,0},{4,4},{0,5},{-4,4},{-5,0},{-4,-4}};
+            SelectObject(draw->hDC,GetStockObject(NULL_PEN));
+            SelectObject(draw->hDC,GetStockObject(DC_BRUSH));
+            for(int i=0;i<8;++i){
+                int fade=(frame-i+8)%8;
+                SetDCBrushColor(draw->hDC,RGB(72+20*fade,96+17*fade,140+12*fade));
+                int cx=x+px(offsets[i].x),cy=y+px(offsets[i].y),radius=px(1);
+                Ellipse(draw->hDC,cx-radius,cy-radius,cx+radius+1,cy+radius+1);
+            }
+        }
         DrawTextW(draw->hDC,label.c_str(),-1,&rect,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
         RestoreDC(draw->hDC,saved);return;
     }
@@ -578,7 +616,8 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
             int saved=SaveDC(draw->hDC);SelectObject(draw->hDC,gUiFont);SetBkMode(draw->hDC,TRANSPARENT);
             SetTextColor(draw->hDC,(draw->itemState&ODS_DISABLED)?COLOR_SECONDARY:COLOR_PRIMARY);
             RECT textRect=draw->rcItem;textRect.left+=px(10);textRect.right-=px(8);
-            DrawTextW(draw->hDC,label.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+            if(draw->CtlID==IDC_METHOD)drawMethodBadge(draw->hDC,textRect,label,(draw->itemState&ODS_DISABLED)!=0);
+            else DrawTextW(draw->hDC,label.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
             RestoreDC(draw->hDC,saved);
         }
         if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT)){
@@ -608,7 +647,7 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
         }
         return;
     }
-    if(draw->CtlID==IDC_URL_FRAME||draw->CtlID==IDC_SAVE||draw->CtlID==IDC_SAVE_MORE||draw->CtlID==IDC_SEND||draw->CtlID==IDC_CANCEL){drawRequestControl(draw);return;}
+    if(draw->CtlID==IDC_TAB_OVERFLOW||draw->CtlID==IDC_URL_FRAME||draw->CtlID==IDC_SAVE||draw->CtlID==IDC_SAVE_MORE||draw->CtlID==IDC_SEND||draw->CtlID==IDC_CANCEL){drawRequestControl(draw);return;}
     if(draw->CtlID==IDC_RESPONSE_MODE_DIVIDER){
         FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
         RECT line=draw->rcItem;line.left=(line.left+line.right)/2;line.right=line.left+px(1);line.top+=px(6);line.bottom-=px(6);
@@ -758,7 +797,8 @@ void paintDropdown(HWND h,HDC dc) {
     auto oldFont=(HFONT)SelectObject(dc,gUiFont);SetBkMode(dc,TRANSPARENT);
     SetTextColor(dc,disabled?RGB(156,163,175):COLOR_PRIMARY);
     RECT textRect=rect;textRect.left+=px(12);textRect.right-=px(28);
-    DrawTextW(dc,label.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+    if(h==gMethod)drawMethodBadge(dc,textRect,label,disabled);
+    else DrawTextW(dc,label.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
     SelectObject(dc,oldFont);
     pen=CreatePen(PS_SOLID,std::max(1,px(1)),disabled?RGB(156,163,175):COLOR_SECONDARY);
     oldPen=(HPEN)SelectObject(dc,pen);int cx=rect.right-px(15),cy=(rect.top+rect.bottom)/2;
@@ -1128,123 +1168,232 @@ void refreshRequestTabs() {
     gRequestTabHot=gRequestTabCloseHot=-1;
     SendMessageW(gRequestTabs,WM_SETREDRAW,FALSE,0);
     TabCtrl_DeleteAllItems(gRequestTabs);
-    for(auto& tab:gTabs){auto& shown=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;tab->displayedDirty=tabDirty(*tab);wstring label=toWide(shown.method)+L"  "+toWide(shown.name)+L"     ×";TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label.c_str();TabCtrl_InsertItem(gRequestTabs,TabCtrl_GetItemCount(gRequestTabs),&item);}
+    HDC dc=GetDC(gRequestTabs);
+    auto previousFont=SelectObject(dc,gUiFont);
+    const int titleBudget=px(REQUEST_TAB_MAX_WIDTH)-2*px(REQUEST_TAB_HORIZONTAL_PADDING)-px(8);
+    for(auto& tab:gTabs){
+        const auto& shown=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
+        tab->displayedDirty=tabDirty(*tab);
+        wstring label=toWide(shown.method)+L" "+toWide(shown.name);
+        int fit=0;SIZE extent{};
+        // The native label sizes the hit target. The painter ellipsizes the original title.
+        if(GetTextExtentExPointW(dc,label.c_str(),(int)label.size(),titleBudget,&fit,nullptr,&extent))
+            label.resize(fit);
+        TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=label.data();
+        TabCtrl_InsertItem(gRequestTabs,TabCtrl_GetItemCount(gRequestTabs),&item);
+    }
+    SelectObject(dc,previousFont);ReleaseDC(gRequestTabs,dc);
     if(gSelectedTab>=0)TabCtrl_SetCurSel(gRequestTabs,gSelectedTab);
     SendMessageW(gRequestTabs,WM_SETREDRAW,TRUE,0);InvalidateRect(gRequestTabs,nullptr,FALSE);
-    gEnsureSelectedRequestTabVisible=true;
-    PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);
+
+    PostMessageW(gWindow,WM_UPDATE_TAB_OVERFLOW,0,0);
 }
 
-RECT requestTabScrollThumbRect(HWND scroll);
+void openRequest(ApiRequest* request,ApiRequestCase* requestCase);
 void positionRequestTabs() {
     if(!gRequestTabs||gRequestTabViewportWidth<=0)return;
-    gRequestTabScrollOffset=std::clamp(gRequestTabScrollOffset,0,std::max(0,gRequestTabContentWidth-gRequestTabViewportWidth));
-    // Moving and repainting are coordinated by setRequestTabScrollOffset().
-    SetWindowPos(gRequestTabs,nullptr,gRequestTabViewportX-gRequestTabScrollOffset,0,gRequestTabContentWidth,px(REQUEST_TAB_HEIGHT),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOCOPYBITS);
-    HRGN clip=CreateRectRgn(gRequestTabScrollOffset,0,gRequestTabScrollOffset+gRequestTabViewportWidth,px(REQUEST_TAB_HEIGHT));if(!SetWindowRgn(gRequestTabs,clip,FALSE))DeleteObject(clip);
+
+
+    SetWindowPos(gRequestTabs,nullptr,gRequestTabViewportX-gTabClipStart,0,gRequestTabContentWidth,px(REQUEST_TAB_HEIGHT),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);
+    HRGN clip=CreateRectRgn(gTabClipStart,0,gTabClipStart+std::min(gTabClipWidth,gRequestTabViewportWidth),px(REQUEST_TAB_HEIGHT));if(!SetWindowRgn(gRequestTabs,clip,TRUE))DeleteObject(clip);
 }
-void updateRequestTabScroll() {
-    if(!gRequestTabs||!gRequestTabScroll)return;
+void updateTabOverflow() {
+    if(!gRequestTabs||!gTabOverflow)return;
     HDC dc=GetDC(gRequestTabs);HFONT oldFont=dc?(HFONT)SelectObject(dc,gUiFont):nullptr;int contentWidth=0;
-    for(int index=0;index<TabCtrl_GetItemCount(gRequestTabs);++index){TCITEMW item{};wchar_t text[512]{};item.mask=TCIF_TEXT;item.pszText=text;item.cchTextMax=512;TabCtrl_GetItem(gRequestTabs,index,&item);SIZE size{};if(dc)GetTextExtentPoint32W(dc,text,(int)wcslen(text),&size);contentWidth+=size.cx+px(48);}
+    for(int index=0;index<TabCtrl_GetItemCount(gRequestTabs);++index){TCITEMW item{};wchar_t text[512]{};item.mask=TCIF_TEXT;item.pszText=text;item.cchTextMax=512;TabCtrl_GetItem(gRequestTabs,index,&item);SIZE size{};if(dc)GetTextExtentPoint32W(dc,text,(int)wcslen(text),&size);contentWidth+=size.cx+px(2*REQUEST_TAB_HORIZONTAL_PADDING+8);}
     if(dc){SelectObject(dc,oldFont);ReleaseDC(gRequestTabs,dc);}
-    gRequestTabContentWidth=std::max(gRequestTabViewportWidth,contentWidth+px(4));
+    int count=TabCtrl_GetItemCount(gRequestTabs);
+    const bool crowded=count>0&&contentWidth>gRequestTabViewportWidth;
+    int available=gRequestTabViewportWidth;
+    int slots=std::max(1,available/px(150));
+    bool overflow=crowded&&count>slots;
+    if(overflow)available-=px(36);
+    slots=std::min(count,std::max(1,available/px(150)));
+    if(crowded&&slots>0){
+        // Fit whole tabs across the row, including the last page of the strip.
+        slots=std::max(slots,(available+px(REQUEST_TAB_MAX_WIDTH)-1)/px(REQUEST_TAB_MAX_WIDTH));
+        slots=std::min(count,slots);
+    }
+    LONG_PTR style=GetWindowLongPtrW(gRequestTabs,GWL_STYLE);
+    if(crowded!=bool(style&TCS_FIXEDWIDTH))
+        SetWindowLongPtrW(gRequestTabs,GWL_STYLE,crowded?style|TCS_FIXEDWIDTH:style&~TCS_FIXEDWIDTH);
+    int tabWidth=crowded?std::min(px(REQUEST_TAB_MAX_WIDTH),available/slots):0;
+    SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(tabWidth,px(REQUEST_TAB_HEIGHT-4)));
+    gRequestTabContentWidth=std::max(gRequestTabViewportWidth,(crowded?tabWidth*count:contentWidth)+px(12));
     positionRequestTabs();
-    int count=TabCtrl_GetItemCount(gRequestTabs);if(count>0){RECT last{};if(TabCtrl_GetItemRect(gRequestTabs,count-1,&last)){gRequestTabContentWidth=std::max(gRequestTabViewportWidth,(int)last.right+px(4));positionRequestTabs();}}
     if(HWND upDown=FindWindowExW(gRequestTabs,nullptr,UPDOWN_CLASSW,nullptr))ShowWindow(upDown,SW_HIDE);
-    if(gEnsureSelectedRequestTabVisible&&gSelectedTab>=0){
-        RECT selected{};TabCtrl_GetItemRect(gRequestTabs,gSelectedTab,&selected);
-        if(selected.left<gRequestTabScrollOffset)gRequestTabScrollOffset=selected.left;else if(selected.right>gRequestTabScrollOffset+gRequestTabViewportWidth)gRequestTabScrollOffset=selected.right-gRequestTabViewportWidth;
-        gEnsureSelectedRequestTabVisible=false;
+    auto itemRect=[](int index){RECT r{};TabCtrl_GetItemRect(gRequestTabs,index,&r);return r;};
+    gFirstVisibleTab=std::clamp(gFirstVisibleTab,0,std::max(0,count-1));
+    if(!overflow)gFirstVisibleTab=0;
+    else if(gSelectedTab>=0){
+        gFirstVisibleTab=std::min(gFirstVisibleTab,gSelectedTab);
+        RECT selected=itemRect(gSelectedTab);
+        while(gFirstVisibleTab<gSelectedTab&&selected.right-itemRect(gFirstVisibleTab).left>available)
+            ++gFirstVisibleTab;
+        while(gFirstVisibleTab>0&&itemRect(count-1).right-itemRect(gFirstVisibleTab-1).left<=available)
+            --gFirstVisibleTab;
     }
-    bool overflow=gRequestTabContentWidth>gRequestTabViewportWidth;
-    ShowWindow(gRequestTabScroll,overflow?SW_SHOW:SW_HIDE);
-    if(!overflow)gRequestTabScrollOffset=0;
+    gTabClipStart=count?itemRect(gFirstVisibleTab).left:0;
+    gPastVisibleTab=gFirstVisibleTab;
+    gTabClipWidth=0;
+    while(gPastVisibleTab<count){
+        int width=itemRect(gPastVisibleTab).right-gTabClipStart;
+        if(width>available)break;
+        gTabClipWidth=width;
+        ++gPastVisibleTab;
+    }
+    if(overflow){
+        SetWindowPos(gTabOverflow,nullptr,gRequestTabViewportX+gRequestTabViewportWidth-px(32),px(8),
+                     px(32),px(28),SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+    ShowWindow(gTabOverflow,overflow?SW_SHOWNA:SW_HIDE);
     positionRequestTabs();
+    RECT band{gRequestTabViewportX,0,gRequestTabViewportX+gRequestTabViewportWidth,px(REQUEST_TAB_HEIGHT)};
+    InvalidateRect(gWindow,&band,TRUE);
     InvalidateRect(gRequestTabs,nullptr,FALSE);
-    if(!overflow)return;
-    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};
-    info.nMin=0;info.nMax=std::max(0,gRequestTabContentWidth-1);
-    info.nPage=(UINT)gRequestTabViewportWidth;info.nPos=gRequestTabScrollOffset;
-    SetScrollInfo(gRequestTabScroll,SB_CTL,&info,TRUE);
 }
-void setRequestTabScrollOffset(int position) {
-    SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(gRequestTabScroll,SB_CTL,&info);
-    int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);position=std::clamp(position,info.nMin,maximum);
-    if(position==gRequestTabScrollOffset)return;
-    gRequestTabScrollOffset=position;gRequestTabHot=gRequestTabCloseHot=-1;positionRequestTabs();info.fMask=SIF_POS;info.nPos=position;SetScrollInfo(gRequestTabScroll,SB_CTL,&info,FALSE);
-    InvalidateRect(gRequestTabScroll,nullptr,FALSE);UpdateWindow(gRequestTabScroll);
-    RECT visible{gRequestTabScrollOffset,0,gRequestTabScrollOffset+gRequestTabViewportWidth,px(REQUEST_TAB_HEIGHT)};
-    RedrawWindow(gRequestTabs,&visible,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);
+
+HWND gOverflowList{};
+std::vector<std::shared_ptr<TabState>> gOverflowRows;
+std::shared_ptr<TabState> gMenuContext;
+constexpr int OVERFLOW_CLOSE_WIDTH=34;
+void showTabOverflow();
+
+bool contextActionEnabled(int row) {
+    auto it=std::find(gTabs.begin(),gTabs.end(),gMenuContext);
+    if(it==gTabs.end())return false;
+    if(row==1)return gTabs.size()>1;
+    if(row==2)return it!=gTabs.begin();
+    if(row==3)return it+1!=gTabs.end();
+    return true;
 }
-void scrollRequestTabs(WPARAM value) {
-    SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(gRequestTabScroll,SB_CTL,&info);
-    int position=gRequestTabScrollOffset;
-    switch(LOWORD(value)){
-    case SB_LINELEFT:position-=px(24);break;case SB_LINERIGHT:position+=px(24);break;
-    case SB_PAGELEFT:position-=(int)info.nPage;break;case SB_PAGERIGHT:position+=(int)info.nPage;break;
-    case SB_THUMBPOSITION:position=(int)HIWORD(value);break;
-    case SB_THUMBTRACK:position=info.nTrackPos;break;default:return;
+void drawOverflowRow(const DRAWITEMSTRUCT& draw) {
+    if(draw.itemID==(UINT)-1)return;
+    RECT row=draw.rcItem;
+    int width=row.right-row.left,height=row.bottom-row.top;
+    HDC dc=CreateCompatibleDC(draw.hDC);
+    HBITMAP bitmap=CreateCompatibleBitmap(draw.hDC,width,height);
+    auto previous=SelectObject(dc,bitmap);
+    int saved=SaveDC(dc);SetViewportOrgEx(dc,-row.left,-row.top,nullptr);
+    FillRect(dc,&row,gWhiteBrush);SetBkMode(dc,TRANSPARENT);
+    if((draw.itemState&ODS_SELECTED)&&(!gMenuContext||contextActionEnabled(draw.itemID))){
+        RECT hover=row;InflateRect(&hover,-px(4),-px(2));fillRoundRect(dc,hover,COLOR_HOVER,6);
     }
-    setRequestTabScrollOffset(position);
-}
-
-RECT requestTabScrollThumbRect(HWND scroll) {
-    RECT client{};GetClientRect(scroll,&client);
-    SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(scroll,SB_CTL,&info);
-    int width=std::max(0,(int)client.right-(int)client.left);
-    int range=std::max(1,info.nMax-info.nMin+1);
-    int minimumThumbWidth=std::min(px(28),width);
-    int thumbWidth=std::clamp(MulDiv(width,(int)info.nPage,range),minimumThumbWidth,width);
-    int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);
-    int travel=std::max(0,width-thumbWidth);
-    int positionRange=std::max(1,maximum-info.nMin);
-    int left=client.left+(maximum==info.nMin?0:MulDiv(info.nPos-info.nMin,travel,positionRange));
-    int thumbHeight=std::min(px(5),std::max(1,(int)client.bottom-(int)client.top));
-    int top=client.top+((int)client.bottom-(int)client.top-thumbHeight)/2;
-    return {left,top,left+thumbWidth,top+thumbHeight};
-}
-
-void setRequestTabScrollFromThumb(HWND scroll,int thumbLeft) {
-    RECT client{};GetClientRect(scroll,&client);
-    SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(scroll,SB_CTL,&info);
-    RECT thumb=requestTabScrollThumbRect(scroll);
-    int travel=std::max(0,(int)client.right-(int)client.left-((int)thumb.right-(int)thumb.left));
-    int maximum=std::max(info.nMin,info.nMax-(int)info.nPage+1);
-    int position=travel==0?info.nMin:info.nMin+MulDiv(std::clamp(thumbLeft,(int)client.left,(int)client.left+travel)-(int)client.left,maximum-info.nMin,travel);
-    setRequestTabScrollOffset(position);
-}
-
-LRESULT CALLBACK requestTabScrollProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
-    switch(message){
-    case WM_ERASEBKGND:return 1;
-    case WM_PAINT:{
-        PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);RECT client{};GetClientRect(h,&client);
-        int width=client.right-client.left,height=client.bottom-client.top;
-        if(width>0&&height>0){
-            HDC buffer=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);HGDIOBJ oldBitmap=SelectObject(buffer,bitmap);
-            FillRect(buffer,&client,gSidebarBrush);RECT thumb=requestTabScrollThumbRect(h);fillRoundRect(buffer,thumb,RGB(156,163,175),px(4));
-            BitBlt(dc,paint.rcPaint.left,paint.rcPaint.top,paint.rcPaint.right-paint.rcPaint.left,paint.rcPaint.bottom-paint.rcPaint.top,buffer,paint.rcPaint.left,paint.rcPaint.top,SRCCOPY);
-            SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);
-        }
-        EndPaint(h,&paint);return 0;
+    RECT label=row;label.left+=px(14);label.right-=px(12);
+    if(draw.itemID<gOverflowRows.size()){
+        const auto& tab=*gOverflowRows[draw.itemID];
+        const auto& request=tab.caseSnapshot?*tab.caseSnapshot:*tab.request;
+        auto method=toWide(request.method);
+        SelectObject(dc,gTreeMethodFont);SetTextColor(dc,methodStyle(method,false).text);
+        SIZE extent{};GetTextExtentPoint32W(dc,method.c_str(),(int)method.size(),&extent);
+        DrawTextW(dc,method.c_str(),-1,&label,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        label.left+=extent.cx+px(7);label.right=row.right-px(OVERFLOW_CLOSE_WIDTH);
+        SelectObject(dc,gUiFont);SetTextColor(dc,COLOR_PRIMARY);
+        DrawTextW(dc,toWide(request.name).c_str(),-1,&label,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+        RECT cross=row;cross.left=label.right;SetTextColor(dc,COLOR_SECONDARY);
+        DrawTextW(dc,L"×",1,&cross,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
+    }else{
+        if(!gMenuContext&&draw.itemID==gOverflowRows.size()){RECT line=row;line.bottom=line.top+1;FillRect(dc,&line,gBorderBrush);}
+        SelectObject(dc,gUiFont);SetTextColor(dc,gMenuContext&&!contextActionEnabled(draw.itemID)?RGB(155,163,175):COLOR_SECONDARY);
+        wchar_t text[32]{};SendMessageW(draw.hwndItem,LB_GETTEXT,draw.itemID,(LPARAM)text);
+        DrawTextW(dc,text,-1,&label,DT_SINGLELINE|DT_VCENTER);
     }
-    case WM_LBUTTONDOWN:{
-        SetFocus(gRequestTabs);RECT thumb=requestTabScrollThumbRect(h);int x=(short)LOWORD(l);
-        if(x>=thumb.left&&x<thumb.right){gDraggingRequestTabScroll=true;gRequestTabScrollDragOffset=x-thumb.left;SetCapture(h);}
-        else setRequestTabScrollFromThumb(h,x-(thumb.right-thumb.left)/2);
+    BitBlt(draw.hDC,row.left,row.top,width,height,dc,row.left,row.top,SRCCOPY);
+    RestoreDC(dc,saved);SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);
+}
+void activateOverflowRow(HWND h,int row,bool close) {
+    if(row<0||row>=SendMessageW(h,LB_GETCOUNT,0,0))return;
+    if(gMenuContext){
+        if(!contextActionEnabled(row))return;
+        int index=(int)(std::find(gTabs.begin(),gTabs.end(),gMenuContext)-gTabs.begin());
+        constexpr int commands[]={IDM_TAB_CLOSE_ALL,IDM_TAB_CLOSE_OTHERS,IDM_TAB_CLOSE_LEFT,IDM_TAB_CLOSE_RIGHT};
+        DestroyWindow(h);closeTabRange(index,commands[row]);SetFocus(gRequestTabs);return;
+    }
+    int action=row-(int)gOverflowRows.size();
+    auto target=action<0?gOverflowRows[row]:nullptr;
+    DestroyWindow(h);
+    if(target){
+        auto it=std::find(gTabs.begin(),gTabs.end(),target);
+        if(it==gTabs.end())return;
+        if(close)closeTab((int)(it-gTabs.begin()));
+        else openRequest(target->request,target->requestCase);
+    }else if(action==0)closeTab(gSelectedTab);
+    else closeTabRange(gSelectedTab,action==1?IDM_TAB_CLOSE_OTHERS:IDM_TAB_CLOSE_ALL);
+    SetFocus(gRequestTabs);
+}
+LRESULT CALLBACK overflowListProc(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR){
+    if(msg==WM_TIMER&&w==1&&!gMenuContext){
+        POINT cursor{};RECT button{},list{};
+        GetWindowRect(gTabOverflow,&button);GetWindowRect(h,&list);
+        if(GetCursorPos(&cursor)&&!PtInRect(&button,cursor)&&!PtInRect(&list,cursor))DestroyWindow(h);
         return 0;
     }
-    case WM_MOUSEMOVE:
-        if(gDraggingRequestTabScroll&&(w&MK_LBUTTON)){setRequestTabScrollFromThumb(h,(short)LOWORD(l)-gRequestTabScrollDragOffset);return 0;}
-        break;
-    case WM_LBUTTONUP:
-        if(gDraggingRequestTabScroll){gDraggingRequestTabScroll=false;ReleaseCapture();RedrawWindow(gRequestTabs,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);return 0;}
-        break;
-    case WM_CAPTURECHANGED:
-        if(gDraggingRequestTabScroll){gDraggingRequestTabScroll=false;RedrawWindow(gRequestTabs,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);}
-        break;
+    if(msg==WM_KILLFOCUS){PostMessageW(h,WM_CLOSE,0,0);return 0;}
+    if(msg==WM_KEYDOWN){
+        if(w==VK_ESCAPE){HWND owner=gMenuContext?gRequestTabs:gTabOverflow;DestroyWindow(h);SetFocus(owner);return 0;}
+        if(w==VK_RETURN||w==VK_DELETE){
+            int row=(int)SendMessageW(h,LB_GETCURSEL,0,0);
+            if(w==VK_RETURN||row<(int)gOverflowRows.size())activateOverflowRow(h,row,w==VK_DELETE);
+            return 0;
+        }
     }
+    if(msg==WM_MOUSEMOVE||msg==WM_LBUTTONUP){
+        auto hit=SendMessageW(h,LB_ITEMFROMPOINT,0,l);
+        if(!HIWORD(hit)){
+            int row=LOWORD(hit);
+            if(msg==WM_MOUSEMOVE){
+                if(row!=(int)SendMessageW(h,LB_GETCURSEL,0,0))SendMessageW(h,LB_SETCURSEL,row,0);
+                return 0;
+            }
+            else{RECT r{};GetClientRect(h,&r);ReleaseCapture();activateOverflowRow(h,row,(short)LOWORD(l)>=r.right-px(OVERFLOW_CLOSE_WIDTH));return 0;}
+        }
+    }
+    if(msg==WM_NCDESTROY){gOverflowList=nullptr;gMenuContext.reset();gOverflowRows.clear();RemoveWindowSubclass(h,overflowListProc,id);}
+    return DefSubclassProc(h,msg,w,l);
+}
+void showTabList(RECT anchor,int context=-1) {
+    if(gOverflowList){
+        if(context<0)return;
+        DestroyWindow(gOverflowList);
+    }
+    if(context>=0)gMenuContext=gTabs[context];
+    else{
+        if(!IsWindowVisible(gTabOverflow))return;
+        for(int i=0;i<(int)gTabs.size();++i)
+            if(i<gFirstVisibleTab||i>=gPastVisibleTab)gOverflowRows.push_back(gTabs[i]);
+        if(gOverflowRows.empty())return;
+    }
+    MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromWindow(gWindow,MONITOR_DEFAULTTONEAREST),&monitor);
+    RECT work=monitor.rcWork;int rowHeight=px(34);
+    int width=std::min<int>(px(context>=0?184:330),work.right-work.left);
+    int space=std::max(anchor.top-work.top,work.bottom-anchor.bottom);
+    int height=std::min<int>((context>=0?4:(int)gOverflowRows.size()+3)*rowHeight+2,space);
+    int x=std::clamp<int>(context>=0?anchor.left:anchor.right-width,work.left,work.right-width);
+    int y=anchor.bottom+height<=work.bottom?anchor.bottom:anchor.top-height;
+    HWND list=CreateWindowExW(WS_EX_TOOLWINDOW,L"LISTBOX",context>=0?L"标签操作":L"隐藏的接口标签",WS_POPUP|WS_BORDER|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS,
+        x,y,width,height,gWindow,nullptr,gInstance,nullptr);
+    if(!list){gMenuContext.reset();gOverflowRows.clear();return;}
+    gOverflowList=list;SetWindowSubclass(list,overflowListProc,1,0);applyFont(list);
+    SendMessageW(list,LB_SETITEMHEIGHT,0,rowHeight);
+    for(const auto& tab:gOverflowRows){
+        const auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
+        auto label=toWide(r.method+" "+r.name);SendMessageW(list,LB_ADDSTRING,0,(LPARAM)label.c_str());
+    }
+    if(context>=0){
+        for(const auto* action:{L"关闭全部标签页",L"关闭其他标签页",L"关闭左侧标签页",L"关闭右侧标签页"})
+            SendMessageW(list,LB_ADDSTRING,0,(LPARAM)action);
+    }else for(const auto* action:{L"关闭当前标签页",L"关闭其他标签页",L"关闭全部标签页"})
+        SendMessageW(list,LB_ADDSTRING,0,(LPARAM)action);
+    SetWindowRgn(list,CreateRoundRectRgn(0,0,width+1,height+1,px(10),px(10)),TRUE);
+    ShowWindow(list,SW_SHOW);SetFocus(list);
+}
+void showTabOverflow(){RECT r{};GetWindowRect(gTabOverflow,&r);showTabList(r);}
+LRESULT CALLBACK tabOverflowProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR){
+    if(message==WM_MOUSEMOVE&&!gMenuContext){
+        showTabOverflow();
+        if(gOverflowList)SetTimer(gOverflowList,1,32,nullptr);
+    }
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(h,tabOverflowProc,id);
     return DefSubclassProc(h,message,w,l);
 }
 
@@ -1274,7 +1423,7 @@ LRESULT CALLBACK requestTabsProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR 
     if(message==WM_MOUSELEAVE||message==WM_ENABLE){gRequestTabHot=gRequestTabCloseHot=-1;InvalidateRect(h,nullptr,FALSE);}
     if(message==WM_LBUTTONDOWN){
         TCHITTESTINFO hit{};hit.pt={(short)LOWORD(l),(short)HIWORD(l)};int index=TabCtrl_HitTest(h,&hit);
-        if(index>=0){RECT close=requestTabCloseRect(h,index);if(PtInRect(&close,hit.pt)){closeTab(index);return 0;}}
+        if(index>=0&&index==gRequestTabHot){RECT close=requestTabCloseRect(h,index);if(PtInRect(&close,hit.pt)){closeTab(index);return 0;}}
     }
     if(message==WM_CONTEXTMENU){
         POINT screen{(short)LOWORD(l),(short)HIWORD(l)},client=screen;
@@ -1284,13 +1433,7 @@ LRESULT CALLBACK requestTabsProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR 
         }else{
             ScreenToClient(h,&client);TCHITTESTINFO hit{};hit.pt=client;index=TabCtrl_HitTest(h,&hit);if(index<0)return 0;
         }
-        HMENU menu=CreatePopupMenu();int count=(int)gTabs.size();
-        AppendMenuW(menu,MF_STRING,IDM_TAB_CLOSE_ALL,L"关闭全部");
-        AppendMenuW(menu,count>1?MF_STRING:MF_GRAYED,IDM_TAB_CLOSE_OTHERS,L"关闭其他");
-        AppendMenuW(menu,index>0?MF_STRING:MF_GRAYED,IDM_TAB_CLOSE_LEFT,L"关闭左侧");
-        AppendMenuW(menu,index+1<count?MF_STRING:MF_GRAYED,IDM_TAB_CLOSE_RIGHT,L"关闭右侧");
-        int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,screen.x,screen.y,0,gWindow,nullptr);DestroyMenu(menu);
-        if(command)closeTabRange(index,command);return 0;
+        showTabList({screen.x,screen.y,screen.x,screen.y},index);return 0;
     }
     if(message==WM_NCDESTROY){gRequestTabHot=gRequestTabCloseHot=-1;RemoveWindowSubclass(h,requestTabsProc,id);}
     LRESULT result=DefSubclassProc(h,message,w,l);
@@ -1463,7 +1606,13 @@ void acceptEditedUrl(const wstring& visible,ApiRequest& request) {
         request.url=std::move(parsed.address);
         request.query=std::move(merged);
     }
-    if(gEditorPage==0&&!sameEntries(readEntryList(gKvList),request.query))fillEntryList(gKvList,request.query);
+    if(gEditorPage==0&&!sameEntries(readEntryList(gKvList),request.query)){
+        bool wasEmpty=ListView_GetItemCount(gKvList)<=1;
+        fillEntryList(gKvList,request.query);
+        if(wasEmpty!=(ListView_GetItemCount(gKvList)<=1)&&!gData.requestPanelHeightManual){
+            RECT client{};GetClientRect(gWindow,&client);layout(client.right,client.bottom);
+        }
+    }
 }
 
 void saveEditor(bool updateBodyType=true) {
@@ -1476,7 +1625,9 @@ void saveEditor(bool updateBodyType=true) {
             size_t queryAt=r.url.find('?'),fragmentAt=r.url.find('#');
             r.url=r.url.substr(0,queryAt)+(fragmentAt==string::npos?string():r.url.substr(fragmentAt));
         }
+        bool heightChanged=r.query.empty()!=entries.empty()&&!gData.requestPanelHeightManual;
         r.query=std::move(entries);showEffectiveRequestUrl(r);
+        if(heightChanged){RECT client{};GetClientRect(gWindow,&client);layout(client.right,client.bottom);}
     }}
     else if(gEditorPage==1)r.headers=readEntryList(gKvList);else if(gEditorPage==2&&(r.bodyType=="Form URL Encoded"||r.bodyType=="Multipart Form Data"))r.formFields=readEntryList(gKvList);
     if(previousMethod!=r.method)refreshRequestTabs();
@@ -1626,14 +1777,14 @@ void updateResponseSummary() {
     auto tab=selectedTab();wstring details;
     if(tab){
         const wstring& summary=tab->summary;auto end=summary.rfind(L" ms");
-        if(end!=wstring::npos){
+        if(tab->sending)details=summary;
+        else if(end!=wstring::npos){
             details=summary.substr(0,end+3);
             if(summary.find(L"响应已截断",end)!=wstring::npos)details+=L" · 响应已截断";
         }
         if(tab->oldResponse)details+=L" · 正在显示上次响应";
     }
-    // Keep the outcome available to screen readers and the tooltip; paint only time.
-    setText(gSummary,details);setVisible(gSummary,!responseDurationText(details).empty());
+    setText(gSummary,details);setVisible(gSummary,(tab&&tab->sending)||!responseToolbarText(details).empty());
     TOOLINFOW tip{sizeof(tip)};tip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tip.hwnd=gWindow;tip.uId=(UINT_PTR)gSummary;
     tip.lpszText=(LPWSTR)details.c_str();SendMessageW(gSaveTooltip,TTM_UPDATETIPTEXTW,0,(LPARAM)&tip);
     InvalidateRect(gSummary,nullptr,FALSE);
@@ -2362,7 +2513,7 @@ void sendCurrent() {
         setValidationText(error);SetFocus(invalidControl);return;
     }
     if(tab->worker.joinable())tab->worker.join();
-    tab->cancel=false;tab->sending=true;tab->workerFinished=false;tab->started=std::chrono::steady_clock::now();tab->summary=L"请求中 · 0 ms";
+    tab->cancel=false;tab->sending=true;tab->workerFinished=false;tab->started=std::chrono::steady_clock::now();tab->summary=L"请求中";
     tab->validation.clear();tab->oldResponse=!tab->responseSummary.empty();
     setValidationText(L"");setVisible(gSend,false);setVisible(gCancel,true);EnableWindow(gCancel,TRUE);setText(gCancel,L"取消");showResponsePage();
     SetTimer(gWindow,REQUEST_TIMER,100,nullptr);
@@ -2374,12 +2525,12 @@ void sendCurrent() {
 }
 void cancelCurrent() {
     auto tab=selectedTab();if(!tab||!tab->sending||tab->cancel)return;
-    tab->cancelNow();auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-tab->started).count();
-    tab->summary=L"正在取消 · "+std::to_wstring(elapsed)+L" ms";setText(gCancel,L"正在取消");EnableWindow(gCancel,FALSE);
+    tab->cancelNow();
+    tab->summary=L"正在取消";setText(gCancel,L"正在取消");EnableWindow(gCancel,FALSE);
     updateResponseSummary();
 }
 void moveFocus(HWND from,bool backwards) {
-    std::vector<HWND> order={gSearch,gAddFolder,gTree,gRequestTabs,gSave,gSaveMore,gMethod,gUrl,gSend,gCancel,
+    std::vector<HWND> order={gSearch,gAddFolder,gTree,gRequestTabs,gTabOverflow,gSave,gSaveMore,gMethod,gUrl,gSend,gCancel,
         gEditorTabs,gBodyType,gFormat,gCompress,gKvList,gBody,gResponseTabs,gResponseMode,gResponseFind,
         gResponseFindEdit,gResponseFindPrev,gResponseFindNext,gResponseFindClose,gResponseBody,gResponseHeaders};
     order.erase(std::remove_if(order.begin(),order.end(),[](HWND control){return !control||!IsWindowVisible(control)||!IsWindowEnabled(control);}),order.end());
@@ -2484,7 +2635,7 @@ void createControls() {
     // Overlapping sibling windows can briefly expose one another while the tab
     // window moves on every drag frame, which makes the thumb appear to flash.
     gRequestTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE,IDC_REQUEST_TABS);SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(REQUEST_TAB_HEIGHT-4)));SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(REQUEST_TAB_HORIZONTAL_PADDING),px(4)));SetWindowSubclass(gRequestTabs,requestTabsProc,3,0);
-    gRequestTabScroll=child(L"SCROLLBAR",L"",SBS_HORZ,IDC_REQUEST_TAB_SCROLL);SetWindowSubclass(gRequestTabScroll,requestTabScrollProc,8,0);ShowWindow(gRequestTabScroll,SW_HIDE);
+    gTabOverflow=child(L"BUTTON",L"···",BS_OWNERDRAW,IDC_TAB_OVERFLOW);SetWindowSubclass(gTabOverflow,requestToolbarButtonProc,19,0);SetWindowSubclass(gTabOverflow,tabOverflowProc,8,0);ShowWindow(gTabOverflow,SW_HIDE);
     gMethod=child(L"COMBOBOX",L"",CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS,IDC_METHOD);
     for(auto method:{L"GET",L"POST",L"PUT",L"PATCH",L"DELETE",L"HEAD",L"OPTIONS"})SendMessageW(gMethod,CB_ADDSTRING,0,(LPARAM)method);
     SendMessageW(gMethod,CB_SETCURSEL,0,0);SendMessageW(gMethod,CB_SETITEMHEIGHT,(WPARAM)-1,px(35));SendMessageW(gMethod,CB_SETITEMHEIGHT,0,px(26));
@@ -2544,6 +2695,12 @@ void createControls() {
     gEmptyNewRequest=child(L"BUTTON",L"新建接口",BS_OWNERDRAW,IDC_EMPTY_NEW_REQUEST);
 }
 
+int editorPanelHeight(int height) {
+    int preferred=gData.requestPanelHeight;
+    if(!gData.requestPanelHeightManual&&gEditorPage==0&&ListView_GetItemCount(gKvList)<=1)
+        preferred=180;
+    return std::clamp(preferred,180,std::max(200,height-350));
+}
 void layout(int width,int height) {
     width=dip(width);height=dip(height);
     static int previousWidth=-1;
@@ -2574,14 +2731,14 @@ void layout(int width,int height) {
     move(gSearchFrame,12,12,sidebar-64,32);move(gSearch,16,16,sidebar-72,24);move(gAddFolder,sidebar-44,12,32,32);move(gSidebarDivider,0,55,sidebar,1);move(gTree,8,64,sidebar-16,height-72);
     constexpr int requestRowTop=REQUEST_BAR_TOP;constexpr int rowHeight=REQUEST_BAR_HEIGHT;constexpr int commandGap=10;constexpr int saveWidth=88;constexpr int saveMoreWidth=24;constexpr int sendWidth=96;
     // Workspace actions stay fixed while request tabs scroll inside their own viewport.
-    int tabViewportWidth=contentW-saveWidth-saveMoreWidth-12;
+    int tabViewportWidth=contentW-saveWidth-saveMoreWidth-4;
     gRequestTabViewportX=px(contentX);gRequestTabViewportWidth=px(tabViewportWidth);
     gRequestTabContentWidth=std::max(gRequestTabContentWidth,gRequestTabViewportWidth);
-    move(gRequestTabs,contentX-dip(gRequestTabScrollOffset),0,dip(gRequestTabContentWidth),REQUEST_TAB_HEIGHT);move(gRequestTabScroll,contentX,REQUEST_TAB_HEIGHT,tabViewportWidth,8);
+    move(gRequestTabs,contentX-dip(gTabClipStart),0,dip(gRequestTabContentWidth),REQUEST_TAB_HEIGHT);
     int sendX=contentX+contentW-sendWidth;int saveMoreX=contentX+contentW-saveMoreWidth;int saveX=saveMoreX-saveWidth;int urlX=contentX+116;int urlWidth=sendX-commandGap-urlX;
     move(gMethod,contentX,requestRowTop,106,260);move(gUrlFrame,urlX,requestRowTop,urlWidth,rowHeight);move(gUrl,urlX+12,requestRowTop+6,urlWidth-24,rowHeight-12);
     move(gSend,sendX,requestRowTop,sendWidth,rowHeight);move(gCancel,sendX,requestRowTop,sendWidth,rowHeight);
-    int editorTop=REQUEST_EDITOR_TOP;int editorHeight=std::clamp(gData.requestPanelHeight,200,std::max(200,height-350));move(gEditorTabs,contentX,editorTop,TabCtrl_GetItemCount(gEditorTabs)*SECTION_TAB_WIDTH+8,36);
+    int editorTop=REQUEST_EDITOR_TOP;int editorHeight=editorPanelHeight(height);move(gEditorTabs,contentX,editorTop,TabCtrl_GetItemCount(gEditorTabs)*SECTION_TAB_WIDTH+8,36);
     move(gSave,saveX,(REQUEST_TAB_HEIGHT-28)/2,saveWidth,28);move(gSaveMore,saveMoreX,(REQUEST_TAB_HEIGHT-28)/2,saveMoreWidth,28);
     const int bodyToolbarTop=editorTop+39;
     // A native drop-down list uses its font-defined closed height and ignores
@@ -2597,12 +2754,12 @@ void layout(int width,int height) {
     // Keep the view selector anchored to the tabs, independent of search state.
     int responseTabsWidth=TabCtrl_GetItemCount(gResponseTabs)*SECTION_TAB_WIDTH+8;
     int responseModeX=contentX+responseTabsWidth+12;
-    constexpr int durationWidth=120;
+    constexpr int durationWidth=220;
     int findWidth=std::min(370,std::max(1,contentX+contentW-responseModeX-40-12-durationWidth-12));
     bool findOpen=gResponseFindVisible&&gResponsePage==0;
     int summaryRight=contentX+contentW-(findOpen?findWidth+12:40);
     move(gSummary,summaryRight-durationWidth,responseTop+6,durationWidth,28);
-    move(gResponseTabs,contentX,responseTop+4,responseTabsWidth,34);
+    move(gResponseTabs,contentX,responseTop+4,responseTabsWidth,33);
     move(gResponseModeDivider,contentX+responseTabsWidth,responseTop+6,12,28);
     move(gResponseMode,responseModeX,responseTop+6,40,28);move(gResponseFind,contentX+contentW-28,responseTop+6,28,28);
     int responseBodyTop=responseTop+38;
@@ -2618,7 +2775,7 @@ void layout(int width,int height) {
     positionRequestTabs();
     if(windowWidthShrank&&gSave)RedrawWindow(gSave,nullptr,nullptr,RDW_INVALIDATE|RDW_NOERASE|RDW_UPDATENOW);
     layoutResponseFindControls();if(!gResizeSidebar)updateSearchFormatting();updateUrlFormatting();updateCodeEditorInsets(gBody);updateCodeEditorInsets(gResponseBody);
-    PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);
+    PostMessageW(gWindow,WM_UPDATE_TAB_OVERFLOW,0,0);
     if(gResizeSidebar){
         // Repaint the parent surface exposed by all right-side children moving.
         // WS_CLIPCHILDREN keeps this operation off the controls themselves, so
@@ -2676,12 +2833,13 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         SendMessageW(gMethod,CB_SETITEMHEIGHT,(WPARAM)-1,px(35));SendMessageW(gMethod,CB_SETITEMHEIGHT,0,px(26));
         SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(REQUEST_TAB_HEIGHT-4)));
         SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(REQUEST_TAB_HORIZONTAL_PADDING),px(4)));
-        gEnsureSelectedRequestTabVisible=true;
+        refreshRequestTabs();
+
         SendMessageW(gEditorTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));
         SendMessageW(gResponseTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));
         auto suggested=(RECT*)l;SetWindowPos(h,nullptr,suggested->left,suggested->top,suggested->right-suggested->left,suggested->bottom-suggested->top,SWP_NOZORDER|SWP_NOACTIVATE);return 0;
     }
-    case WM_ERASEBKGND:{RECT client{};GetClientRect(h,&client);FillRect((HDC)w,&client,gWhiteBrush);RECT sidebar=client;sidebar.right=px(std::clamp(gData.sidebarWidth,180,420));FillRect((HDC)w,&sidebar,gSidebarBrush);RECT tabs{gRequestTabViewportX,0,client.right-px(10),px(REQUEST_TAB_HEIGHT)};FillRect((HDC)w,&tabs,gSidebarBrush);return 1;}
+    case WM_ERASEBKGND:{RECT client{};GetClientRect(h,&client);FillRect((HDC)w,&client,gWhiteBrush);RECT sidebar=client;sidebar.right=px(std::clamp(gData.sidebarWidth,180,420));FillRect((HDC)w,&sidebar,gSidebarBrush);return 1;}
     case WM_CTLCOLOREDIT:
         if(gCellEditor&&((HWND)l==gCellEditor||IsChild(gCellEditor,(HWND)l))){
             HDC dc=(HDC)w;COLORREF color=gEditColumn==4?COLOR_SECONDARY:(gEditColumn==3?RGB(94,111,133):COLOR_PRIMARY);
@@ -2693,7 +2851,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         else if((HWND)l==gFindStatus)SetTextColor(dc,!gResponseFindQuery.empty()&&gResponseMatches.empty()?RGB(185,28,28):(gResponseFindWrapped?COLOR_ACCENT:COLOR_SECONDARY));
         else if((HWND)l==gBodyNone||(HWND)l==gEmptyHelp)SetTextColor(dc,COLOR_SECONDARY);
         else SetTextColor(dc,COLOR_PRIMARY);return (LRESULT)gWhiteBrush;}
-    case WM_DRAWITEM:drawButton((DRAWITEMSTRUCT*)l);return TRUE;
+    case WM_DRAWITEM:if(((DRAWITEMSTRUCT*)l)->CtlType==ODT_LISTBOX&&((DRAWITEMSTRUCT*)l)->hwndItem==gOverflowList){drawOverflowRow(*(DRAWITEMSTRUCT*)l);return TRUE;}drawButton((DRAWITEMSTRUCT*)l);return TRUE;
     case WM_COMMAND: {
         int id=LOWORD(w),notification=HIWORD(w);
         if(id==IDC_RESPONSE_FIND_EDIT&&notification==EN_CHANGE&&!gLoadingEditor){
@@ -2728,6 +2886,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDC_BODY_TYPE:if(notification==CBN_SELCHANGE&&!gLoadingEditor){saveEditor(false);auto tab=selectedTab();if(tab){auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;int selected=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(selected>=0&&selected<5)request.bodyType=types[selected];}updateBodyAppearance();showEditorPage();scheduleSave();}break;
         case IDC_FORMAT:if(notification==BN_CLICKED)formatCurrentJson(false);break;
         case IDC_COMPRESS:if(notification==BN_CLICKED)formatCurrentJson(true);break;
+        case IDC_TAB_OVERFLOW:if(notification==BN_CLICKED)showTabOverflow();break;
         case IDC_SAVE_MORE:{HMENU menu=CreatePopupMenu();auto tab=selectedTab();AppendMenuW(menu,tab&&!tab->requestCase?MF_STRING:MF_GRAYED,IDM_SAVE_CASE,L"保存用例");RECT r{};GetWindowRect(gSaveMore,&r);TrackPopupMenu(menu,TPM_RIGHTBUTTON,r.left,r.bottom,0,h,nullptr);DestroyMenu(menu);break;}
         case IDM_SAVE_CASE:{auto tab=selectedTab();if(tab&&tab->request&&!tab->requestCase){wstring name;if(prompt(L"保存用例",L"请输入用例名称：",L"成功",name)){saveEditor();auto c=std::make_unique<ApiRequestCase>();c->id=newId();c->name=toUtf8(name);c->method=tab->request->method;c->url=tab->request->url;c->query=tab->request->query;c->headers=tab->request->headers;c->bodyType=tab->request->bodyType;c->body=tab->request->body;c->formFields=tab->request->formFields;c->responseSummary=toUtf8(tab->responseSummary);c->responseRaw=tab->responseRaw;c->responsePretty=tab->responsePretty;c->responseHeaders=tab->responseHeaders;tab->request->cases.push_back(std::move(c));rebuildTree();saveNow();}}break;}
         case IDM_FOLDER_ADD_REQUEST:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Folder)addRequest((ApiFolder*)gTreeSelection->value);break;
@@ -2741,7 +2900,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDM_CASE_DELETE:deleteCase(gTreeSelection->ownerRequest,(ApiRequestCase*)gTreeSelection->value);break;
         }return 0;
     }
-    case WM_HSCROLL:if((HWND)l==gRequestTabScroll){scrollRequestTabs(w);return 0;}break;
+
     case WM_NOTIFY: {
         auto header=(LPNMHDR)l;
         if(header->idFrom==IDC_TREE&&header->code==NM_CUSTOMDRAW)return drawTreeItem((NMTVCUSTOMDRAW*)l);
@@ -2768,7 +2927,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
                 else if(ref&&ref->kind==NodeRef::Kind::Case)openRequest(ref->ownerRequest,(ApiRequestCase*)ref->value);
             }return 0;
         }
-        if(header->idFrom==IDC_REQUEST_TABS&&header->code==TCN_SELCHANGE){commitCellEditor();saveEditor();captureView();for(int& row:gSelectedEntryRows)row=-1;gSelectedTab=TabCtrl_GetCurSel(gRequestTabs);gEnsureSelectedRequestTabVisible=true;loadEditor();selectTreeTab(selectedTab());PostMessageW(gWindow,WM_UPDATE_TAB_SCROLL,0,0);return 0;}
+        if(header->idFrom==IDC_REQUEST_TABS&&header->code==TCN_SELCHANGE){commitCellEditor();saveEditor();captureView();for(int& row:gSelectedEntryRows)row=-1;gSelectedTab=TabCtrl_GetCurSel(gRequestTabs);loadEditor();selectTreeTab(selectedTab());PostMessageW(gWindow,WM_UPDATE_TAB_OVERFLOW,0,0);return 0;}
         // Closing is intercepted before the tab control changes selection.
         if(header->idFrom==IDC_EDITOR_TABS&&header->code==TCN_SELCHANGE){commitCellEditor();saveEditor();gEditorPage=TabCtrl_GetCurSel(gEditorTabs);if(auto tab=selectedTab())tab->editorPage=gEditorPage;showEditorPage();return 0;}
         if(header->idFrom==IDC_RESPONSE_TABS&&header->code==TCN_SELCHANGE){captureView();gResponsePage=TabCtrl_GetCurSel(gResponseTabs);if(auto tab=selectedTab())tab->responsePage=gResponsePage;showResponsePage();return 0;}
@@ -2780,26 +2939,26 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
     case WM_EDIT_ENTRY_CELL:{auto tab=selectedTab();string bodyType=tab?(tab->caseSnapshot?tab->caseSnapshot->bodyType:tab->request->bodyType):string();bool listPage=tab&&(gEditorPage<2||(gEditorPage==2&&(bodyType=="Form URL Encoded"||bodyType=="Multipart Form Data")));int row=(int)w,column=(int)l;if(listPage&&IsWindowVisible(gKvList)&&row>=0&&row<ListView_GetItemCount(gKvList)&&column>=1&&column<=4)editListCell(row,column);return 0;}
     case WM_MOUSEMOVE:
         if(gResizeSidebar){RECT client{};GetClientRect(h,&client);gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::max(180,std::min(420,dip((int)client.right)-660)));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return 0;}
-        if(gResizePanels){RECT client{};GetClientRect(h,&client);int editorTop=REQUEST_EDITOR_TOP;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZENS));return 0;}
+        if(gResizePanels){RECT client{};GetClientRect(h,&client);int editorTop=REQUEST_EDITOR_TOP;gData.requestPanelHeightManual=true;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,180,std::max(200,dip((int)client.bottom)-350));layout((int)client.right,(int)client.bottom);SetCursor(LoadCursorW(nullptr,IDC_SIZENS));return 0;}
         if(gDragRequest){
             POINT point{(short)LOWORD(l),(short)HIWORD(l)};MapWindowPoints(h,gTree,&point,1);TVHITTESTINFO hit{};hit.pt=point;TreeView_HitTest(gTree,&hit);
             gDragTarget=nullptr;if(hit.hItem){TVITEMW item{};item.mask=TVIF_PARAM;item.hItem=hit.hItem;TreeView_GetItem(gTree,&item);auto ref=(NodeRef*)item.lParam;if(ref&&ref->kind==NodeRef::Kind::Folder)gDragTarget=(ApiFolder*)ref->value;else if(ref&&ref->kind==NodeRef::Kind::Request)gDragTarget=ref->ownerFolder;}
             if(hit.hItem!=gDragHover){TreeView_SelectDropTarget(gTree,hit.hItem);gDragHover=hit.hItem;}SetCursor(LoadCursorW(nullptr,gDragTarget&&gDragTarget!=findFolderForRequest(gDragRequest)?IDC_SIZEALL:IDC_NO));return 0;
         }break;
     case WM_LBUTTONUP:
-        if(gResizeSidebar||gResizePanels){RECT client{};GetClientRect(h,&client);if(gResizeSidebar)gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::max(180,std::min(420,dip((int)client.right)-660)));if(gResizePanels){int editorTop=REQUEST_EDITOR_TOP;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,200,std::max(200,dip((int)client.bottom)-350));}gResizeSidebar=gResizePanels=false;ReleaseCapture();layout((int)client.right,(int)client.bottom);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);setSaveStatus(L"未保存");SetCursor(LoadCursorW(nullptr,IDC_ARROW));return 0;}
+        if(gResizeSidebar||gResizePanels){RECT client{};GetClientRect(h,&client);if(gResizeSidebar)gData.sidebarWidth=std::clamp(dip((int)(short)LOWORD(l)),180,std::max(180,std::min(420,dip((int)client.right)-660)));if(gResizePanels){int editorTop=REQUEST_EDITOR_TOP;gData.requestPanelHeightManual=true;gData.requestPanelHeight=std::clamp(dip((int)(short)HIWORD(l))-editorTop,180,std::max(200,dip((int)client.bottom)-350));}gResizeSidebar=gResizePanels=false;ReleaseCapture();layout((int)client.right,(int)client.bottom);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);setSaveStatus(L"未保存");SetCursor(LoadCursorW(nullptr,IDC_ARROW));return 0;}
         if(gDragRequest){ReleaseCapture();TreeView_SelectDropTarget(gTree,nullptr);auto request=gDragRequest;auto target=gDragTarget;gDragRequest=nullptr;gDragTarget=nullptr;gDragHover=nullptr;if(target)moveRequestDirect(request,target);return 0;}break;
     case WM_LBUTTONDOWN: {
         POINT point{dip((short)LOWORD(l)),dip((short)HIWORD(l))};RECT client{};GetClientRect(h,&client);client.right=dip(client.right);client.bottom=dip(client.bottom);
         if(std::abs(point.x-gData.sidebarWidth)<=5){gResizeSidebar=true;SetCapture(h);SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return 0;}
-        int splitterY=REQUEST_EDITOR_TOP+std::clamp(gData.requestPanelHeight,200,std::max(200,(int)client.bottom-350));
+        int splitterY=REQUEST_EDITOR_TOP+editorPanelHeight((int)client.bottom);
         if(point.x>gData.sidebarWidth&&std::abs(point.y-splitterY)<=5){gResizePanels=true;SetCapture(h);SetCursor(LoadCursorW(nullptr,IDC_SIZENS));return 0;}
         break;
     }
     case WM_SETCURSOR: {
         POINT point{};GetCursorPos(&point);ScreenToClient(h,&point);point.x=dip(point.x);point.y=dip(point.y);RECT client{};GetClientRect(h,&client);client.right=dip(client.right);client.bottom=dip(client.bottom);
         if(std::abs(point.x-gData.sidebarWidth)<=5){SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return TRUE;}
-        int splitterY=REQUEST_EDITOR_TOP+std::clamp(gData.requestPanelHeight,200,std::max(200,(int)client.bottom-350));
+        int splitterY=REQUEST_EDITOR_TOP+editorPanelHeight((int)client.bottom);
         if(point.x>gData.sidebarWidth&&std::abs(point.y-splitterY)<=5){SetCursor(LoadCursorW(nullptr,IDC_SIZENS));return TRUE;}
         break;
     }
@@ -2808,7 +2967,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(GetKeyState(VK_CONTROL)<0&&w=='D'){duplicateSelectedTab();return 0;}
         if(w==VK_F2&&GetFocus()==gTree){renameSelection();return 0;}if(w==VK_DELETE&&GetFocus()==gTree&&gTreeSelection){if(gTreeSelection->kind==NodeRef::Kind::Request)deleteRequest((ApiRequest*)gTreeSelection->value);else if(gTreeSelection->kind==NodeRef::Kind::Folder)deleteFolder((ApiFolder*)gTreeSelection->value);else deleteCase(gTreeSelection->ownerRequest,(ApiRequestCase*)gTreeSelection->value);return 0;}break;
     case WM_SEARCH_REFRESH:rebuildTree();return 0;
-    case WM_UPDATE_TAB_SCROLL:updateRequestTabScroll();return 0;
+    case WM_UPDATE_TAB_OVERFLOW:updateTabOverflow();return 0;
     case WM_TIMER:
         if(w==BODY_STYLE_TIMER){updateBodyAppearance();return 0;}
         if(w==FIND_WRAP_TIMER){KillTimer(h,FIND_WRAP_TIMER);gResponseFindWrapped=false;updateResponseFindStatus();return 0;}
@@ -2817,9 +2976,8 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(w==REQUEST_TIMER){
             reapRetiredTabs();
             bool sending=!gRetiredTabs.empty();for(const auto& tab:gTabs)if(tab->sending){
-                sending=true;auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-tab->started).count();
-                tab->summary=(tab->cancel?L"正在取消 · ":L"请求中 · ")+std::to_wstring(elapsed)+L" ms";
-                if(tab==selectedTab())updateResponseSummary();
+                sending=true;
+                if(tab==selectedTab())InvalidateRect(gSummary,nullptr,FALSE);
             }
             if(!sending)KillTimer(h,REQUEST_TIMER);return 0;
         }break;

@@ -53,6 +53,7 @@ struct ApiFolder {
 struct AppData {
     int sidebarWidth = 320;
     int requestPanelHeight = 330;
+    bool requestPanelHeightManual = false;
     std::vector<std::unique_ptr<ApiFolder>> folders;
 };
 
