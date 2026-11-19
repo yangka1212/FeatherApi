@@ -51,7 +51,8 @@ constexpr UINT_PTR REQUEST_TIMER=2;
 constexpr UINT_PTR DIRTY_TIMER=3;
 constexpr UINT_PTR FIND_WRAP_TIMER=4;
 constexpr UINT_PTR BODY_STYLE_TIMER=5;
-constexpr int SECTION_TAB_WIDTH=68;
+constexpr int SECTION_TAB_WIDTH=62;
+constexpr int REQUEST_TAB_HORIZONTAL_PADDING=16;
 constexpr int REQUEST_TAB_HEIGHT=44;
 constexpr int ENTRY_ROW_HEIGHT=32;
 constexpr int ENTRY_HEADER_HEIGHT=32;
@@ -269,6 +270,7 @@ constexpr COLORREF COLOR_SIDEBAR=RGB(247,248,250);
 constexpr COLORREF COLOR_SELECTED=RGB(234,242,255);
 constexpr COLORREF COLOR_HOVER=RGB(238,242,247);
 constexpr COLORREF COLOR_SELECTED_BORDER=RGB(199,218,255);
+constexpr COLORREF COLOR_ENTRY_EDIT=RGB(242,247,255);
 
 void fillRoundRect(HDC dc,const RECT& rect,COLORREF color,int radius) {
     HBRUSH brush=CreateSolidBrush(color);HPEN pen=CreatePen(PS_SOLID,1,color);
@@ -565,7 +567,7 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
         DrawTextW(draw->hDC,label.c_str(),-1,&rect,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
         RestoreDC(draw->hDC,saved);return;
     }
-    if(draw->CtlID==IDC_BODY_TYPE||draw->CtlID==IDC_METHOD){
+    if(draw->CtlID==IDC_BODY_TYPE||draw->CtlID==IDC_METHOD||(gCellEditor&&draw->hwndItem==gCellEditor)){
         bool closed=(draw->itemState&ODS_COMBOBOXEDIT)!=0;
         bool selected=!closed&&(draw->itemState&ODS_SELECTED)!=0;
         FillRect(draw->hDC,&draw->rcItem,selected?gSelectedBrush:gWhiteBrush);
@@ -1886,11 +1888,17 @@ LRESULT drawEntryList(NMLVCUSTOMDRAW* draw) {
     if(draw->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
     if(draw->nmcd.dwDrawStage!=CDDS_ITEMPREPAINT)return CDRF_DODEFAULT;
     const int row=(int)draw->nmcd.dwItemSpec;HDC dc=draw->nmcd.hdc;int saved=SaveDC(dc);
+    // The editor is an overlapping sibling of the list. Protect it even when
+    // custom drawing uses a buffer that does not inherit the window DC's clip.
+    if(gCellEditor){
+        RECT editor{};GetWindowRect(gCellEditor,&editor);MapWindowPoints(nullptr,gKvList,(POINT*)&editor,2);
+        ExcludeClipRect(dc,editor.left,editor.top,editor.right,editor.bottom);
+    }
     RECT bounds{};ListView_GetItemRect(gKvList,row,&bounds,LVIR_BOUNDS);
     bool placeholder=isEntryPlaceholder(row),checked=ListView_GetCheckState(gKvList,row)!=FALSE;
     bool focused=GetFocus()==gKvList&&row==ListView_GetNextItem(gKvList,-1,LVNI_SELECTED);
     bool editing=gCellEditor&&row==gEditRow,hot=row==gEntryHotRow;
-    COLORREF background=focused||editing?RGB(242,247,255):(hot?RGB(248,250,253):RGB(255,255,255));
+    COLORREF background=focused||editing?COLOR_ENTRY_EDIT:(hot?RGB(248,250,253):RGB(255,255,255));
     HBRUSH brush=CreateSolidBrush(background);FillRect(dc,&bounds,brush);DeleteObject(brush);SetBkMode(dc,TRANSPARENT);
     for(int column=0;column<6;++column){
         RECT cell=entryCellBounds(row,column);if(!RectVisible(dc,&cell))continue;
@@ -1932,6 +1940,7 @@ LRESULT drawEntryList(NMLVCUSTOMDRAW* draw) {
         RestoreDC(dc,cellState);
     }
     RECT line{bounds.left+px(12),bounds.bottom-1,bounds.right-px(12),bounds.bottom};HBRUSH lineBrush=CreateSolidBrush(RGB(239,242,246));FillRect(dc,&line,lineBrush);DeleteObject(lineBrush);
+    if(editing){RECT cell=entryCellBounds(row,gEditColumn);RECT underline{cell.left+px(12),cell.bottom-px(3),cell.right-px(12),cell.bottom-px(2)};FillRect(dc,&underline,gAccentBrush);}
     if(focused){RECT cell=entryCellBounds(row,gFocusedEntryColumn);InflateRect(&cell,-px(3),-px(3));drawFocusRing(dc,cell);}
     RestoreDC(dc,saved);return CDRF_SKIPDEFAULT;
 }
@@ -1943,6 +1952,7 @@ void commitCellEditor(bool save) {
     if(!gCellEditor)return;HWND editor=gCellEditor;gCellEditor=nullptr;
     if(save&&gEditRow>=0&&gEditColumn>=0){wstring value=textOf(editor);ListView_SetItemText(gKvList,gEditRow,gEditColumn,(LPWSTR)value.c_str());}
     int editedRow=gEditRow;DestroyWindow(editor);gEditRow=gEditColumn=-1;
+    if(editedRow>=0)ListView_RedrawItems(gKvList,editedRow,editedRow);
     if(save&&editedRow>=0){if(entryCellText(editedRow,3).empty()&&(!entryCellText(editedRow,1).empty()||!entryCellText(editedRow,2).empty()))ListView_SetItemText(gKvList,editedRow,3,(LPWSTR)L"string");ensureTrailingEntryRow();}
     saveEditor();if(save)scheduleSave();
 }
@@ -1955,7 +1965,25 @@ void navigateEntry(bool backwards) {
     if(next.row<0){moveFocus(gKvList,backwards);return;}
     editListCell(next.row,next.column,true);
 }
+void paintEntryTypeEditor(HWND h,HDC dc) {
+    int saved=SaveDC(dc);RECT client{};GetClientRect(h,&client);
+    COMBOBOXINFO info{sizeof(info)};
+    if(GetComboBoxInfo(h,&info)){RECT input{};GetWindowRect(info.hwndItem,&input);MapWindowPoints(nullptr,h,(POINT*)&input,2);ExcludeClipRect(dc,input.left,input.top,input.right,input.bottom);}
+    SetDCBrushColor(dc,COLOR_ENTRY_EDIT);FillRect(dc,&client,(HBRUSH)GetStockObject(DC_BRUSH));
+    HPEN pen=CreatePen(PS_SOLID,std::max(1,px(1)),COLOR_SECONDARY);auto oldPen=SelectObject(dc,pen);
+    int cx=client.right-px(12),cy=(client.top+client.bottom)/2;
+    MoveToEx(dc,cx-px(3),cy-px(1),nullptr);LineTo(dc,cx,cy+px(2));LineTo(dc,cx+px(3)+1,cy-px(1)-1);
+    SelectObject(dc,oldPen);DeleteObject(pen);RestoreDC(dc,saved);
+}
 LRESULT CALLBACK cellEditorProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
+    bool typeEditor=h==gCellEditor&&gEditColumn==3;
+    if(typeEditor){
+        if(message==WM_ERASEBKGND)return 1;
+        if(message==WM_PAINT){PAINTSTRUCT paint{};HDC dc=BeginPaint(h,&paint);paintEntryTypeEditor(h,dc);EndPaint(h,&paint);return 0;}
+        if(message==WM_PRINTCLIENT){if(w)paintEntryTypeEditor(h,(HDC)w);return 0;}
+        if(message==WM_PRINT){LRESULT result=DefSubclassProc(h,message,w,l);if(w)paintEntryTypeEditor(h,(HDC)w);return result;}
+        if(message==WM_CTLCOLOREDIT)return SendMessageW(gWindow,message,w,l);
+    }
     if(message==WM_IME_STARTCOMPOSITION)gImeComposing=true;
     if(message==WM_IME_ENDCOMPOSITION)gImeComposing=false;
     if(message==WM_KEYDOWN&&!gImeComposing){
@@ -1966,12 +1994,21 @@ LRESULT CALLBACK cellEditorProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,D
         }
     }
     if(message==WM_KILLFOCUS&&gCellEditor&&(HWND)w!=gCellEditor&&!IsChild(gCellEditor,(HWND)w)){commitCellEditor();return 0;}
-    return DefSubclassProc(h,message,w,l);
+    LRESULT result=DefSubclassProc(h,message,w,l);
+    if(typeEditor&&IsWindow(h)&&(message==WM_SETFOCUS||message==WM_KILLFOCUS||message==CB_SETCURSEL||message==WM_KEYDOWN||message==WM_LBUTTONUP))InvalidateRect(h,nullptr,FALSE);
+    return result;
 }
 LRESULT CALLBACK kvListProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
     if(message==WM_MOUSEMOVE){
         LVHITTESTINFO hit{};hit.pt={(short)LOWORD(l),(short)HIWORD(l)};ListView_SubItemHitTest(h,&hit);
-        if(gEntryHotRow!=hit.iItem||gEntryHotColumn!=hit.iSubItem){int previous=gEntryHotRow;gEntryHotRow=hit.iItem;gEntryHotColumn=hit.iSubItem;if(previous>=0)ListView_RedrawItems(h,previous,previous);if(hit.iItem>=0)ListView_RedrawItems(h,hit.iItem,hit.iItem);}
+        int previousRow=gEntryHotRow,previousColumn=gEntryHotColumn;gEntryHotRow=hit.iItem;gEntryHotColumn=hit.iSubItem;
+        if(previousRow!=gEntryHotRow){
+            if(previousRow>=0)ListView_RedrawItems(h,previousRow,previousRow);
+            if(gEntryHotRow>=0)ListView_RedrawItems(h,gEntryHotRow,gEntryHotRow);
+        }else if(gEntryHotRow>=0&&previousColumn!=gEntryHotColumn&&(previousColumn==5||gEntryHotColumn==5)){
+            // Only the delete button changes appearance within the same row.
+            RECT action=entryCellBounds(gEntryHotRow,5);InvalidateRect(h,&action,FALSE);
+        }
         TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,h,0};TrackMouseEvent(&track);
     }
     if(message==WM_MOUSELEAVE||message==WM_MOUSEWHEEL||message==WM_VSCROLL||message==WM_HSCROLL){
@@ -2257,19 +2294,30 @@ void editListCell(int row,int column,bool keyboard) {
     ListView_SetItemState(gKvList,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
     ListView_SetItemState(gKvList,row,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
     RECT bounds{};if(!ListView_GetSubItemRect(gKvList,row,column,LVIR_BOUNDS,&bounds))return;MapWindowPoints(gKvList,gWindow,(POINT*)&bounds,2);
-    InflateRect(&bounds,-px(8),-px(4));
     wstring current=entryCellText(row,column);bool combo=column==3;
-    gCellEditor=CreateWindowExW(WS_EX_STATICEDGE,combo?L"COMBOBOX":L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|(combo?(CBS_DROPDOWN|WS_VSCROLL):ES_AUTOHSCROLL),
+    InflateRect(&bounds,-px(combo?8:12),-px(4));
+    HFONT font=combo?gEntryTypeFont:gUiFont;
+    HDC dc=GetDC(gKvList);auto oldFont=SelectObject(dc,font);TEXTMETRICW metrics{};GetTextMetricsW(dc,&metrics);SelectObject(dc,oldFont);ReleaseDC(gKvList,dc);
+    if(!combo){int center=(bounds.top+bounds.bottom)/2;bounds.top=center-metrics.tmHeight/2;bounds.bottom=bounds.top+metrics.tmHeight;}
+    gCellEditor=CreateWindowExW(0,combo?L"COMBOBOX":L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_CLIPSIBLINGS|(combo?(CBS_DROPDOWN|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL|WS_CLIPCHILDREN):ES_AUTOHSCROLL),
         bounds.left,bounds.top,bounds.right-bounds.left,combo?px(180):bounds.bottom-bounds.top,gWindow,nullptr,gInstance,nullptr);
-    if(!gCellEditor)return;applyFont(gCellEditor);
-    if(combo){RECT editor{};GetWindowRect(gCellEditor,&editor);SetWindowPos(gCellEditor,nullptr,bounds.left,(bounds.top+bounds.bottom-(editor.bottom-editor.top))/2,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);}
-    else SendMessageW(gCellEditor,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(px(3),px(3)));
+    if(!gCellEditor)return;applyFont(gCellEditor,font);
+    if(combo){
+        SendMessageW(gCellEditor,CB_SETITEMHEIGHT,(WPARAM)-1,metrics.tmHeight);SendMessageW(gCellEditor,CB_SETITEMHEIGHT,0,px(26));SendMessageW(gCellEditor,CB_SETDROPPEDWIDTH,px(112),0);
+        RECT editor{};GetWindowRect(gCellEditor,&editor);SetWindowPos(gCellEditor,nullptr,bounds.left,(bounds.top+bounds.bottom-(editor.bottom-editor.top))/2,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+    else SendMessageW(gCellEditor,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,0);
     if(combo)for(auto type:{L"string",L"number",L"file"})SendMessageW(gCellEditor,CB_ADDSTRING,0,(LPARAM)type);
     setText(gCellEditor,current);gEditRow=row;gEditColumn=column;gFocusedEntryColumn=column;
     SetWindowSubclass(gCellEditor,cellEditorProc,1,0);
-    HWND input=gCellEditor;if(combo){COMBOBOXINFO info{sizeof(info)};if(GetComboBoxInfo(gCellEditor,&info)){input=info.hwndItem;SetWindowSubclass(input,cellEditorProc,1,0);}}
+    HWND input=gCellEditor;if(combo){COMBOBOXINFO info{sizeof(info)};if(GetComboBoxInfo(gCellEditor,&info)){
+        input=info.hwndItem;SetWindowSubclass(input,cellEditorProc,1,0);RECT client{};GetClientRect(gCellEditor,&client);
+        SetWindowPos(input,nullptr,px(12),(client.bottom-metrics.tmHeight)/2,std::max(1,(int)client.right-px(36)),metrics.tmHeight,SWP_NOZORDER|SWP_NOACTIVATE);
+        SendMessageW(input,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,0);
+    }}
     SendMessageW(input,EM_SETLIMITTEXT,0,0);SetWindowPos(gCellEditor,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
     SetFocus(input);SendMessageW(input,EM_SETSEL,0,-1);
+    ListView_RedrawItems(gKvList,row,row);
 }
 void toggleEntry(int row){ListView_SetCheckState(gKvList,row,ListView_GetCheckState(gKvList,row)==FALSE);}
 
@@ -2435,7 +2483,7 @@ void createControls() {
     // Keep the tab control and its custom scrollbar in adjacent rectangles.
     // Overlapping sibling windows can briefly expose one another while the tab
     // window moves on every drag frame, which makes the thumb appear to flash.
-    gRequestTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE,IDC_REQUEST_TABS);SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(REQUEST_TAB_HEIGHT-4)));SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(22),px(4)));SetWindowSubclass(gRequestTabs,requestTabsProc,3,0);
+    gRequestTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE,IDC_REQUEST_TABS);SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(REQUEST_TAB_HEIGHT-4)));SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(REQUEST_TAB_HORIZONTAL_PADDING),px(4)));SetWindowSubclass(gRequestTabs,requestTabsProc,3,0);
     gRequestTabScroll=child(L"SCROLLBAR",L"",SBS_HORZ,IDC_REQUEST_TAB_SCROLL);SetWindowSubclass(gRequestTabScroll,requestTabScrollProc,8,0);ShowWindow(gRequestTabScroll,SW_HIDE);
     gMethod=child(L"COMBOBOX",L"",CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS,IDC_METHOD);
     for(auto method:{L"GET",L"POST",L"PUT",L"PATCH",L"DELETE",L"HEAD",L"OPTIONS"})SendMessageW(gMethod,CB_ADDSTRING,0,(LPARAM)method);
@@ -2453,7 +2501,7 @@ void createControls() {
     for(HWND button:{gSave,gSaveMore,gSend,gCancel})SetWindowSubclass(button,requestToolbarButtonProc,13,0);
     gEditorTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE|TCS_FIXEDWIDTH,IDC_EDITOR_TABS);SendMessageW(gEditorTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));for(auto label:{L"Params",L"Headers",L"Body"}){TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label;TabCtrl_InsertItem(gEditorTabs,TabCtrl_GetItemCount(gEditorTabs),&item);}
     SetWindowSubclass(gEditorTabs,sectionTabsProc,11,0);
-    gKvList=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL,IDC_KV_LIST);ListView_SetExtendedListViewStyle(gKvList,LVS_EX_DOUBLEBUFFER|LVS_EX_CHECKBOXES|LVS_EX_LABELTIP);addListColumns(gKvList,true);
+    gKvList=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL|WS_CLIPSIBLINGS,IDC_KV_LIST);ListView_SetExtendedListViewStyle(gKvList,LVS_EX_DOUBLEBUFFER|LVS_EX_CHECKBOXES|LVS_EX_LABELTIP);addListColumns(gKvList,true);
     SetWindowSubclass(gKvList,kvListProc,2,0);
     SetWindowSubclass(ListView_GetHeader(gKvList),entryHeaderProc,12,0);updateEntryMetrics();
     gBodyType=child(L"COMBOBOX",L"",CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS,IDC_BODY_TYPE);
@@ -2627,14 +2675,20 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         updateEntryMetrics();SendMessageW(gBodyType,CB_SETITEMHEIGHT,(WPARAM)-1,px(23));SendMessageW(gBodyType,CB_SETITEMHEIGHT,0,px(26));
         SendMessageW(gMethod,CB_SETITEMHEIGHT,(WPARAM)-1,px(35));SendMessageW(gMethod,CB_SETITEMHEIGHT,0,px(26));
         SendMessageW(gRequestTabs,TCM_SETITEMSIZE,0,MAKELPARAM(0,px(REQUEST_TAB_HEIGHT-4)));
-        SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(22),px(4)));
+        SendMessageW(gRequestTabs,TCM_SETPADDING,0,MAKELPARAM(px(REQUEST_TAB_HORIZONTAL_PADDING),px(4)));
         gEnsureSelectedRequestTabVisible=true;
         SendMessageW(gEditorTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));
         SendMessageW(gResponseTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));
         auto suggested=(RECT*)l;SetWindowPos(h,nullptr,suggested->left,suggested->top,suggested->right-suggested->left,suggested->bottom-suggested->top,SWP_NOZORDER|SWP_NOACTIVATE);return 0;
     }
     case WM_ERASEBKGND:{RECT client{};GetClientRect(h,&client);FillRect((HDC)w,&client,gWhiteBrush);RECT sidebar=client;sidebar.right=px(std::clamp(gData.sidebarWidth,180,420));FillRect((HDC)w,&sidebar,gSidebarBrush);RECT tabs{gRequestTabViewportX,0,client.right-px(10),px(REQUEST_TAB_HEIGHT)};FillRect((HDC)w,&tabs,gSidebarBrush);return 1;}
-    case WM_CTLCOLOREDIT:if((HWND)l==gResponseFindEdit||(HWND)l==gSearch||(HWND)l==gBody){SetTextColor((HDC)w,COLOR_PRIMARY);SetBkColor((HDC)w,RGB(255,255,255));return (LRESULT)gWhiteBrush;}break;
+    case WM_CTLCOLOREDIT:
+        if(gCellEditor&&((HWND)l==gCellEditor||IsChild(gCellEditor,(HWND)l))){
+            HDC dc=(HDC)w;COLORREF color=gEditColumn==4?COLOR_SECONDARY:(gEditColumn==3?RGB(94,111,133):COLOR_PRIMARY);
+            if(gEditRow>=0&&!ListView_GetCheckState(gKvList,gEditRow))color=RGB(139,149,164);
+            SetTextColor(dc,color);SetBkColor(dc,COLOR_ENTRY_EDIT);SetDCBrushColor(dc,COLOR_ENTRY_EDIT);return (LRESULT)GetStockObject(DC_BRUSH);
+        }
+        if((HWND)l==gResponseFindEdit||(HWND)l==gSearch||(HWND)l==gBody){SetTextColor((HDC)w,COLOR_PRIMARY);SetBkColor((HDC)w,RGB(255,255,255));return (LRESULT)gWhiteBrush;}break;
     case WM_CTLCOLORSTATIC:{HDC dc=(HDC)w;SetBkMode(dc,TRANSPARENT);if((HWND)l==gSidebarDivider){SetBkColor(dc,COLOR_BORDER);return (LRESULT)gBorderBrush;}if((HWND)l==gValidation)SetTextColor(dc,RGB(220,38,38));
         else if((HWND)l==gFindStatus)SetTextColor(dc,!gResponseFindQuery.empty()&&gResponseMatches.empty()?RGB(185,28,28):(gResponseFindWrapped?COLOR_ACCENT:COLOR_SECONDARY));
         else if((HWND)l==gBodyNone||(HWND)l==gEmptyHelp)SetTextColor(dc,COLOR_SECONDARY);

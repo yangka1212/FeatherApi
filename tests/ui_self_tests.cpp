@@ -177,11 +177,36 @@ static void runEntryTableTests(ApiRequest* request) {
         RECT value{};ListView_GetSubItemRect(gKvList,1,2,LVIR_BOUNDS,&value);
         LVHITTESTINFO hit{};hit.pt={(value.left+value.right)/2,(value.top+value.bottom)/2};ListView_SubItemHitTest(gKvList,&hit);
         check(hit.iItem==1&&hit.iSubItem==2,"native parameter hit testing matches the displayed cell at every DPI");
-        editListCell(1,3,true);RECT type{};ListView_GetSubItemRect(gKvList,1,3,LVIR_BOUNDS,&type);
-        MapWindowPoints(gKvList,gWindow,(POINT*)&type,2);RECT editor=boundsInWindow(gCellEditor);
-        check(gCellEditor&&gEditRow==1&&gEditColumn==3&&editor.top>=type.top&&editor.bottom<=type.bottom&&
-              editor.left>=type.left&&editor.right<=type.right,"the type dropdown fits inside its native parameter cell at every DPI");
-        commitCellEditor(false);
+        for(int column:{2,3}){
+            editListCell(1,column,true);RECT cell=entryCellBounds(1,column);
+            MapWindowPoints(gKvList,gWindow,(POINT*)&cell,2);RECT editor=boundsInWindow(gCellEditor);
+            check(gCellEditor&&gEditRow==1&&gEditColumn==column&&editor.top>=cell.top&&editor.bottom<=cell.bottom&&
+                  editor.left>=cell.left&&editor.right<=cell.right,"text and type editors fit inside their parameter cells at every DPI");
+            setText(gCellEditor,L"uncommitted draft");HWND editing=gCellEditor;
+            MapWindowPoints(gWindow,gKvList,(POINT*)&editor,2);
+            // An offscreen paint makes any write over the live editor detectable,
+            // without requiring an unlocked desktop or relying on caret timing.
+            RECT area{};GetClientRect(gKvList,&area);HDC dc=GetDC(gKvList),canvas=CreateCompatibleDC(dc);
+            HBITMAP editorBitmap=CreateCompatibleBitmap(dc,area.right,area.bottom);auto old=SelectObject(canvas,editorBitmap);
+            PatBlt(canvas,0,0,area.right,area.bottom,BLACKNESS);
+            NMLVCUSTOMDRAW draw{};draw.nmcd.dwDrawStage=CDDS_ITEMPREPAINT;draw.nmcd.dwItemSpec=1;draw.nmcd.hdc=canvas;
+            drawEntryList(&draw);
+            bool intact=true;
+            for(int y:{editor.top,(editor.top+editor.bottom)/2,editor.bottom-1})
+                for(int x:{editor.left,(editor.left+editor.right)/2,editor.right-1})
+                    intact=intact&&GetPixel(canvas,x,y)==RGB(0,0,0);
+            check(intact&&GetPixel(canvas,row.right-px(2),(row.top+row.bottom)/2)==RGB(242,247,255),
+                  "row repaint preserves the live editor pixels while painting the surrounding row at every DPI");
+            RECT name=entryCellBounds(1,1),description=entryCellBounds(1,4),remove=entryCellBounds(1,5);
+            for(const RECT& hover:{name,description,remove})SendMessageW(gKvList,WM_MOUSEMOVE,0,MAKELPARAM((hover.left+hover.right)/2,(hover.top+hover.bottom)/2));
+            SendMessageW(gKvList,WM_MOUSELEAVE,0,0);
+            check(gCellEditor==editing&&textOf(editing)==L"uncommitted draft"&&entryCellText(1,column)!=L"uncommitted draft",
+                  "moving across a row and its delete action retains the same uncommitted editor");
+            commitCellEditor(false);drawEntryList(&draw);
+            check(GetPixel(canvas,editor.right-px(2),editor.top+px(2))!=RGB(0,0,0),
+                  "closing a parameter editor lets the table repaint the previously covered area");
+            SelectObject(canvas,old);DeleteObject(editorBitmap);DeleteDC(canvas);ReleaseDC(gKvList,dc);
+        }
     }
 
     request->query.clear();
