@@ -35,11 +35,12 @@ enum : int {
     IDC_FORMAT,IDC_COMPRESS,IDC_BODY,IDC_VALIDATION,IDC_SUMMARY,
     IDC_RESPONSE_TABS,IDC_RESPONSE_BODY,IDC_RESPONSE_HEADERS,IDC_RESPONSE_FIND_PANEL,IDC_RESPONSE_FIND_EDIT,IDC_RESPONSE_FIND_PREV,IDC_RESPONSE_FIND_NEXT,IDC_RESPONSE_FIND_CLOSE,IDC_BODY_NONE,IDC_EMPTY_TITLE,IDC_EMPTY_HELP,IDC_SIDEBAR_DIVIDER,IDC_TAB_OVERFLOW,
     IDC_RESPONSE_MODE,IDC_RESPONSE_FIND,IDC_FIND_STATUS,IDC_RESPONSE_MODE_DIVIDER,IDC_EMPTY_NEW_REQUEST,
+    IDC_SEARCH_EMPTY,IDC_CLEAR_SEARCH,
     IDC_PROMPT_EDIT=900,IDC_URL_FRAME,IDC_SEARCH_FRAME,
     IDM_FOLDER_ADD_REQUEST=1000,IDM_FOLDER_ADD_CHILD,IDM_FOLDER_IMPORT,IDM_FOLDER_RENAME,IDM_FOLDER_DELETE,
     IDM_REQUEST_OPEN,IDM_REQUEST_RENAME,IDM_REQUEST_DUPLICATE,IDM_REQUEST_MOVE,IDM_REQUEST_DELETE,
     IDM_SAVE_CASE,IDM_CASE_DELETE,
-    IDM_TAB_CLOSE_ALL,IDM_TAB_CLOSE_OTHERS,IDM_TAB_CLOSE_LEFT,IDM_TAB_CLOSE_RIGHT
+    IDM_TAB_CLOSE_ALL,IDM_TAB_CLOSE_OTHERS,IDM_TAB_CLOSE_LEFT,IDM_TAB_CLOSE_RIGHT,IDM_CANCEL_IMPORT
 };
 constexpr UINT WM_HTTP_DONE=WM_APP+1;
 constexpr UINT WM_SEARCH_REFRESH=WM_APP+2;
@@ -76,6 +77,7 @@ struct TabState {
     wstring summary;
     wstring validation;
     wstring responseSummary;
+    std::unique_ptr<RequestSnapshot> responseRequest;
     bool oldResponse=false,rawView=false,findVisible=false,displayedDirty=false;
     unsigned statusCode=0;
     int editorPage=0,responsePage=0;
@@ -88,7 +90,7 @@ struct TabState {
     void cancelNow(){cancel=true;HINTERNET handle=activeRequest.exchange(nullptr);if(handle)WinHttpCloseHandle(handle);}
     ~TabState(){cancelNow();if(worker.joinable())worker.join();}
 };
-struct HttpCompletion { std::shared_ptr<TabState> tab;HttpResult result; };
+struct HttpCompletion { std::shared_ptr<TabState> tab;HttpResult result;RequestSnapshot request; };
 struct ImportDownload { string targetId;string sourceUrl;HttpResult result; };
 struct FolderChoice { ApiFolder* folder=nullptr;std::wstring label; };
 struct FolderPickerContext { const std::vector<FolderChoice>* choices=nullptr;ApiFolder* selected=nullptr;bool accepted=false; };
@@ -96,7 +98,7 @@ struct FolderPickerContext { const std::vector<FolderChoice>* choices=nullptr;Ap
 MainWindowServices gServices{};
 HINSTANCE gInstance{};
 HMODULE gRichEditModule{};
-HWND gWindow{},gSearchFrame{},gSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gTabOverflow{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
+HWND gWindow{},gSearchFrame{},gSearch{},gSearchEmpty{},gClearSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gTabOverflow{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
 HWND gEditorTabs{},gKvList{},gBodyType{},gFormat{},gCompress{},gBody{},gValidation{};
 HWND gSummary{},gResponseTabs{},gResponseBody{},gResponseHeaders{},gResponseFindPanel{},gResponseFindEdit{},gResponseFindPrev{},gResponseFindNext{},gResponseFindClose{},gBodyNone{},gEmptyTitle{},gEmptyHelp{},gEmptyNewRequest{};
 HWND gResponseMode{},gResponseModeDivider{},gResponseFind{},gFindStatus{},gResponseToolbarHot{},gRequestToolbarHot{};
@@ -131,6 +133,7 @@ int gFocusedEntryColumn=1;
 bool gImeComposing=false;
 bool gResizeSidebar=false,gResizePanels=false,gAddFolderHot=false;
 HWND gDropdownHot{};
+string gImportFolderId;
 std::atomic<bool> gImportCancel=false;
 bool gImporting=false;
 wstring gSaveStatus=L"已保存";
@@ -356,6 +359,15 @@ LRESULT drawTreeItem(const NMTVCUSTOMDRAW* draw) {
     if(folder){
         auto value=(ApiFolder*)ref->value;bool module=TreeView_GetParent(gTree,item)==nullptr;RECT glyph{textRect.left,center-px(7),textRect.left+px(15),center+px(7)};
         drawFolderGlyph(draw->nmcd.hdc,glyph,(info.state&TVIS_EXPANDED)!=0,module);textRect.left+=px(21);font=gTreeFolderFont;text=toWide(value->name);
+        const bool importing=gImporting&&value->id==gImportFolderId;
+        if(importing){
+            const wchar_t* status=gImportCancel?L"正在取消…":L"正在导入…";
+            RECT badge=textRect;
+            badge.left=std::max(badge.left,badge.right-px(69));
+            SetTextColor(draw->nmcd.hdc,COLOR_ACCENT);
+            DrawTextW(draw->nmcd.hdc,status,-1,&badge,DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
+            textRect.right=badge.left-px(4);
+        }
         auto old=(HFONT)SelectObject(draw->nmcd.hdc,font);SetTextColor(draw->nmcd.hdc,COLOR_PRIMARY);DrawTextW(draw->nmcd.hdc,text.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
         if(!module){SIZE nameSize{};GetTextExtentPoint32W(draw->nmcd.hdc,text.c_str(),(int)text.size(),&nameSize);RECT countRect=textRect;countRect.left=std::min(textRect.right,textRect.left+nameSize.cx+px(5));SelectObject(draw->nmcd.hdc,gUiFont);SetTextColor(draw->nmcd.hdc,COLOR_SECONDARY);wstring count=L"("+std::to_wstring(value->requests.size())+L")";DrawTextW(draw->nmcd.hdc,count.c_str(),-1,&countRect,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);}
         SelectObject(draw->nmcd.hdc,old);
@@ -368,6 +380,22 @@ LRESULT drawTreeItem(const NMTVCUSTOMDRAW* draw) {
         textRect.left+=px(18);auto old=(HFONT)SelectObject(draw->nmcd.hdc,gUiFont);SetTextColor(draw->nmcd.hdc,COLOR_PRIMARY);text=toWide(requestCase->name);DrawTextW(draw->nmcd.hdc,text.c_str(),-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);SelectObject(draw->nmcd.hdc,old);
     }
     RestoreDC(draw->nmcd.hdc,savedDc);return CDRF_SKIPDEFAULT;
+}
+
+void drawRequestSpinner(HDC dc,int x,int y,std::chrono::steady_clock::time_point started) {
+    int saved=SaveDC(dc);
+    auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
+    int frame=(int)((elapsed/100)%8);
+    constexpr POINT offsets[]={{0,-5},{4,-4},{5,0},{4,4},{0,5},{-4,4},{-5,0},{-4,-4}};
+    SelectObject(dc,GetStockObject(NULL_PEN));
+    SelectObject(dc,GetStockObject(DC_BRUSH));
+    for(int i=0;i<8;++i){
+        int fade=(frame-i+8)%8;
+        SetDCBrushColor(dc,RGB(72+20*fade,96+17*fade,140+12*fade));
+        int cx=x+px(offsets[i].x),cy=y+px(offsets[i].y),radius=px(1);
+        Ellipse(dc,cx-radius,cy-radius,cx+radius+1,cy+radius+1);
+    }
+    RestoreDC(dc,saved);
 }
 
 RECT requestTabCardRect(HWND tab,int index) {
@@ -418,7 +446,9 @@ void paintRequestTabs(HWND tab,HDC dc) {
         SelectObject(dc,gTreeMethodFont);SetTextColor(dc,methodStyle(method,!enabled).text);
         SIZE methodSize{};GetTextExtentPoint32W(dc,method.c_str(),(int)method.size(),&methodSize);
         int end=hot?close.left-px(3):card.right-px(8);
-        RECT prefix{card.left+px(8),card.top,std::min<LONG>(card.left+px(8)+methodSize.cx,end),card.bottom};
+        int left=card.left+px(8);
+        if(state.sending){drawRequestSpinner(dc,left+px(5),center,state.started);left+=px(15);}
+        RECT prefix{left,card.top,std::min<LONG>(left+methodSize.cx,end),card.bottom};
         DrawTextW(dc,method.c_str(),-1,&prefix,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
         RECT name{prefix.right+px(5),card.top,end-(state.displayedDirty?px(8):0),card.bottom};
         SelectObject(dc,active?gTreeFolderFont:gUiFont);SetTextColor(dc,!enabled?COLOR_SECONDARY:(active?COLOR_PRIMARY:RGB(75,85,99)));
@@ -590,17 +620,7 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
         if(tab&&tab->sending){
             SIZE size{};GetTextExtentPoint32W(draw->hDC,label.c_str(),(int)label.size(),&size);
             int x=rect.right-size.cx-px(13),y=(rect.top+rect.bottom)/2;
-            auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-tab->started).count();
-            int frame=(int)((elapsed/100)%8);
-            constexpr POINT offsets[]={{0,-5},{4,-4},{5,0},{4,4},{0,5},{-4,4},{-5,0},{-4,-4}};
-            SelectObject(draw->hDC,GetStockObject(NULL_PEN));
-            SelectObject(draw->hDC,GetStockObject(DC_BRUSH));
-            for(int i=0;i<8;++i){
-                int fade=(frame-i+8)%8;
-                SetDCBrushColor(draw->hDC,RGB(72+20*fade,96+17*fade,140+12*fade));
-                int cx=x+px(offsets[i].x),cy=y+px(offsets[i].y),radius=px(1);
-                Ellipse(draw->hDC,cx-radius,cy-radius,cx+radius+1,cy+radius+1);
-            }
+            drawRequestSpinner(draw->hDC,x,y,tab->started);
         }
         DrawTextW(draw->hDC,label.c_str(),-1,&rect,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
         RestoreDC(draw->hDC,saved);return;
@@ -920,6 +940,9 @@ void rebuildTree() {
     gRebuildingTree=true;
     gTreeSelection=nullptr;TreeView_DeleteAllItems(gTree);gNodeRefs.clear();wstring query=trimWide(textOf(gSearch));
     for(auto& folder:gData.folders)insertFolder(*folder,TVI_ROOT,query,false);
+    bool emptySearch=!query.empty()&&!TreeView_GetRoot(gTree);
+    setVisible(gSearchEmpty,emptySearch);
+    setVisible(gClearSearch,emptySearch);
     if(preserveValue){
         std::function<HTREEITEM(HTREEITEM)> find=[&](HTREEITEM parent)->HTREEITEM{
             for(HTREEITEM item=TreeView_GetChild(gTree,parent);item;item=TreeView_GetNextSibling(gTree,item)){
@@ -935,6 +958,7 @@ void rebuildTree() {
         SendMessageW(gTree,WM_SETREDRAW,TRUE,0);
         RedrawWindow(gTree,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME);
     }
+    setVisible(gTree,!emptySearch);
 }
 
 HTREEITEM findTreeRequest(ApiRequest* request) {
@@ -1164,7 +1188,10 @@ bool pickFolder(const std::vector<FolderChoice>& choices,ApiFolder*& selected) {
     EnableWindow(gWindow,TRUE);SetForegroundWindow(gWindow);if(context.accepted){selected=context.selected;return true;}return false;
 }
 
+HWND gOverflowList{};
+bool gClosingOverflowRow=false;
 void refreshRequestTabs() {
+    if(gOverflowList&&!gClosingOverflowRow)DestroyWindow(gOverflowList);
     gRequestTabHot=gRequestTabCloseHot=-1;
     SendMessageW(gRequestTabs,WM_SETREDRAW,FALSE,0);
     TabCtrl_DeleteAllItems(gRequestTabs);
@@ -1253,11 +1280,11 @@ void updateTabOverflow() {
     InvalidateRect(gRequestTabs,nullptr,FALSE);
 }
 
-HWND gOverflowList{};
 std::vector<std::shared_ptr<TabState>> gOverflowRows;
 std::shared_ptr<TabState> gMenuContext;
 constexpr int OVERFLOW_CLOSE_WIDTH=34;
-void showTabOverflow();
+void showTabOverflow(bool focusList=true);
+void refreshOverflowList(HWND list,int row,int top);
 
 bool contextActionEnabled(int row) {
     auto it=std::find(gTabs.begin(),gTabs.end(),gMenuContext);
@@ -1311,24 +1338,34 @@ void activateOverflowRow(HWND h,int row,bool close) {
     }
     int action=row-(int)gOverflowRows.size();
     auto target=action<0?gOverflowRows[row]:nullptr;
+    if(target&&close){
+        auto it=std::find(gTabs.begin(),gTabs.end(),target);
+        if(it==gTabs.end())return;
+        int top=(int)SendMessageW(h,LB_GETTOPINDEX,0,0);
+        SendMessageW(h,WM_SETREDRAW,FALSE,0);
+        gClosingOverflowRow=true;
+        closeTab((int)(it-gTabs.begin()));
+        gClosingOverflowRow=false;
+        if(gOverflowList==h)refreshOverflowList(h,row,top);
+        return;
+    }
     DestroyWindow(h);
     if(target){
         auto it=std::find(gTabs.begin(),gTabs.end(),target);
         if(it==gTabs.end())return;
-        if(close)closeTab((int)(it-gTabs.begin()));
-        else openRequest(target->request,target->requestCase);
+        openRequest(target->request,target->requestCase);
     }else if(action==0)closeTab(gSelectedTab);
     else closeTabRange(gSelectedTab,action==1?IDM_TAB_CLOSE_OTHERS:IDM_TAB_CLOSE_ALL);
     SetFocus(gRequestTabs);
 }
 LRESULT CALLBACK overflowListProc(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR){
-    if(msg==WM_TIMER&&w==1&&!gMenuContext){
+    if(msg==WM_TIMER&&w==1&&!gMenuContext&&!gClosingOverflowRow){
         POINT cursor{};RECT button{},list{};
         GetWindowRect(gTabOverflow,&button);GetWindowRect(h,&list);
         if(GetCursorPos(&cursor)&&!PtInRect(&button,cursor)&&!PtInRect(&list,cursor))DestroyWindow(h);
         return 0;
     }
-    if(msg==WM_KILLFOCUS){PostMessageW(h,WM_CLOSE,0,0);return 0;}
+    if(msg==WM_KILLFOCUS&&!gClosingOverflowRow){PostMessageW(h,WM_CLOSE,0,0);return 0;}
     if(msg==WM_KEYDOWN){
         if(w==VK_ESCAPE){HWND owner=gMenuContext?gRequestTabs:gTabOverflow;DestroyWindow(h);SetFocus(owner);return 0;}
         if(w==VK_RETURN||w==VK_DELETE){
@@ -1351,17 +1388,18 @@ LRESULT CALLBACK overflowListProc(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,
     if(msg==WM_NCDESTROY){gOverflowList=nullptr;gMenuContext.reset();gOverflowRows.clear();RemoveWindowSubclass(h,overflowListProc,id);}
     return DefSubclassProc(h,msg,w,l);
 }
-void showTabList(RECT anchor,int context=-1) {
-    if(gOverflowList){
-        if(context<0)return;
+void showTabList(RECT anchor,int context=-1,bool focusList=true,HWND reuse=nullptr) {
+    if(gOverflowList&&!reuse){
+        if(context<0){if(focusList){KillTimer(gOverflowList,1);SetFocus(gOverflowList);}return;}
         DestroyWindow(gOverflowList);
     }
     if(context>=0)gMenuContext=gTabs[context];
     else{
-        if(!IsWindowVisible(gTabOverflow))return;
+        gOverflowRows.clear();
+        if(!IsWindowVisible(gTabOverflow)){if(reuse)DestroyWindow(reuse);return;}
         for(int i=0;i<(int)gTabs.size();++i)
             if(i<gFirstVisibleTab||i>=gPastVisibleTab)gOverflowRows.push_back(gTabs[i]);
-        if(gOverflowRows.empty())return;
+        if(gOverflowRows.empty()){if(reuse)DestroyWindow(reuse);return;}
     }
     MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromWindow(gWindow,MONITOR_DEFAULTTONEAREST),&monitor);
     RECT work=monitor.rcWork;int rowHeight=px(34);
@@ -1370,10 +1408,13 @@ void showTabList(RECT anchor,int context=-1) {
     int height=std::min<int>((context>=0?4:(int)gOverflowRows.size()+3)*rowHeight+2,space);
     int x=std::clamp<int>(context>=0?anchor.left:anchor.right-width,work.left,work.right-width);
     int y=anchor.bottom+height<=work.bottom?anchor.bottom:anchor.top-height;
-    HWND list=CreateWindowExW(WS_EX_TOOLWINDOW,L"LISTBOX",context>=0?L"标签操作":L"隐藏的接口标签",WS_POPUP|WS_BORDER|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS,
+    HWND list=reuse?reuse:CreateWindowExW(WS_EX_TOOLWINDOW,L"LISTBOX",context>=0?L"标签操作":L"隐藏的接口标签",WS_POPUP|WS_BORDER|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS,
         x,y,width,height,gWindow,nullptr,gInstance,nullptr);
     if(!list){gMenuContext.reset();gOverflowRows.clear();return;}
-    gOverflowList=list;SetWindowSubclass(list,overflowListProc,1,0);applyFont(list);
+    if(reuse){
+        SendMessageW(list,LB_RESETCONTENT,0,0);
+        SetWindowPos(list,nullptr,x,y,width,height,SWP_NOACTIVATE|SWP_NOZORDER);
+    }else{gOverflowList=list;SetWindowSubclass(list,overflowListProc,1,0);applyFont(list);}
     SendMessageW(list,LB_SETITEMHEIGHT,0,rowHeight);
     for(const auto& tab:gOverflowRows){
         const auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
@@ -1385,13 +1426,25 @@ void showTabList(RECT anchor,int context=-1) {
     }else for(const auto* action:{L"关闭当前标签页",L"关闭其他标签页",L"关闭全部标签页"})
         SendMessageW(list,LB_ADDSTRING,0,(LPARAM)action);
     SetWindowRgn(list,CreateRoundRectRgn(0,0,width+1,height+1,px(10),px(10)),TRUE);
-    ShowWindow(list,SW_SHOW);SetFocus(list);
+    if(!reuse){
+        ShowWindow(list,focusList?SW_SHOW:SW_SHOWNOACTIVATE);
+        if(focusList)SetFocus(list);else SetTimer(list,1,32,nullptr);
+    }
 }
-void showTabOverflow(){RECT r{};GetWindowRect(gTabOverflow,&r);showTabList(r);}
+void refreshOverflowList(HWND list,int row,int top){
+    RECT anchor{};GetWindowRect(gTabOverflow,&anchor);
+    showTabList(anchor,-1,false,list);
+    if(gOverflowList!=list)return;
+    int last=(int)gOverflowRows.size()-1;
+    SendMessageW(list,LB_SETCURSEL,std::min(row,last),0);
+    SendMessageW(list,LB_SETTOPINDEX,std::min(top,last),0);
+    SendMessageW(list,WM_SETREDRAW,TRUE,0);
+    RedrawWindow(list,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ERASE);
+}
+void showTabOverflow(bool focusList){RECT r{};GetWindowRect(gTabOverflow,&r);showTabList(r,-1,focusList);}
 LRESULT CALLBACK tabOverflowProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR){
     if(message==WM_MOUSEMOVE&&!gMenuContext){
-        showTabOverflow();
-        if(gOverflowList)SetTimer(gOverflowList,1,32,nullptr);
+        showTabOverflow(false);
     }
     if(message==WM_NCDESTROY)RemoveWindowSubclass(h,tabOverflowProc,id);
     return DefSubclassProc(h,message,w,l);
@@ -1989,7 +2042,7 @@ void moveRequestDirect(ApiRequest* request,ApiFolder* target) {
 
 void showTreeMenu(POINT point) {
     if(!gTreeSelection)return;HMENU menu=CreatePopupMenu();
-    if(gTreeSelection->kind==NodeRef::Kind::Folder){AppendMenuW(menu,MF_STRING,IDM_FOLDER_ADD_REQUEST,L"＋ 新增接口");AppendMenuW(menu,MF_STRING,IDM_FOLDER_ADD_CHILD,L"＋ 新增子目录");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,gImporting?MF_GRAYED:MF_STRING,IDM_FOLDER_IMPORT,L"导入 OpenAPI/Swagger");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,IDM_FOLDER_RENAME,L"重命名\tF2");AppendMenuW(menu,MF_STRING,IDM_FOLDER_DELETE,L"删除目录\tDelete");}
+    if(gTreeSelection->kind==NodeRef::Kind::Folder){AppendMenuW(menu,MF_STRING,IDM_FOLDER_ADD_REQUEST,L"＋ 新增接口");AppendMenuW(menu,MF_STRING,IDM_FOLDER_ADD_CHILD,L"＋ 新增子目录");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);if(gImporting&&((ApiFolder*)gTreeSelection->value)->id==gImportFolderId)AppendMenuW(menu,gImportCancel?MF_GRAYED:MF_STRING,IDM_CANCEL_IMPORT,L"取消导入");else AppendMenuW(menu,gImporting?MF_GRAYED:MF_STRING,IDM_FOLDER_IMPORT,L"导入 OpenAPI/Swagger");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,IDM_FOLDER_RENAME,L"重命名\tF2");AppendMenuW(menu,MF_STRING,IDM_FOLDER_DELETE,L"删除目录\tDelete");}
     else if(gTreeSelection->kind==NodeRef::Kind::Request){AppendMenuW(menu,MF_STRING,IDM_REQUEST_OPEN,L"打开接口");AppendMenuW(menu,MF_STRING,IDM_REQUEST_RENAME,L"重命名\tF2");AppendMenuW(menu,MF_STRING,IDM_REQUEST_DUPLICATE,L"复制接口\tCtrl+D");AppendMenuW(menu,gData.folders.size()>1?MF_STRING:MF_GRAYED,IDM_REQUEST_MOVE,L"移动接口");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,IDM_REQUEST_DELETE,L"删除接口\tDelete");}
     else {AppendMenuW(menu,MF_STRING,IDM_REQUEST_OPEN,L"打开用例");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,IDM_CASE_DELETE,L"删除用例\tDelete");}
     TrackPopupMenu(menu,TPM_RIGHTBUTTON,point.x,point.y,0,gWindow,nullptr);DestroyMenu(menu);
@@ -1997,7 +2050,7 @@ void showTreeMenu(POINT point) {
 void importOpenApi(ApiFolder* folder) {
     if(!folder||gImporting)return;wstring url;
     if(!prompt(L"导入 OpenAPI/Swagger",L"请输入 Swagger/OpenAPI JSON 地址：",L"https://localhost:7297/swagger/v1/swagger.json",url))return;
-    gImporting=true;gImportCancel=false;
+    gImporting=true;gImportCancel=false;gImportFolderId=folder->id;InvalidateRect(gTree,nullptr,FALSE);
     RequestSnapshot request;request.method="GET";request.url=toUtf8(url);
     string targetId=folder->id;gImportWorker=std::thread([targetId=std::move(targetId),request=std::move(request)](){
         auto download=new ImportDownload();download->targetId=targetId;download->sourceUrl=request.url;download->result=executeHttp(request,gImportCancel,&gImportRequest);PostMessageW(gWindow,WM_IMPORT_DONE,(WPARAM)download,0);
@@ -2478,11 +2531,46 @@ RequestSnapshot snapshotCurrent() {
     ParsedUrlQuery draft=parseUrlQuery(r.url);if(draft.hasQuery&&!draft.complete)snapshot.query.clear();
     return snapshot;
 }
+bool matchesResponse(const TabState& tab,const RequestSnapshot& current) {
+    if(!tab.responseRequest)return false;
+    const auto& sent=*tab.responseRequest;
+    return sent.method==current.method&&sent.url==current.url&&sent.bodyType==current.bodyType&&sent.body==current.body&&
+           sameEntries(sent.query,current.query)&&sameEntries(sent.headers,current.headers)&&sameEntries(sent.formFields,current.formFields);
+}
+
+void saveCurrentAsCase() {
+    auto tab=selectedTab();
+    if(!tab||tab->requestCase)return;
+    auto current=snapshotCurrent();
+    bool stale=!tab->responseSummary.empty()&&!matchesResponse(*tab,current);
+    wstring name;
+    if(!prompt(L"保存用例",stale?L"参数已修改，本次仅保存请求。请输入用例名称：":L"请输入用例名称：",L"成功",name))return;
+    auto saved=std::make_unique<ApiRequestCase>();
+    RequestContent::from(*tab->request).apply(*saved);
+    saved->id=newId();saved->name=toUtf8(name);
+    if(matchesResponse(*tab,current)){
+        saved->responseSummary=toUtf8(tab->responseSummary);saved->responseRaw=tab->responseRaw;
+        saved->responsePretty=tab->responsePretty;saved->responseHeaders=tab->responseHeaders;
+    }
+    tab->request->cases.push_back(std::move(saved));rebuildTree();saveNow();
+}
+
+void selectJsonError(const string& source,size_t offset) {
+    if(offset==string::npos)return;
+    auto prefix=toWide(source.substr(0,offset));
+    // Rich Edit counts each CRLF paragraph break as one selection position.
+    LONG start=(LONG)prefix.size();
+    if(gRichEditModule)for(size_t i=1;i<prefix.size();++i)if(prefix[i-1]==L'\r'&&prefix[i]==L'\n')--start;
+    int length=offset==source.size()?0:((unsigned char)source[offset]>=0xF0?2:1);
+    SetFocus(gBody);SendMessageW(gBody,EM_SETSEL,start,start+length);SendMessageW(gBody,EM_SCROLLCARET,0,0);
+}
+
 void formatCurrentJson(bool compact) {
     auto tab=selectedTab();if(!tab)return;string source=toUtf8(textOf(gBody));
     if(trimWide(toWide(source)).empty()){tab->validation=L"JSON 内容不能为空。";setValidationText(tab->validation);return;}
     if(source.size()>2*1024*1024){tab->validation=L"JSON 内容超过 2 MB，无法格式化或压缩。";setValidationText(tab->validation);return;}
-    if(auto error=jsonValidationMessage(source,!compact);!error.empty()){tab->validation=std::move(error);setValidationText(tab->validation);return;}
+    size_t offset=string::npos;
+    if(auto error=jsonValidationMessage(source,true,&offset);!error.empty()){tab->validation=std::move(error);setValidationText(tab->validation);selectJsonError(source,offset);return;}
     wstring formatted=toWide(prettyJson(source,compact));
     if(!compact){
         wstring windowsText;windowsText.reserve(formatted.size()+formatted.size()/8);
@@ -2500,25 +2588,26 @@ void sendCurrent() {
     RequestSnapshot request=snapshotCurrent();captureView();
     wstring url=trimWide(toWide(buildRequestUrl(request)));
     URL_COMPONENTSW parts{};parts.dwStructSize=sizeof(parts);parts.dwSchemeLength=(DWORD)-1;parts.dwHostNameLength=(DWORD)-1;
-    wstring error;HWND invalidControl=gUrl;
+    wstring error;HWND invalidControl=gUrl;size_t offset=string::npos;
     if(url.empty()||!WinHttpCrackUrl(url.c_str(),0,0,&parts)||parts.dwHostNameLength==0||
         (parts.nScheme!=INTERNET_SCHEME_HTTP&&parts.nScheme!=INTERNET_SCHEME_HTTPS))error=L"请输入完整的 HTTP 或 HTTPS 请求地址。";
     if(error.empty()&&request.bodyType=="JSON"&&!trimWide(toWide(request.body)).empty()){
         invalidControl=gBody;
-        error=request.body.size()>2*1024*1024?L"JSON 内容超过 2 MB，无法发送。":jsonValidationMessage(request.body);
+        error=request.body.size()>2*1024*1024?L"JSON 内容超过 2 MB，无法发送。":jsonValidationMessage(request.body,true,&offset);
     }
     if(!error.empty()){
         tab->validation=error;
         if(invalidControl==gBody){gEditorPage=tab->editorPage=2;TabCtrl_SetCurSel(gEditorTabs,2);showEditorPage();}
-        setValidationText(error);SetFocus(invalidControl);return;
+        setValidationText(error);SetFocus(invalidControl);selectJsonError(request.body,offset);return;
     }
     if(tab->worker.joinable())tab->worker.join();
     tab->cancel=false;tab->sending=true;tab->workerFinished=false;tab->started=std::chrono::steady_clock::now();tab->summary=L"请求中";
     tab->validation.clear();tab->oldResponse=!tab->responseSummary.empty();
     setValidationText(L"");setVisible(gSend,false);setVisible(gCancel,true);EnableWindow(gCancel,TRUE);setText(gCancel,L"取消");showResponsePage();
     SetTimer(gWindow,REQUEST_TIMER,100,nullptr);
-    auto keep=tab;tab->worker=std::thread([keep,request=std::move(request)](){
+    auto keep=tab;tab->worker=std::thread([keep,request=std::move(request)]() mutable {
         auto completion=new HttpCompletion();completion->tab=keep;completion->result=executeHttp(request,keep->cancel,&keep->activeRequest);
+        completion->request=std::move(request);
         if(!PostMessageW(gWindow,WM_HTTP_DONE,(WPARAM)completion,0))delete completion;
         keep->workerFinished=true;
     });
@@ -2530,7 +2619,7 @@ void cancelCurrent() {
     updateResponseSummary();
 }
 void moveFocus(HWND from,bool backwards) {
-    std::vector<HWND> order={gSearch,gAddFolder,gTree,gRequestTabs,gTabOverflow,gSave,gSaveMore,gMethod,gUrl,gSend,gCancel,
+    std::vector<HWND> order={gSearch,gClearSearch,gAddFolder,gTree,gRequestTabs,gTabOverflow,gSave,gSaveMore,gMethod,gUrl,gSend,gCancel,
         gEditorTabs,gBodyType,gFormat,gCompress,gKvList,gBody,gResponseTabs,gResponseMode,gResponseFind,
         gResponseFindEdit,gResponseFindPrev,gResponseFindNext,gResponseFindClose,gResponseBody,gResponseHeaders};
     order.erase(std::remove_if(order.begin(),order.end(),[](HWND control){return !control||!IsWindowVisible(control)||!IsWindowEnabled(control);}),order.end());
@@ -2630,6 +2719,8 @@ void createControls() {
     gAddFolder=child(L"BUTTON",L"+",BS_OWNERDRAW,IDC_ADD_FOLDER);SetWindowSubclass(gAddFolder,addFolderProc,14,0);
     gSidebarDivider=child(L"STATIC",L"",SS_LEFT,IDC_SIDEBAR_DIVIDER);
     gTree=child(WC_TREEVIEWW,L"",TVS_SHOWSELALWAYS|TVS_FULLROWSELECT|TVS_TRACKSELECT|TVS_NOHSCROLL,IDC_TREE,0);TreeView_SetExtendedStyle(gTree,TVS_EX_DOUBLEBUFFER,TVS_EX_DOUBLEBUFFER);
+    gSearchEmpty=child(L"STATIC",L"未找到匹配的接口",SS_CENTER,IDC_SEARCH_EMPTY);
+    gClearSearch=child(L"BUTTON",L"清除搜索",BS_PUSHBUTTON,IDC_CLEAR_SEARCH);
     SetWindowSubclass(gTree,treeExpansionProc,1,0);
     // Keep the tab control and its custom scrollbar in adjacent rectangles.
     // Overlapping sibling windows can briefly expose one another while the tab
@@ -2729,6 +2820,7 @@ void layout(int width,int height) {
     int sidebar=std::clamp(gData.sidebarWidth,180,std::max(180,std::min(420,width-660)));int workspaceX=sidebar;int workspaceW=width-workspaceX;
     constexpr int contentInset=10;int contentX=workspaceX+contentInset;int contentW=workspaceW-contentInset*2;
     move(gSearchFrame,12,12,sidebar-64,32);move(gSearch,16,16,sidebar-72,24);move(gAddFolder,sidebar-44,12,32,32);move(gSidebarDivider,0,55,sidebar,1);move(gTree,8,64,sidebar-16,height-72);
+    move(gSearchEmpty,8,92,sidebar-16,24);move(gClearSearch,(sidebar-88)/2,122,88,30);
     constexpr int requestRowTop=REQUEST_BAR_TOP;constexpr int rowHeight=REQUEST_BAR_HEIGHT;constexpr int commandGap=10;constexpr int saveWidth=88;constexpr int saveMoreWidth=24;constexpr int sendWidth=96;
     // Workspace actions stay fixed while request tabs scroll inside their own viewport.
     int tabViewportWidth=contentW-saveWidth-saveMoreWidth-4;
@@ -2886,11 +2978,19 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDC_BODY_TYPE:if(notification==CBN_SELCHANGE&&!gLoadingEditor){saveEditor(false);auto tab=selectedTab();if(tab){auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;int selected=(int)SendMessageW(gBodyType,CB_GETCURSEL,0,0);const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};if(selected>=0&&selected<5)request.bodyType=types[selected];}updateBodyAppearance();showEditorPage();scheduleSave();}break;
         case IDC_FORMAT:if(notification==BN_CLICKED)formatCurrentJson(false);break;
         case IDC_COMPRESS:if(notification==BN_CLICKED)formatCurrentJson(true);break;
+        case IDC_CLEAR_SEARCH:setText(gSearch,L"");SetFocus(gSearch);break;
         case IDC_TAB_OVERFLOW:if(notification==BN_CLICKED)showTabOverflow();break;
         case IDC_SAVE_MORE:{HMENU menu=CreatePopupMenu();auto tab=selectedTab();AppendMenuW(menu,tab&&!tab->requestCase?MF_STRING:MF_GRAYED,IDM_SAVE_CASE,L"保存用例");RECT r{};GetWindowRect(gSaveMore,&r);TrackPopupMenu(menu,TPM_RIGHTBUTTON,r.left,r.bottom,0,h,nullptr);DestroyMenu(menu);break;}
-        case IDM_SAVE_CASE:{auto tab=selectedTab();if(tab&&tab->request&&!tab->requestCase){wstring name;if(prompt(L"保存用例",L"请输入用例名称：",L"成功",name)){saveEditor();auto c=std::make_unique<ApiRequestCase>();c->id=newId();c->name=toUtf8(name);c->method=tab->request->method;c->url=tab->request->url;c->query=tab->request->query;c->headers=tab->request->headers;c->bodyType=tab->request->bodyType;c->body=tab->request->body;c->formFields=tab->request->formFields;c->responseSummary=toUtf8(tab->responseSummary);c->responseRaw=tab->responseRaw;c->responsePretty=tab->responsePretty;c->responseHeaders=tab->responseHeaders;tab->request->cases.push_back(std::move(c));rebuildTree();saveNow();}}break;}
+        case IDM_SAVE_CASE:saveCurrentAsCase();break;
         case IDM_FOLDER_ADD_REQUEST:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Folder)addRequest((ApiFolder*)gTreeSelection->value);break;
         case IDM_FOLDER_ADD_CHILD:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Folder)addFolder((ApiFolder*)gTreeSelection->value);break;
+        case IDM_CANCEL_IMPORT:
+            if(gImporting){
+                gImportCancel=true;
+                if(auto handle=gImportRequest.exchange(nullptr))WinHttpCloseHandle(handle);
+                InvalidateRect(gTree,nullptr,FALSE);
+            }
+            break;
         case IDM_FOLDER_IMPORT:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Folder)importOpenApi((ApiFolder*)gTreeSelection->value);break;
         case IDM_FOLDER_RENAME:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Folder)renameFolder((ApiFolder*)gTreeSelection->value);break;
         case IDM_REQUEST_RENAME:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Request)renameRequest((ApiRequest*)gTreeSelection->value);break;
@@ -2979,6 +3079,7 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
                 sending=true;
                 if(tab==selectedTab())InvalidateRect(gSummary,nullptr,FALSE);
             }
+            if(sending)InvalidateRect(gRequestTabs,nullptr,FALSE);
             if(!sending)KillTimer(h,REQUEST_TIMER);return 0;
         }break;
     case WM_HTTP_DONE:{
@@ -2992,11 +3093,12 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(std::find(gTabs.begin(),gTabs.end(),tab)==gTabs.end())return 0;
         if(gClosingPrompt){gDeferredCompletions.emplace_back(WM_HTTP_DONE,(WPARAM)completion.release());return 0;}
         if(selectedTab()==tab)captureView();
-        tab->validation.clear();tab->sending=false;
+        tab->validation.clear();tab->sending=false;InvalidateRect(gRequestTabs,nullptr,FALSE);
         if(result.transportSuccess){
             tab->responseRaw=std::move(result.rawBody);tab->responsePretty=std::move(result.prettyBody);tab->responseHeaders=std::move(result.headers);
             tab->statusCode=result.statusCode;tab->summary=std::to_wstring(result.statusCode)+L" "+result.statusText+L"    "+std::to_wstring(result.durationMs)+L" ms";
             if(result.truncated)tab->summary+=L" · 响应已截断";
+            tab->responseRequest=std::make_unique<RequestSnapshot>(std::move(completion->request));
             tab->responseSummary=tab->summary;tab->oldResponse=false;
             tab->selectionStart=tab->selectionEnd=0;tab->firstVisibleLine=tab->horizontalScroll=0;tab->responseScroll={};tab->findPosition=wstring::npos;tab->findStatus.clear();
         }else{
@@ -3013,6 +3115,8 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(gClosingPrompt){gDeferredCompletions.emplace_back(WM_IMPORT_DONE,w);return 0;}
         std::unique_ptr<ImportDownload> download((ImportDownload*)w);gImporting=false;
         if(gImportWorker.joinable())gImportWorker.join();
+        gImportFolderId.clear();InvalidateRect(gTree,nullptr,FALSE);
+        if(gImportCancel||download->result.cancelled)return 0;
         if(!download->result.transportSuccess){MessageBoxW(gWindow,download->result.errorMessage.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         if(download->result.statusCode<200||download->result.statusCode>=300){wstring downloadError=L"下载 Swagger/OpenAPI 文档失败：HTTP "+std::to_wstring(download->result.statusCode)+L" "+download->result.statusText;MessageBoxW(gWindow,downloadError.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         if(download->result.truncated){wstring sizeError=L"Swagger/OpenAPI 文档超过 5 MB，已取消导入。";MessageBoxW(gWindow,sizeError.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
@@ -3021,7 +3125,18 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         auto previewTarget=cloneFolderForImport(*target);OpenApiImportSummary preview;wstring previewError;
         if(!importOpenApiJson(*previewTarget,download->result.rawBody,false,preview,previewError,importSourceUrl)){MessageBoxW(gWindow,previewError.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         if(preview.added+preview.overwritten+preview.skipped==0){MessageBoxW(gWindow,L"未找到可导入的接口。",L"导入 OpenAPI/Swagger",MB_OK|MB_ICONINFORMATION);return 0;}
-        bool overwrite=false;if(preview.skipped>0){wstring conflictPrompt=L"发现 "+std::to_wstring(preview.skipped)+L" 个同目录同方法同 URL 的已有接口。\r\n\r\n选择“是”覆盖已有接口；选择“否”跳过已有接口；选择“取消”不导入。";int choice=MessageBoxW(gWindow,conflictPrompt.c_str(),L"导入冲突",MB_YESNOCANCEL|MB_ICONQUESTION);if(choice==IDCANCEL)return 0;overwrite=choice==IDYES;}
+        bool overwrite=false;
+        if(preview.skipped>0){
+            wstring conflictMessage=L"发现 "+std::to_wstring(preview.skipped)+L" 个目录、请求方法和 URL 相同的接口。";
+            TASKDIALOG_BUTTON buttons[]={{IDYES,L"覆盖已有接口"},{IDNO,L"跳过重复接口"},{IDCANCEL,L"取消导入"}};
+            TASKDIALOGCONFIG config{};config.cbSize=sizeof(config);config.hwndParent=gWindow;
+            config.dwFlags=TDF_ALLOW_DIALOG_CANCELLATION|TDF_POSITION_RELATIVE_TO_WINDOW;
+            config.pszWindowTitle=L"导入 OpenAPI/Swagger";config.pszMainInstruction=L"如何处理重复接口？";
+            config.pszContent=conflictMessage.c_str();config.pButtons=buttons;config.cButtons=3;config.nDefaultButton=IDNO;
+            int choice=IDCANCEL;
+            if(FAILED(gServices.showTaskDialog(&config,&choice,nullptr,nullptr))||choice==IDCANCEL)return 0;
+            overwrite=choice==IDYES;
+        }
         OpenApiImportSummary summary;wstring error;
         if(!importOpenApiJson(*target,download->result.rawBody,overwrite,summary,error,importSourceUrl)){MessageBoxW(gWindow,error.c_str(),L"导入 OpenAPI/Swagger 失败",MB_OK|MB_ICONWARNING);return 0;}
         rebuildTree();refreshRequestTabs();loadEditor();setSaveStatus(L"未保存");

@@ -112,6 +112,23 @@ static void runRequestTabTests(ApiRequest* request,ApiRequest* second) {
         check(last.right<=gTabClipStart+gTabClipWidth&&scroll.right<=boundsInWindow(gSave).left,
               "visible tabs fit completely beside the overflow and save buttons");
     }
+    ShowWindow(gWindow,SW_SHOWNOACTIVATE);
+    SetFocus(gUrl);
+    SendMessageW(gTabOverflow,WM_MOUSEMOVE,0,0);
+    HWND popup=gOverflowList;
+    check(popup&&GetFocus()==gUrl,"hover opens overflow without taking the URL editor focus");
+    int previousChoice=closeChoice;closeChoice=IDNO;
+    for(int i=0;i<2&&popup&&gOverflowList==popup&&gOverflowRows.size()>1;++i){
+        auto before=gTabs.size();
+        RECT item{};SendMessageW(popup,LB_GETITEMRECT,1,(LPARAM)&item);
+        LPARAM point=MAKELPARAM(item.right-px(12),(item.top+item.bottom)/2);
+        SendMessageW(popup,WM_LBUTTONDOWN,MK_LBUTTON,point);
+        SendMessageW(popup,WM_LBUTTONUP,0,point);
+        check(gOverflowList==popup&&gTabs.size()+1==before,"closing a hidden row updates the same popup in place");
+    }
+    closeChoice=previousChoice;
+    if(gOverflowList)DestroyWindow(gOverflowList);
+    ShowWindow(gWindow,SW_HIDE);
     while(gTabs.size()>1)closeTab((int)gTabs.size()-1,false);
     gData.sidebarWidth=originalSidebar;SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
     openRequest(request);updateTabOverflow();updateDirtyStatus();
@@ -594,7 +611,14 @@ static void runSidebarSearchTests() {
     requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
     check(requestItem&&treeItemIsRevealed(requestItem),"URL search reveals a nested request");
 
-    setText(gSearch,L"");rebuildTree();
+    setText(gSearch,L"missing-search-result");rebuildTree();
+    check((GetWindowLongPtrW(gClearSearch,GWL_STYLE)&WS_VISIBLE)&&
+          (GetWindowLongPtrW(gSearchEmpty,GWL_STYLE)&WS_VISIBLE)&&!TreeView_GetCount(gTree),
+          "an unmatched filter shows an empty message and a clear button");
+    SendMessageW(gClearSearch,BM_CLICK,0,0);
+    SendMessageW(gWindow,WM_SEARCH_REFRESH,0,0);
+    check(textOf(gSearch).empty()&&!(GetWindowLongPtrW(gClearSearch,GWL_STYLE)&WS_VISIBLE)&&
+          (GetWindowLongPtrW(gTree,GWL_STYLE)&WS_VISIBLE),"clear restores the sidebar tree");
     folderItem=findTreeValue(NodeRef::Kind::Folder,nestedPtr);
     requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
     check(folderItem&&requestItem&&!treeItemIsRevealed(requestItem)&&!nestedPtr->expanded&&
@@ -823,6 +847,21 @@ static void runControllerTests() {
     check(!tab->sending&&tab->responseRaw==oldBody&&!tab->validation.empty(),"invalid URL is rejected without removing the last response");
     setText(gUrl,L"http://127.0.0.1/test");tab->caseSnapshot->bodyType="JSON";tab->editorPage=2;loadEditor();setText(gBody,L"{");sendCurrent();
     check(!tab->sending&&tab->responseRaw==oldBody&&gEditorPage==2,"invalid JSON is rejected before transport and preserves response");
+    setText(gBody,L"{\r\n\"中文😀\": ?}");sendCurrent();
+    wchar_t selectedError[8]{};
+    SendMessageW(gBody,EM_GETSELTEXT,0,(LPARAM)selectedError);
+    check(wstring(selectedError)==L"?"&&tab->validation.find(L"第 2 行，第 8 个字符")!=wstring::npos,
+          "JSON validation selects the offending character after CRLF, CJK and a surrogate pair");
+    auto original=snapshotCurrent();
+    tab->responseRequest=std::make_unique<RequestSnapshot>(original);
+    auto changed=original;changed.body="{}";
+    check(matchesResponse(*tab,original)&&!matchesResponse(*tab,changed),"case response belongs to the sent request body");
+    gImporting=true;gImportFolderId="folder";gImportCancel=false;
+    SendMessageW(gWindow,WM_COMMAND,IDM_CANCEL_IMPORT,0);
+    auto cancelledImport=new ImportDownload();cancelledImport->targetId="folder";
+    cancelledImport->result.transportSuccess=true;
+    SendMessageW(gWindow,WM_IMPORT_DONE,(WPARAM)cancelledImport,0);
+    check(gImportCancel&&!gImporting&&gImportFolderId.empty(),"cancelled import drops even a completed download and clears folder status");
     setText(gBody,L"{}");finish(tab,false,true);
     check(tab->summary.find(L"已取消")==0&&tab->responseRaw==oldBody&&tab->oldResponse,"cancelled requests retain explicitly labelled previous response");
     finish(tab,false);check(tab->summary.find(L"网络错误")==0&&tab->responseRaw==oldBody,"network failures preserve previous response");

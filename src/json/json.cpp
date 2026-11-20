@@ -66,11 +66,17 @@ bool isValidJson(const string& value) {
     Json parsed;return Parser(value).parse(parsed);
 }
 
-wstring jsonValidationMessage(const string& value,bool includeColumn) {
+wstring jsonValidationMessage(const string& value,bool includeColumn,size_t* errorOffset) {
     Json parsed;Parser parser(value);if(parser.parse(parsed))return {};
     size_t position=std::min(parser.errorPosition(),value.size()),line=1,lineStart=0;
-    for(size_t i=0;i<position;++i)if(value[i]=='\n'){++line;lineStart=i+1;}
-    size_t column=position-lineStart+1;
+    while(position<value.size()&&position>0&&((unsigned char)value[position]&0xC0)==0x80)--position;
+    if(errorOffset)*errorOffset=position;
+    for(size_t i=0;i<position;++i){
+        if(value[i]=='\r'||(value[i]=='\n'&&(i==0||value[i-1]!='\r')))++line;
+        if(value[i]=='\r'||value[i]=='\n')lineStart=i+1;
+    }
+    size_t column=1;
+    for(size_t i=lineStart;i<position;++i)if(((unsigned char)value[i]&0xC0)!=0x80)++column;
     if(includeColumn)return L"JSON 格式不正确：第 "+std::to_wstring(line)+L" 行，第 "+std::to_wstring(column)+L" 个字符附近。";
     return L"JSON 格式不正确：第 "+std::to_wstring(line)+L" 行附近。";
 }
