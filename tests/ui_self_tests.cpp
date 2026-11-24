@@ -210,6 +210,28 @@ static void runEntryTableTests(ApiRequest* request) {
         }
     }
 
+    const int savedHeight=gData.requestPanelHeight;
+    const bool wasManual=gData.requestPanelHeightManual;
+    ShowWindow(gWindow,SW_SHOWNOACTIVATE);
+    RECT windowClient{};GetClientRect(gWindow,&windowClient);
+    const int x=px(gData.sidebarWidth+40);
+    const int divider=REQUEST_EDITOR_TOP+editorPanelHeight(dip(windowClient.bottom));
+    SendMessageW(gWindow,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,px(divider)));
+    bool framesComplete=gResizePanels;
+    for(int frame=0;frame<32;++frame){
+        int height=frame%2?185:310;
+        int y=px(REQUEST_EDITOR_TOP+height);
+        SendMessageW(gWindow,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(x,y));
+        RECT tabs=boundsInWindow(gResponseTabs),list=boundsInWindow(gKvList);
+        framesComplete=framesComplete&&tabs.top==px(REQUEST_EDITOR_TOP+height+4)&&list.bottom<=y
+            &&!GetUpdateRect(gResponseTabs,nullptr,FALSE)&&!GetUpdateRect(gKvList,nullptr,FALSE);
+    }
+    SendMessageW(gWindow,WM_LBUTTONUP,0,MAKELPARAM(x,px(REQUEST_EDITOR_TOP+185)));
+    check(framesComplete&&!gResizePanels&&gData.requestPanelHeight==185,
+          "rapid vertical splitter reversals paint the parameter list and response toolbar before release");
+    ShowWindow(gWindow,SW_HIDE);
+    gData.requestPanelHeight=savedHeight;gData.requestPanelHeightManual=wasManual;
+    layout(windowClient.right,windowClient.bottom);
     request->query.clear();
     for(int i=0;i<40;++i)request->query.push_back({true,"scroll-row-"+std::to_string(i),"before","string",""});
     fillEntryList(gKvList,request->query);editListCell(0,2,true);setText(gCellEditor,L"committed_before_scroll");
@@ -364,6 +386,13 @@ static void runRequestToolbarTests(ApiRequest* request) {
     frameDraw.hDC=buffer;frameDraw.rcItem=frameBounds;drawRequestControl(&frameDraw);
     check(GetPixel(buffer,urlCenterX,urlCenterY)==RGB(255,0,255),
           "URL frame repaint does not cover pixels inside the URL editor");
+    COLORREF edge=GetPixel(buffer,frameBounds.right/2,0);
+    bool blended=false;
+    for(int x=1;x<=px(REQUEST_CONTROL_CORNER_DIAMETER)/2;++x){
+        COLORREF corner=GetPixel(buffer,frameBounds.right-x,0);
+        blended|=GetRValue(corner)>GetRValue(edge)&&GetRValue(corner)<255;
+    }
+    check(blended,"URL corner blends its outline into the white background");
     SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);ReleaseDC(gUrlFrame,screen);
     const DWORD selectedStart=10,selectedEnd=24;SendMessageW(gUrl,EM_SETSEL,selectedStart,selectedEnd);
     for(UINT dpi:{96u,144u,192u}){
@@ -378,6 +407,9 @@ static void runRequestToolbarTests(ApiRequest* request) {
             for(size_t j=i+1;j<actions.size();++j){RECT overlap{};usable=usable&&!IntersectRect(&overlap,&rect,&actions[j]);}
         }
         RECT frame=boundsInWindow(gUrlFrame),url=boundsInWindow(gUrl),send=boundsInWindow(gSend),cancel=boundsInWindow(gCancel);
+        RECT method=boundsInWindow(gMethod);
+        check(method.right==frame.left&&method.top==frame.top&&method.bottom==frame.bottom,
+              "method and URL share a continuous outline at every DPI");
         check(usable&&url.left>=frame.left&&url.right<=frame.right&&url.top>=frame.top&&url.bottom<=frame.bottom&&EqualRect(&send,&cancel),
               "request controls stay usable at minimum width and send/cancel share one slot at every DPI");
         RECT save=boundsInWindow(gSave),more=boundsInWindow(gSaveMore),tabs=boundsInWindow(gRequestTabs);
@@ -583,6 +615,9 @@ static void runSidebarSearchTests() {
     auto matchPtr=match.get();auto otherPtr=other.get();
     request->cases.push_back(std::move(match));request->cases.push_back(std::move(other));
     nested->requests.push_back(std::move(request));root.children.push_back(std::move(nested));rebuildTree();
+    auto duplicate=std::make_unique<ApiRequest>();duplicate->id="duplicate-search-name";duplicate->name=requestPtr->name;
+    duplicate->method="POST";duplicate->url="https://example.invalid/refund?token=private";
+    auto duplicatePtr=duplicate.get();nestedPtr->requests.push_back(std::move(duplicate));
     HTREEITEM initialRequestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
     check(initialRequestItem&&!treeItemIsRevealed(initialRequestItem),
           "sidebar fixture request starts hidden inside a collapsed folder");
@@ -607,6 +642,20 @@ static void runSidebarSearchTests() {
     setText(gSearch,L"Billing upload");rebuildTree();
     requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
     check(requestItem&&treeItemIsRevealed(requestItem),"request name search reveals a nested request");
+    auto secondItem=findTreeValue(NodeRef::Kind::Request,duplicatePtr);
+    wchar_t label[128]{};TVITEMW info{};info.hItem=secondItem;info.mask=TVIF_TEXT;info.pszText=label;info.cchTextMax=128;
+    TreeView_GetItem(gTree,&info);
+    check(wstring(label)==L"POST Billing upload  /refund","duplicate hits expose method and path without query values");
+    auto previous=selectedTab();SetFocus(gSearch);
+    SendMessageW(gSearch,WM_KEYDOWN,VK_DOWN,0);SendMessageW(gSearch,WM_KEYDOWN,VK_DOWN,0);
+    check(TreeView_GetSelection(gTree)==secondItem&&selectedTab()==previous,"arrow keys highlight hits without opening them");
+    SendMessageW(gSearch,WM_IME_STARTCOMPOSITION,0,0);SendMessageW(gSearch,WM_KEYDOWN,VK_RETURN,0);
+    check(selectedTab()==previous,"IME confirmation does not open a search result");
+    SendMessageW(gSearch,WM_IME_ENDCOMPOSITION,0,0);SendMessageW(gSearch,WM_KEYDOWN,VK_RETURN,0);
+    check(selectedTab()&&selectedTab()->request==duplicatePtr,"Enter opens the highlighted duplicate");
+    if(selectedTab()&&selectedTab()->request==duplicatePtr)closeTab(gSelectedTab,false);
+    SetFocus(gSearch);SendMessageW(gSearch,WM_KEYDOWN,VK_ESCAPE,0);
+    check(textOf(gSearch).empty()&&gRenderedSearch.empty(),"Escape clears the filter and restores the tree");
     setText(gSearch,L"search-by-url");rebuildTree();
     requestItem=findTreeValue(NodeRef::Kind::Request,requestPtr);
     check(requestItem&&treeItemIsRevealed(requestItem),"URL search reveals a nested request");
@@ -616,7 +665,6 @@ static void runSidebarSearchTests() {
           (GetWindowLongPtrW(gSearchEmpty,GWL_STYLE)&WS_VISIBLE)&&!TreeView_GetCount(gTree),
           "an unmatched filter shows an empty message and a clear button");
     SendMessageW(gClearSearch,BM_CLICK,0,0);
-    SendMessageW(gWindow,WM_SEARCH_REFRESH,0,0);
     check(textOf(gSearch).empty()&&!(GetWindowLongPtrW(gClearSearch,GWL_STYLE)&WS_VISIBLE)&&
           (GetWindowLongPtrW(gTree,GWL_STYLE)&WS_VISIBLE),"clear restores the sidebar tree");
     folderItem=findTreeValue(NodeRef::Kind::Folder,nestedPtr);
@@ -822,7 +870,7 @@ static void runControllerTests() {
 
     auto tab=selectedTab();
     check(gRichEditModule!=nullptr,"response Rich Edit is available");
-    tab->responseRaw="{\"first\":1,\"user_name\":\"hello-world 中文\",\"ok\":true,\"empty\":null}";tab->responsePretty=prettyJson(tab->responseRaw);showResponsePage();
+    tab->responseRaw=R"({"first":1,"user_name":"hello-order-001 中文 \"引号\"","ok":true,"empty":null})";tab->responsePretty=prettyJson(tab->responseRaw);showResponsePage();
     auto rendered=responseText();auto key=rendered.find(L"user_name");
     SendMessageW(gResponseBody,EM_SETSEL,(WPARAM)key,(LPARAM)(key+9));
     CHARFORMAT2W keyFormat{};keyFormat.cbSize=sizeof(keyFormat);SendMessageW(gResponseBody,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&keyFormat);
@@ -836,10 +884,22 @@ static void runControllerTests() {
     POINTL hit{};SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&hit,(LPARAM)(key+3));
     SendMessageW(gResponseBody,WM_LBUTTONDBLCLK,MK_LBUTTON,MAKELPARAM(hit.x+1,hit.y+2));SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
     check(rendered.substr(start,end-start)==L"user_name","double click selects a complete English JSON field without quotes");
-    SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&hit,(LPARAM)(hello+2));
-    SendMessageW(gResponseBody,WM_LBUTTONDBLCLK,MK_LBUTTON,MAKELPARAM(hit.x+1,hit.y+2));SendMessageW(gResponseBody,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
-    check(rendered.substr(start,end-start)==L"hello","double click stops at punctuation inside JSON strings");
+    const wstring expectedValue=LR"(hello-order-001 中文 \"引号\")";
+    for(wchar_t target : wstring(L"h-0 中\\\"")){
+        size_t position=hello+expectedValue.find(target);
+        SendMessageW(gResponseBody,EM_SETSEL,position,position);
+        SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&hit,(LPARAM)position);
+        SendMessageW(gResponseBody,WM_LBUTTONDBLCLK,MK_LBUTTON,MAKELPARAM(hit.x+1,hit.y+2));
+        responseSelection(start,end);
+        check(start==hello&&end==hello+expectedValue.size(),"double click inside a formatted string selects exactly its value");
+        wchar_t selected[128]{};
+        SendMessageW(gResponseBody,EM_GETSELTEXT,0,(LPARAM)selected);
+        check(selected==expectedValue,"selected Rich Edit text includes punctuation, spaces, Chinese and escaped quotes");
+    }
     tab->rawView=true;showResponsePage();check(responseText()==toWide(tab->responseRaw),"raw view preserves the original JSON text");
+    SendMessageW(gResponseBody,EM_POSFROMCHAR,(WPARAM)&hit,(LPARAM)(responseText().find(L"hello")+2));
+    SendMessageW(gResponseBody,WM_LBUTTONDBLCLK,MK_LBUTTON,MAKELPARAM(hit.x+1,hit.y+2));responseSelection(start,end);
+    check(responseText().substr(start,end-start)==L"hello","raw view keeps word selection");
     SendMessageW(gResponseBody,EM_SETSEL,0,-1);CHARFORMAT2W rawFormat{};rawFormat.cbSize=sizeof(rawFormat);SendMessageW(gResponseBody,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&rawFormat);
     check((rawFormat.dwMask&CFM_COLOR)&&rawFormat.crTextColor==COLOR_PRIMARY&&!(rawFormat.dwEffects&CFE_BOLD),"raw view clears syntax formatting");
     tab->rawView=false;showResponsePage();
@@ -852,6 +912,22 @@ static void runControllerTests() {
     SendMessageW(gBody,EM_GETSELTEXT,0,(LPARAM)selectedError);
     check(wstring(selectedError)==L"?"&&tab->validation.find(L"第 2 行，第 8 个字符")!=wstring::npos,
           "JSON validation selects the offending character after CRLF, CJK and a surrogate pair");
+    SendMessageW(gBody,EM_REPLACESEL,TRUE,(LPARAM)L"1");
+    check(tab->jsonRecheckPending&&!textOf(gValidation).empty(),"editing a reported JSON error schedules idle validation");
+    const auto deadline=GetTickCount64()+1500;
+    while(tab->jsonRecheckPending&&GetTickCount64()<deadline){
+        MSG timer{};
+        if(PeekMessageW(&timer,gWindow,WM_TIMER,WM_TIMER,PM_REMOVE))DispatchMessageW(&timer);
+        else Sleep(5);
+    }
+    check(tab->validation.empty()&&textOf(gValidation).empty()&&!(GetWindowLongW(gValidation,GWL_STYLE)&WS_VISIBLE),
+          "idle JSON validation clears the corrected diagnostic and hides its row");
+    setText(gBody,L"{");formatCurrentJson(false);
+    SendMessageW(gBody,EM_SETSEL,0,-1);SendMessageW(gBody,EM_REPLACESEL,TRUE,(LPARAM)L"[1]");
+    openRequest(second);const auto otherValidation=selectedTab()->validation;
+    SendMessageW(gWindow,WM_TIMER,JSON_RECHECK_TIMER,0);
+    check(tab->validation.empty()&&textOf(gValidation)==otherValidation,"background JSON correction stays with its tab");
+    openRequest(request,c);
     auto original=snapshotCurrent();
     tab->responseRequest=std::make_unique<RequestSnapshot>(original);
     auto changed=original;changed.body="{}";
