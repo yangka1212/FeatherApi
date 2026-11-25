@@ -8,6 +8,8 @@
 struct MainWindowServices {
     bool (*loadData)(AppData&, std::wstring&);
     bool (*saveData)(const AppData&);
+    bool (*loadEnvironments)(EnvironmentSettings&);
+    bool (*saveEnvironments)(const EnvironmentSettings&);
     HRESULT (WINAPI *showTaskDialog)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
 };
 

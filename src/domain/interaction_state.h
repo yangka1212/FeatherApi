@@ -60,7 +60,8 @@ struct WorkspaceContent {
         catalog.push_back("end-folder");
     }
     static WorkspaceContent from(const AppData& data) {
-        WorkspaceContent result;for(const auto& folder:data.folders)result.add(*folder);return result;
+        WorkspaceContent result;
+        for(const auto& folder:data.folders)result.add(*folder);return result;
     }
     bool operator==(const WorkspaceContent& c) const {return requests==c.requests&&cases==c.cases&&catalog==c.catalog;}
 };

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -50,7 +51,13 @@ struct ApiFolder {
     std::vector<std::unique_ptr<ApiRequest>> requests;
 };
 
-struct AppData {
+struct EnvironmentSettings {
+    std::map<std::string,std::string> environmentHosts;
+    std::string activeEnvironment;
+};
+
+struct AppData : EnvironmentSettings {
+    bool hasLegacyEnvironments = false;
     int sidebarWidth = 320;
     int requestPanelHeight = 330;
     bool requestPanelHeightManual = false;

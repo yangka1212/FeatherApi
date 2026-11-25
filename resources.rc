@@ -1,12 +1,12 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include "resources.h"
 
 IDI_FEATHERAPI ICON "FeatherApi.ico"
 
 // Keep the numeric and string versions in sync when preparing a release.
 1 VERSIONINFO
- FILEVERSION 2,0,4,0
- PRODUCTVERSION 2,0,4,0
+ FILEVERSION 3,0,0,0
+ PRODUCTVERSION 3,0,0,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -23,16 +23,36 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "yangka\0"
             VALUE "FileDescription", "FeatherApi - Lightweight API Client\0"
-            VALUE "FileVersion", "2.0.4.0\0"
+            VALUE "FileVersion", "3.0.0.0\0"
             VALUE "InternalName", "FeatherApi\0"
             VALUE "LegalCopyright", "Copyright (c) 2026 yangka\0"
             VALUE "OriginalFilename", "FeatherApi.exe\0"
             VALUE "ProductName", "FeatherApi\0"
-            VALUE "ProductVersion", "2.0.4.0\0"
+            VALUE "ProductVersion", "3.0.0.0\0"
         END
     END
     BLOCK "VarFileInfo"
     BEGIN
         VALUE "Translation", 0x0409, 1200
     END
+END
+
+#pragma code_page(65001)
+IDD_ENV_PAGE DIALOGEX 0, 0, 380, 198
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
+CAPTION "环境管理"
+FONT 9, "Microsoft YaHei UI"
+BEGIN
+    LTEXT "环境列表", IDC_ENV_LIST_TITLE, 12, 13, 94, 14
+    LISTBOX IDC_ENV_LIST, 6, 33, 104, 125, LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP | NOT WS_BORDER
+    PUSHBUTTON "添加环境", IDC_ENV_ADD, 10, 166, 96, 22, BS_OWNERDRAW
+    LTEXT "编辑环境", IDC_ENV_TITLE, 130, 13, 234, 15
+    LTEXT "环境名称", -1, 130, 41, 234, 12
+    EDITTEXT IDC_ENV_NAME, 136, 60, 222, 14, ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    LTEXT "API Host", -1, 130, 88, 234, 12
+    EDITTEXT IDC_ENV_HOST, 136, 107, 222, 14, ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    LTEXT "", IDC_ENV_MESSAGE, 130, 132, 234, 28
+    PUSHBUTTON "删除环境", IDC_ENV_DELETE, 130, 166, 53, 22, BS_OWNERDRAW
+    PUSHBUTTON "关闭", IDCANCEL, 246, 166, 52, 22, BS_OWNERDRAW
+    PUSHBUTTON "保存环境", IDOK, 304, 166, 60, 22, BS_OWNERDRAW
 END

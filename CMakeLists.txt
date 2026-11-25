@@ -40,7 +40,7 @@ target_link_libraries(FeatherApplication PUBLIC FeatherDomain PRIVATE FeatherJso
 add_library(FeatherInfrastructure STATIC src/infrastructure/storage.cpp src/infrastructure/http_client.cpp)
 target_link_libraries(FeatherInfrastructure PUBLIC FeatherDomain PRIVATE FeatherJson FeatherPlatform winhttp shell32 ole32)
 
-add_library(FeatherUi STATIC src/ui/main_window.cpp)
+add_library(FeatherUi STATIC src/ui/main_window.cpp src/ui/environment_page.cpp)
 target_include_directories(FeatherUi PRIVATE "${PROJECT_SOURCE_DIR}")
 target_link_libraries(FeatherUi PUBLIC FeatherBuildOptions PRIVATE
   FeatherApplication FeatherInfrastructure FeatherJson FeatherPlatform comctl32 comdlg32 shlwapi)
@@ -64,7 +64,7 @@ if(BUILD_TESTING)
     FeatherApplication FeatherInfrastructure FeatherJson FeatherPlatform)
 
   # White-box controller tests compile the UI once in the test translation unit.
-  add_executable(FeatherApiUiTests tests/ui_self_tests.cpp resources.rc app.manifest)
+  add_executable(FeatherApiUiTests tests/ui_self_tests.cpp src/ui/environment_page.cpp resources.rc app.manifest)
   target_include_directories(FeatherApiUiTests PRIVATE "${PROJECT_SOURCE_DIR}")
   target_link_libraries(FeatherApiUiTests PRIVATE
     FeatherApplication FeatherInfrastructure FeatherJson FeatherPlatform comctl32 comdlg32 shlwapi)

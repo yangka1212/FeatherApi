@@ -7,3 +7,6 @@ bool loadAppData(AppData& data, std::wstring& sourcePath);
 bool saveAppData(const AppData& data);
 bool loadAppDataFromPath(const std::wstring& path, AppData& data);
 bool saveAppDataToPath(const AppData& data, const std::wstring& path);
+
+bool saveEnvironmentSettings(const EnvironmentSettings& data,const std::wstring& workspace);
+bool loadEnvironmentSettings(EnvironmentSettings& data,const std::wstring& workspace);

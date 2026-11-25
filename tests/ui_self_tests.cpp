@@ -109,14 +109,35 @@ static void runRequestTabTests(ApiRequest* request,ApiRequest* second) {
         check(tabs.bottom-tabs.top==MulDiv(baselineHeight,(int)dpi,96),"request strip scales with DPI");
         check((GetWindowLongPtrW(gTabOverflow,GWL_STYLE)&WS_VISIBLE)&&gFirstVisibleTab>0&&gPastVisibleTab==(int)gTabs.size(),
               "overflow lists hidden tabs while the selected last tab stays visible");
-        check(last.right<=gTabClipStart+gTabClipWidth&&scroll.right<=boundsInWindow(gSave).left,
-              "visible tabs fit completely beside the overflow and save buttons");
+        RECT environment=boundsInWindow(gEnvironment);
+        check(scroll.top==environment.top&&scroll.bottom==environment.bottom,"overflow and environment buttons align at every DPI");
+        check(last.right<=gTabClipStart+gTabClipWidth&&scroll.right<=environment.left,
+              "visible tabs fit completely beside the overflow and environment buttons");
     }
     ShowWindow(gWindow,SW_SHOWNOACTIVATE);
     SetFocus(gUrl);
     SendMessageW(gTabOverflow,WM_MOUSEMOVE,0,0);
     HWND popup=gOverflowList;
     check(popup&&GetFocus()==gUrl,"hover opens overflow without taking the URL editor focus");
+    if(popup){
+        RECT bounds{};GetWindowRect(popup,&bounds);
+        int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
+        HDC popupScreen=GetDC(popup),dc=CreateCompatibleDC(popupScreen);
+        HBITMAP popupBitmap=CreateCompatibleBitmap(popupScreen,width,height);
+        auto old=SelectObject(dc,popupBitmap);
+        SendMessageW(popup,WM_PRINT,reinterpret_cast<WPARAM>(dc),PRF_CLIENT|PRF_NONCLIENT);
+        bool joined=true;
+        for(int y:{px(TAB_POPUP_RADIUS)/2,height-1-px(TAB_POPUP_RADIUS)/2}){
+            bool left=false,right=false;
+            for(int x=0;x<px(TAB_POPUP_RADIUS);++x){
+                left|=GetPixel(dc,x,y)==COLOR_BORDER;
+                right|=GetPixel(dc,width-1-x,y)==COLOR_BORDER;
+            }
+            joined&=left&&right;
+        }
+        check(joined,"all four popup corners draw their rounded outline");
+        SelectObject(dc,old);DeleteObject(popupBitmap);DeleteDC(dc);ReleaseDC(popup,popupScreen);
+    }
     int previousChoice=closeChoice;closeChoice=IDNO;
     for(int i=0;i<2&&popup&&gOverflowList==popup&&gOverflowRows.size()>1;++i){
         auto before=gTabs.size();
@@ -359,7 +380,23 @@ static void runUrlParamSyncTests(ApiRequest* request,ApiRequest* second) {
     original.apply(*request);loadEditor();saveNow();saveCalls=previousSaveCalls;
     check(RequestContent::from(*request)==original,"URL/Params checks restore the original request fixture");
 }
+static LRESULT CALLBACK countSelectionUpdates(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR count){
+    if(msg==LB_SETCURSEL)++*reinterpret_cast<int*>(count);
+    return DefSubclassProc(h,msg,w,l);
+}
+
 static void runRequestToolbarTests(ApiRequest* request) {
+    SendMessageW(gSaveMore,BM_CLICK,0,0);
+    check(gToolbarList&&SendMessageW(gToolbarList,LB_GETCOUNT,0,0)==1&&gToolbarRows.front().enabled&&
+          gToolbarRows.front().command==IDM_SAVE_CASE,"Save opens a rounded list with the save-case action");
+    if(gToolbarList){
+        SendMessageW(gToolbarList,LB_SETCURSEL,static_cast<WPARAM>(-1),0);
+        int changes=0;SetWindowSubclass(gToolbarList,countSelectionUpdates,52,reinterpret_cast<DWORD_PTR>(&changes));
+        for(int x=2;x<25;++x)SendMessageW(gToolbarList,WM_MOUSEMOVE,0,MAKELPARAM(x,px(10)));
+        check(changes==1,"moving across a toolbar popup row highlights it only once");
+        RemoveWindowSubclass(gToolbarList,countSelectionUpdates,52);
+        SendMessageW(gToolbarList,WM_KEYDOWN,VK_ESCAPE,0);
+    }
     const auto originalContent=RequestContent::from(*request);const wstring originalUrl=textOf(gUrl),originalMethod=textOf(gMethod);
     const UINT originalDpi=gDpi;const int originalSidebar=gData.sidebarWidth;RECT originalWindow{};GetWindowRect(gWindow,&originalWindow);
     const wstring address=L"https://example.invalid/接口?name=中文&query="+wstring(180,L'x');
@@ -394,12 +431,54 @@ static void runRequestToolbarTests(ApiRequest* request) {
     }
     check(blended,"URL corner blends its outline into the white background");
     SelectObject(buffer,oldBitmap);DeleteObject(bitmap);DeleteDC(buffer);ReleaseDC(gUrlFrame,screen);
-    const DWORD selectedStart=10,selectedEnd=24;SendMessageW(gUrl,EM_SETSEL,selectedStart,selectedEnd);
+    gData.environmentHosts={{"A","https://a.test"},{"B","https://b.test:8080"}};
+    gData.activeEnvironment="A";auto first=snapshotCurrent();
+    gData.activeEnvironment="B";auto second=snapshotCurrent();
+    check(first.url==resolveEnvironmentUrl(request->url,"https://a.test")&&
+          second.url==resolveEnvironmentUrl(request->url,"https://b.test:8080")&&first.url!=second.url&&
+          textOf(gUrl)==address,"switching environments resolves each send while retaining the editable address");
+    auto testPage=[](HWND,UINT,UINT_PTR timer,DWORD){
+        KillTimer(nullptr,timer);
+        HWND page=GetLastActivePopup(gWindow);
+        HWND name=GetDlgItem(page,IDC_ENV_NAME);
+        check(name!=nullptr,"toolbar opens the environment maintenance page");
+        if(!name)return;
+        bool adding=textOf(name).empty();
+        if(adding){
+            SetWindowTextW(name,L"QA");
+            SetDlgItemTextW(page,IDC_ENV_HOST,L"https://qa.test/");
+        }else{
+            check(textOf(name)==L"B","manage opens the active environment");
+            SetWindowTextW(name,L"Renamed");
+        }
+        SendMessageW(page,WM_COMMAND,IDOK,0);
+        SendMessageW(page,WM_COMMAND,IDCANCEL,0);
+    };
+    SetTimer(nullptr,0,50,testPage);
+    SendMessageW(gEnvironmentMenu,BM_CLICK,0,0);
+    check(gData.activeEnvironment=="Renamed"&&gData.environmentHosts.count("B")==0,"manage page renames the active environment");
+    showEnvironmentMenu();
+    SendMessageW(gToolbarList,LB_SETCURSEL,SendMessageW(gToolbarList,LB_GETCOUNT,0,0)-1,0);
+    SetTimer(nullptr,0,50,testPage);
+    SendMessageW(gToolbarList,WM_KEYDOWN,VK_RETURN,0);
+    check(gData.activeEnvironment=="QA"&&gData.environmentHosts.at("QA")=="https://qa.test","add menu opens a blank form and saves its host");
+    EnvironmentSettings savedEnvironment;
+    check(loadEnvironmentSettings(savedEnvironment,testDataPath)&&savedEnvironment.activeEnvironment=="QA"&&savedEnvironment.environmentHosts==gData.environmentHosts,"environment form writes immediately without saving requests");
+    SendMessageW(gUrlHost,BM_CLICK,0,0);
+    check(gToolbarList&&gToolbarRows[1].addressEntry,"address bar host opens the inline environment list");
+    SendMessageW(gToolbarList,LB_SETCURSEL,1,0);
+    SendMessageW(gToolbarList,WM_KEYDOWN,VK_RETURN,0);
+    check(textOf(gUrlHost)==L"https://a.test"&&textOf(gEnvironment)==L"A"&&
+          textOf(gUrl).find(L"/接口?")==0&&snapshotCurrent().url=="https://a.test/接口",
+          "address host selector updates both controls and the outgoing request");
+    gData.activeEnvironment.clear();gData.environmentHosts.clear();refreshEnvironmentButton();
+    const DWORD selectedStart=10,selectedEnd=24;
     for(UINT dpi:{96u,144u,192u}){
+        auto beforeResize=textOf(gUrl);SendMessageW(gUrl,EM_SETSEL,selectedStart,selectedEnd);
         gData.sidebarWidth=420;RECT proposed{0,0,MulDiv(980,(int)dpi,96),MulDiv(640,(int)dpi,96)};
         SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),(LPARAM)&proposed);
         RECT client{};GetClientRect(gWindow,&client);std::vector<RECT> actions;
-        for(HWND control:{gMethod,gUrl,gSave,gSaveMore,gSend,gEditorTabs})actions.push_back(boundsInWindow(control));
+        for(HWND control:{gEnvironment,gEnvironmentMenu,gMethod,gUrlHost,gUrl,gSave,gSaveMore,gSend,gEditorTabs})actions.push_back(boundsInWindow(control));
         bool usable=true;
         for(size_t i=0;i<actions.size();++i){
             const RECT& rect=actions[i];usable=usable&&rect.left>=0&&rect.right<=client.right&&rect.top>=0&&
@@ -413,16 +492,56 @@ static void runRequestToolbarTests(ApiRequest* request) {
         check(usable&&url.left>=frame.left&&url.right<=frame.right&&url.top>=frame.top&&url.bottom<=frame.bottom&&EqualRect(&send,&cancel),
               "request controls stay usable at minimum width and send/cancel share one slot at every DPI");
         RECT save=boundsInWindow(gSave),more=boundsInWindow(gSaveMore),tabs=boundsInWindow(gRequestTabs);
-        check(send.left>=frame.right&&send.left-frame.right<=px(16)&&save.bottom<=frame.top&&more.bottom<=frame.top&&
-              save.top>=tabs.top&&save.bottom<=tabs.bottom&&more.top>=tabs.top&&more.bottom<=tabs.bottom,
-              "the URL uses the space before Send while save actions stay in the top request-tab strip at every DPI");
+        RECT environment=boundsInWindow(gEnvironment),manage=boundsInWindow(gEnvironmentMenu);
+        for(HWND button:{gEnvironment,gEnvironmentMenu,gSave,gSaveMore}){
+            RECT r{};GetClientRect(button,&r);
+            HDC screenDc=GetDC(button),dc=CreateCompatibleDC(screenDc);
+            HBITMAP surface=CreateCompatibleBitmap(screenDc,r.right,r.bottom);
+            auto previous=SelectObject(dc,surface);
+            DRAWITEMSTRUCT item{};item.CtlID=GetDlgCtrlID(button);item.hwndItem=button;item.rcItem=r;item.hDC=dc;
+            drawRequestControl(&item);
+            bool right=button==gEnvironmentMenu||button==gSaveMore;
+            int cy=r.bottom/2;
+            if(right)check(GetPixel(dc,0,cy)==COLOR_BORDER,"split button has an inset divider");
+            int corner=right?r.right-1:0;
+            check(GetPixel(dc,corner,0)==RGB(255,255,255),"split button outer corner blends into toolbar");
+            if(button==gEnvironment||button==gSaveMore){
+                int cx=button==gEnvironment?r.right-px(10):r.right/2;
+                bool symmetric=true,visible=false;
+                for(int y=cy-px(4);y<=cy+px(4);++y){
+                    COLORREF tip=GetPixel(dc,cx-px(4),y);
+                    visible|=tip!=GetPixel(dc,cx-px(5),y);
+                    symmetric&=tip==GetPixel(dc,cx+px(4),y);
+                }
+                check(symmetric&&visible,"dropdown chevron has two complete matching tips");
+            }
+            SelectObject(dc,previous);DeleteObject(surface);DeleteDC(dc);ReleaseDC(button,screenDc);
+        }
+        DWORD start=0,end=0;SendMessageW(gUrl,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
+        check(textOf(gUrl)==beforeResize&&request->url=="https://example.invalid/接口"&&start==selectedStart&&end==selectedEnd,
+              "toolbar relayout preserves the native URL text and selection");
+        gData.environmentHosts.emplace("Development","https://dev.test");
+        showEnvironmentMenu();
+        RECT popup{};GetWindowRect(gToolbarList,&popup);
+        check(popup.right-popup.left>=manage.right-environment.left&&popup.right-popup.left<=px(210),
+              "short environment names use a compact selector-width menu at every DPI");
+        auto environmentRowHeight=SendMessageW(gToolbarList,LB_GETITEMHEIGHT,1,0);
+        SendMessageW(gToolbarList,LB_SETCURSEL,1,0);
+        SendMessageW(gToolbarList,WM_KEYDOWN,VK_RETURN,0);
+        check(!gToolbarList&&gData.activeEnvironment=="Development","environment popup selects the highlighted host with Enter");
+        gData.environmentHosts.clear();gData.activeEnvironment.clear();refreshEnvironmentButton();
+        check(environment.bottom-environment.top==px(34)&&manage.top==environment.top&&manage.bottom==environment.bottom&&
+              environmentRowHeight==px(34)&&fontTextHeight(gEnvironment,gEntryTypeFont)<fontTextHeight(gEnvironment,gUiFont),
+              "environment toolbar and dropdown scale with a smaller badge font and single-line environment names");
+        check(send.left>=frame.right&&send.left-frame.right<=px(16)&&send.right<=save.left&&
+              save.top==send.top&&more.top==send.top&&save.right==more.left&&environment.right==manage.left&&
+              environment.top>=tabs.top&&environment.bottom<=tabs.bottom,
+              "environment selector occupies the tab strip and Save follows Send at every DPI");
         RECT editClient{},format{};GetClientRect(gUrl,&editClient);SendMessageW(gUrl,EM_GETRECT,0,(LPARAM)&format);
         check(format.left>=0&&format.right<=editClient.right&&format.top>=0&&format.bottom<=editClient.bottom&&
               format.right>format.left&&format.bottom-format.top>=fontTextHeight(gUrl,gCodeFont),
               "the native URL text rectangle fits its editor without clipping at every DPI");
-        DWORD start=0,end=0;SendMessageW(gUrl,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);
-        check(textOf(gUrl)==address&&request->url=="https://example.invalid/接口"&&start==selectedStart&&end==selectedEnd,
-              "toolbar relayout preserves the native URL text and selection");
+
     }
     gData.sidebarWidth=originalSidebar;SendMessageW(gWindow,WM_DPICHANGED,MAKEWPARAM(originalDpi,originalDpi),(LPARAM)&originalWindow);
     selectRequestMethod(originalMethod.c_str());originalContent.apply(*request);loadEditor();updateDirtyStatus();
@@ -982,7 +1101,9 @@ static void runControllerTests() {
 }
 int main(int argc,char**) {
     std::cout.setf(std::ios::unitbuf);SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
-    gServices={loadTestData,saveTestData,testTaskDialog};
+    gServices={loadTestData,saveTestData,
+        [](EnvironmentSettings& env){return loadEnvironmentSettings(env,testDataPath);},
+        [](const EnvironmentSettings& env){return saveEnvironmentSettings(env,testDataPath);},testTaskDialog};
     testMode=argc>1;SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     wchar_t executable[MAX_PATH]{};GetModuleFileNameW(nullptr,executable,MAX_PATH);

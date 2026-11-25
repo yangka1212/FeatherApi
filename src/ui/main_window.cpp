@@ -1,4 +1,5 @@
 #include "ui/main_window.h"
+#include "ui/environment_page.h"
 #include "ui/ui_helpers.h"
 #include "domain/interaction_state.h"
 #include "application/openapi_import.h"
@@ -36,7 +37,7 @@ enum : int {
     IDC_FORMAT,IDC_COMPRESS,IDC_BODY,IDC_VALIDATION,IDC_SUMMARY,
     IDC_RESPONSE_TABS,IDC_RESPONSE_BODY,IDC_RESPONSE_HEADERS,IDC_RESPONSE_FIND_PANEL,IDC_RESPONSE_FIND_EDIT,IDC_RESPONSE_FIND_PREV,IDC_RESPONSE_FIND_NEXT,IDC_RESPONSE_FIND_CLOSE,IDC_BODY_NONE,IDC_EMPTY_TITLE,IDC_EMPTY_HELP,IDC_SIDEBAR_DIVIDER,IDC_TAB_OVERFLOW,
     IDC_RESPONSE_MODE,IDC_RESPONSE_FIND,IDC_FIND_STATUS,IDC_RESPONSE_MODE_DIVIDER,IDC_EMPTY_NEW_REQUEST,
-    IDC_SEARCH_EMPTY,IDC_CLEAR_SEARCH,
+    IDC_SEARCH_EMPTY,IDC_CLEAR_SEARCH,IDC_ENVIRONMENT,IDC_ENVIRONMENT_MENU,IDC_URL_HOST,
     IDC_PROMPT_EDIT=900,IDC_URL_FRAME,IDC_SEARCH_FRAME,
     IDM_FOLDER_ADD_REQUEST=1000,IDM_FOLDER_ADD_CHILD,IDM_FOLDER_IMPORT,IDM_FOLDER_RENAME,IDM_FOLDER_DELETE,
     IDM_REQUEST_OPEN,IDM_REQUEST_RENAME,IDM_REQUEST_DUPLICATE,IDM_REQUEST_MOVE,IDM_REQUEST_DELETE,
@@ -58,6 +59,8 @@ constexpr int SECTION_TAB_WIDTH=62;
 constexpr int REQUEST_TAB_HORIZONTAL_PADDING=13;
 constexpr int REQUEST_TAB_MAX_WIDTH=240;
 constexpr int REQUEST_TAB_HEIGHT=44;
+constexpr int TAB_ACTION_HEIGHT=34;
+constexpr int TAB_ACTION_TOP=(REQUEST_TAB_HEIGHT-TAB_ACTION_HEIGHT)/2;
 constexpr int ENTRY_ROW_HEIGHT=32;
 constexpr int ENTRY_HEADER_HEIGHT=32;
 constexpr int REQUEST_BAR_TOP=60;
@@ -114,7 +117,7 @@ struct FolderPickerContext { const std::vector<FolderChoice>* choices=nullptr;Ap
 MainWindowServices gServices{};
 HINSTANCE gInstance{};
 HMODULE gRichEditModule{};
-HWND gWindow{},gSearchFrame{},gSearch{},gSearchEmpty{},gClearSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gTabOverflow{},gMethod{},gUrlFrame{},gUrl{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
+HWND gWindow{},gSearchFrame{},gSearch{},gSearchEmpty{},gClearSearch{},gAddFolder{},gTree{},gSidebarDivider{},gRequestTabs{},gTabOverflow{},gMethod{},gUrlFrame{},gUrlHost{},gUrl{},gEnvironment{},gEnvironmentMenu{},gSave{},gSaveMore{},gSend{},gCancel{},gSaveTooltip{};
 HWND gEditorTabs{},gKvList{},gBodyType{},gFormat{},gCompress{},gBody{},gValidation{};
 HWND gSummary{},gResponseTabs{},gResponseBody{},gResponseHeaders{},gResponseFindPanel{},gResponseFindEdit{},gResponseFindPrev{},gResponseFindNext{},gResponseFindClose{},gBodyNone{},gEmptyTitle{},gEmptyHelp{},gEmptyNewRequest{};
 HWND gResponseMode{},gResponseModeDivider{},gResponseFind{},gFindStatus{},gResponseToolbarHot{},gRequestToolbarHot{};
@@ -548,9 +551,9 @@ LRESULT CALLBACK sectionTabsProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR 
     return result;
 }
 
-// The two native windows each own one rounded end of the address field.
+// Each segment has one rounded outer end and one flush join.
 // Sample only the corner pixels; GDI can fill the straight spans directly.
-void drawAddressSegment(HDC dc,RECT bounds,bool leftEnd,COLORREF fill,COLORREF border) {
+void drawRoundedSegment(HDC dc,RECT bounds,bool leftEnd,COLORREF fill,COLORREF border) {
     const int stroke=std::max(1,px(1));
     const int radius=std::min({px(REQUEST_CONTROL_CORNER_DIAMETER)/2,
                                int(bounds.bottom-bounds.top)/2,int(bounds.right-bounds.left)});
@@ -575,19 +578,64 @@ void drawAddressSegment(HDC dc,RECT bounds,bool leftEnd,COLORREF fill,COLORREF b
     }
 }
 
+// Mirror the two strokes so both tips have identical coverage at fractional DPI.
+void drawDropdownChevron(HDC dc,int cx,int cy,COLORREF ink,COLORREF face) {
+    const int half=px(4);
+    const double weight=1.4*gDpi/96.0;
+    for(int x=0;x<=half;++x){
+        double center=cy+half*0.4-x*0.8;
+        for(int y=cy-half;y<=cy+half;++y){
+            double coverage=std::clamp(std::min(y+0.5,center+weight/2)-std::max(y-0.5,center-weight/2),0.0,1.0);
+            if(coverage==0)continue;
+            auto blend=[&](int a,int b){return int(a+(b-a)*coverage+0.5);};
+            COLORREF color=RGB(blend(GetRValue(face),GetRValue(ink)),blend(GetGValue(face),GetGValue(ink)),blend(GetBValue(face),GetBValue(ink)));
+            SetPixelV(dc,cx-x,y,color);SetPixelV(dc,cx+x,y,color);
+        }
+    }
+}
+
+void drawEnvironmentBadge(HDC dc,RECT badge,const wstring& label) {
+    if(label.empty())return;
+    fillRoundRect(dc,badge,RGB(243,240,255),5);
+    auto font=SelectObject(dc,gEntryTypeFont);
+    auto color=SetTextColor(dc,RGB(106,80,178));
+    int length=IS_HIGH_SURROGATE(label[0])&&label.size()>1?2:1;
+    DrawTextW(dc,label.c_str(),length,&badge,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_NOPREFIX);
+    SelectObject(dc,font);SetTextColor(dc,color);
+}
+
+// Present the background, outline and text together, including during native hover repaints.
+template<class Paint>
+void drawBufferedItem(const DRAWITEMSTRUCT& item,Paint paint) {
+    const RECT& rect=item.rcItem;
+    int width=rect.right-rect.left,height=rect.bottom-rect.top;
+    if(width<=0||height<=0)return;
+    HDC dc=CreateCompatibleDC(item.hDC);
+    HBITMAP bitmap=dc?CreateCompatibleBitmap(item.hDC,width,height):nullptr;
+    if(bitmap){
+        auto previous=SelectObject(dc,bitmap);
+        DRAWITEMSTRUCT buffered=item;buffered.hDC=dc;buffered.rcItem={0,0,width,height};
+        paint(buffered);
+        BitBlt(item.hDC,rect.left,rect.top,width,height,dc,0,0,SRCCOPY);
+        SelectObject(dc,previous);DeleteObject(bitmap);
+    }else paint(item);
+    if(dc)DeleteDC(dc);
+}
+
 void drawRequestControl(const DRAWITEMSTRUCT* draw) {
     HDC dc=draw->hDC;RECT rect=draw->rcItem;
     bool disabled=(draw->itemState&ODS_DISABLED)!=0,pressed=(draw->itemState&ODS_SELECTED)!=0;
     bool hot=!disabled&&gRequestToolbarHot==draw->hwndItem;
     bool url=draw->CtlID==IDC_URL_FRAME;
     bool save=draw->CtlID==IDC_SAVE,more=draw->CtlID==IDC_SAVE_MORE,send=draw->CtlID==IDC_SEND;
+    bool environment=draw->CtlID==IDC_ENVIRONMENT,manage=draw->CtlID==IDC_ENVIRONMENT_MENU;
     bool inputFocused=GetFocus()==gUrl||GetFocus()==gMethod;
     wstring label=textOf(draw->hwndItem);
     bool saved=save&&label==L"已保存",failed=save&&gSaveFailed;
     COLORREF background=RGB(255,255,255),border=RGB(218,224,233),foreground=COLOR_PRIMARY;
     if(url)border=inputFocused?COLOR_ACCENT:RGB(211,219,230);
     else if(send){background=disabled?RGB(225,232,244):(pressed?RGB(29,78,216):(hot?RGB(32,87,218):COLOR_ACCENT));border=background;foreground=RGB(255,255,255);}
-    else if(save||more||draw->CtlID==IDC_TAB_OVERFLOW){background=pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(255,255,255));border=hot?RGB(196,205,217):RGB(218,224,233);foreground=hot?COLOR_PRIMARY:COLOR_SECONDARY;}
+    else if(environment||manage||save||more||draw->CtlID==IDC_TAB_OVERFLOW){background=pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(255,255,255));border=hot?RGB(196,205,217):RGB(218,224,233);foreground=hot?COLOR_PRIMARY:COLOR_SECONDARY;}
     else {background=pressed?RGB(235,239,245):(hot?RGB(244,246,249):RGB(250,251,253));foreground=COLOR_SECONDARY;}
     if(saved)foreground=RGB(21,128,91);if(failed)foreground=RGB(185,55,65);
     if(disabled)foreground=RGB(156,163,175);
@@ -597,29 +645,42 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
         MapWindowPoints(nullptr,draw->hwndItem,(POINT*)&editor,2);
         ExcludeClipRect(dc,editor.left,editor.top,editor.right,editor.bottom);
     }
-    if(url){drawAddressSegment(dc,rect,false,background,border);RestoreDC(dc,savedDc);return;}
+    if(url){drawRoundedSegment(dc,rect,false,background,border);RestoreDC(dc,savedDc);return;}
     FillRect(dc,&rect,gWhiteBrush);
-    RECT outline=rect;
-    const int diameter=px(REQUEST_CONTROL_CORNER_DIAMETER);
-    // Clip adjacent native controls into a continuous rounded field or split button.
-    if(save&&(GetWindowLongPtrW(gSaveMore,GWL_STYLE)&WS_VISIBLE))outline.right+=px(10);
-    if(more)outline.left-=px(10);
-    HBRUSH brush=CreateSolidBrush(background);HPEN pen=CreatePen(PS_SOLID,px(1),border);
-    auto oldBrush=(HBRUSH)SelectObject(dc,brush);auto oldPen=(HPEN)SelectObject(dc,pen);
-    RoundRect(dc,outline.left,outline.top,outline.right,outline.bottom,diameter,diameter);
-    SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(pen);DeleteObject(brush);RestoreDC(dc,savedDc);
+    if(save&&!(GetWindowLongPtrW(gSaveMore,GWL_STYLE)&WS_VISIBLE)){
+        RECT left=rect,right=rect;
+        left.right=right.left=(rect.left+rect.right)/2;
+        drawRoundedSegment(dc,left,true,background,border);
+        drawRoundedSegment(dc,right,false,background,border);
+    }else if(environment||save||manage||more){
+        drawRoundedSegment(dc,rect,environment||save,background,border);
+    }else{
+        HBRUSH brush=CreateSolidBrush(background);HPEN pen=CreatePen(PS_SOLID,px(1),border);
+        auto oldBrush=SelectObject(dc,brush);auto oldPen=SelectObject(dc,pen);
+        int diameter=px(REQUEST_CONTROL_CORNER_DIAMETER);
+        RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,diameter,diameter);
+        SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(pen);DeleteObject(brush);
+    }
+    RestoreDC(dc,savedDc);
     int cy=(rect.top+rect.bottom)/2+(pressed?px(1):0);
     auto oldFont=(HFONT)SelectObject(dc,send?gTreeFolderFont:gUiFont);SetBkMode(dc,TRANSPARENT);
     RECT textRect=rect;UINT format=DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX;
     int saveIconCenter=0;
-    if(save){
+    if(environment){
+        textRect.left+=px(9);textRect.right-=px(20);format|=DT_END_ELLIPSIS|DT_LEFT;
+        if(!gData.activeEnvironment.empty()&&!label.empty()){
+            RECT badge{textRect.left,cy-px(9),textRect.left+px(20),cy+px(9)};
+            drawEnvironmentBadge(dc,badge,label);
+            textRect.left=badge.right+px(5);
+        }
+    }else if(save){
         SIZE textSize{};GetTextExtentPoint32W(dc,label.c_str(),(int)label.size(),&textSize);
         int contentWidth=px(14)+px(6)+textSize.cx;
         int contentLeft=rect.left+((rect.right-rect.left)-contentWidth)/2;
         saveIconCenter=contentLeft+px(7);textRect.left=contentLeft+px(20);textRect.right=textRect.left+textSize.cx;
         if(pressed)OffsetRect(&textRect,0,px(1));format|=DT_CENTER;
-    }else if(more){
-        HPEN separator=CreatePen(PS_SOLID,px(1),COLOR_BORDER);oldPen=(HPEN)SelectObject(dc,separator);
+    }else if(more||manage){
+        HPEN separator=CreatePen(PS_SOLID,px(1),COLOR_BORDER);auto oldPen=(HPEN)SelectObject(dc,separator);
         MoveToEx(dc,rect.left,rect.top+px(7),nullptr);LineTo(dc,rect.left,rect.bottom-px(7));SelectObject(dc,oldPen);DeleteObject(separator);
     }else{
         textRect.left+=px(42);textRect.right-=px(8);format|=DT_LEFT;
@@ -627,13 +688,14 @@ void drawRequestControl(const DRAWITEMSTRUCT* draw) {
         if(!save&&!send){textRect=rect;format=(format&~DT_LEFT)|DT_CENTER;}
     }
     if(disabled)foreground=RGB(156,163,175);SetTextColor(dc,foreground);
-    if(!more)DrawTextW(dc,label.c_str(),-1,&textRect,format);
-    pen=CreatePen(PS_SOLID,px(1),foreground);oldPen=(HPEN)SelectObject(dc,pen);oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
-    if(more){
+    if(!more&&!manage)DrawTextW(dc,label.c_str(),-1,&textRect,format);
+    HPEN pen=CreatePen(PS_SOLID,px(1),foreground);auto oldPen=(HPEN)SelectObject(dc,pen);auto oldBrush=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
+    if(manage){
         int cx=(rect.left+rect.right)/2;
-        MoveToEx(dc,cx-px(3),cy-px(1),nullptr);LineTo(dc,cx,cy+px(2));
-        // LineTo excludes its endpoint; continue one device pixel so the right tip is drawn.
-        LineTo(dc,cx+px(3)+1,cy-px(1)-1);
+        for(int offset:{-3,0,3}){MoveToEx(dc,cx-px(5),cy+px(offset),nullptr);LineTo(dc,cx+px(5),cy+px(offset));}
+    }else if(environment||more){
+        int cx=environment?rect.right-px(10):(rect.left+rect.right)/2;
+        drawDropdownChevron(dc,cx,cy,foreground,background);
     }else if(save){
         int cx=saveIconCenter;
         if(saved){MoveToEx(dc,cx-px(5),cy,nullptr);LineTo(dc,cx-px(1),cy+px(4));LineTo(dc,cx+px(6),cy-px(4));}
@@ -717,7 +779,22 @@ void drawButton(const DRAWITEMSTRUCT* draw) {
         }
         return;
     }
-    if(draw->CtlID==IDC_TAB_OVERFLOW||draw->CtlID==IDC_URL_FRAME||draw->CtlID==IDC_SAVE||draw->CtlID==IDC_SAVE_MORE||draw->CtlID==IDC_SEND||draw->CtlID==IDC_CANCEL){drawRequestControl(draw);return;}
+    if(draw->CtlID==IDC_URL_HOST){
+        drawBufferedItem(*draw,[](const DRAWITEMSTRUCT& item){
+            HDC dc=item.hDC;RECT rect=item.rcItem;FillRect(dc,&rect,gWhiteBrush);
+            fillRoundRect(dc,rect,gRequestToolbarHot==item.hwndItem?RGB(231,236,244):RGB(242,244,247),5);
+            auto font=SelectObject(dc,gUiFont);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,COLOR_PRIMARY);
+            RECT label=rect;InflateRect(&label,-px(8),0);
+            auto host=textOf(item.hwndItem);
+            DrawTextW(dc,host.c_str(),-1,&label,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+            SelectObject(dc,font);
+            if(item.itemState&ODS_FOCUS)drawFocusRing(dc,rect);
+        });return;
+    }
+    if(draw->CtlID==IDC_ENVIRONMENT||draw->CtlID==IDC_ENVIRONMENT_MENU||draw->CtlID==IDC_SAVE||draw->CtlID==IDC_SAVE_MORE){
+        drawBufferedItem(*draw,[](const DRAWITEMSTRUCT& item){drawRequestControl(&item);});return;
+    }
+    if(draw->CtlID==IDC_TAB_OVERFLOW||draw->CtlID==IDC_URL_FRAME||draw->CtlID==IDC_SEND||draw->CtlID==IDC_CANCEL){drawRequestControl(draw);return;}
     if(draw->CtlID==IDC_RESPONSE_MODE_DIVIDER){
         FillRect(draw->hDC,&draw->rcItem,gWhiteBrush);
         RECT line=draw->rcItem;line.left=(line.left+line.right)/2;line.right=line.left+px(1);line.top+=px(6);line.bottom-=px(6);
@@ -871,7 +948,7 @@ void paintDropdown(HWND h,HDC dc) {
     COLORREF background=disabled?RGB(250,251,253):RGB(255,255,255);
     if(h==gMethod&&!disabled)background=methodStyle(label,false).background;
     if(h==gMethod){
-        drawAddressSegment(dc,rect,true,background,border);
+        drawRoundedSegment(dc,rect,true,background,border);
         RECT divider{rect.right-1,rect.top+px(1),rect.right,rect.bottom-px(1)};
         SetDCBrushColor(dc,RGB(211,219,230));FillRect(dc,&divider,(HBRUSH)GetStockObject(DC_BRUSH));
     }else{
@@ -1389,8 +1466,8 @@ void updateTabOverflow() {
         ++gPastVisibleTab;
     }
     if(overflow){
-        SetWindowPos(gTabOverflow,nullptr,gRequestTabViewportX+gRequestTabViewportWidth-px(32),px(8),
-                     px(32),px(28),SWP_NOZORDER|SWP_NOACTIVATE);
+        SetWindowPos(gTabOverflow,nullptr,gRequestTabViewportX+gRequestTabViewportWidth-px(32),px(TAB_ACTION_TOP),
+                     px(32),px(TAB_ACTION_HEIGHT),SWP_NOZORDER|SWP_NOACTIVATE);
     }
     ShowWindow(gTabOverflow,overflow?SW_SHOWNA:SW_HIDE);
     positionRequestTabs();
@@ -1477,6 +1554,51 @@ void activateOverflowRow(HWND h,int row,bool close) {
     else closeTabRange(gSelectedTab,action==1?IDM_TAB_CLOSE_OTHERS:IDM_TAB_CLOSE_ALL);
     SetFocus(gRequestTabs);
 }
+constexpr int TAB_POPUP_RADIUS=5;
+
+HRGN tabPopupRegion(int width,int height) {
+    const int diameter=2*px(TAB_POPUP_RADIUS);
+    return CreateRoundRectRgn(0,0,width+1,height+1,diameter,diameter);
+}
+
+void paintTabPopupFrame(HWND window,HDC dc) {
+    RECT bounds{};GetWindowRect(window,&bounds);
+    OffsetRect(&bounds,-bounds.left,-bounds.top);
+    HRGN outline=tabPopupRegion(bounds.right,bounds.bottom);
+    int state=SaveDC(dc);
+    ExtSelectClipRgn(dc,outline,RGN_AND);
+    RECT top=bounds,bottom=bounds;
+    top.bottom=px(TAB_POPUP_RADIUS);
+    bottom.top=bounds.bottom-px(TAB_POPUP_RADIUS);
+    FillRect(dc,&top,gWhiteBrush);FillRect(dc,&bottom,gWhiteBrush);
+    FrameRgn(dc,outline,gBorderBrush,1,1);
+    RestoreDC(dc,state);DeleteObject(outline);
+}
+
+LRESULT CALLBACK popupFrameProc(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR){
+    if(msg==WM_NCCALCSIZE){
+        auto result=DefSubclassProc(h,msg,w,l);
+        RECT* client=w?&reinterpret_cast<NCCALCSIZE_PARAMS*>(l)->rgrc[0]:reinterpret_cast<RECT*>(l);
+        InflateRect(client,-1,-px(TAB_POPUP_RADIUS));
+        return result;
+    }
+    if(msg==WM_NCPAINT||(msg==WM_PRINT&&(l&PRF_NONCLIENT))){
+        auto result=DefSubclassProc(h,msg,w,l);
+        HDC dc=msg==WM_PRINT?reinterpret_cast<HDC>(w):GetWindowDC(h);
+        if(dc){paintTabPopupFrame(h,dc);if(msg==WM_NCPAINT)ReleaseDC(h,dc);}
+        return result;
+    }
+    if(msg==WM_NCDESTROY)RemoveWindowSubclass(h,popupFrameProc,id);
+    return DefSubclassProc(h,msg,w,l);
+}
+
+void applyPopupFrame(HWND list,int width,int height){
+    SetWindowSubclass(list,popupFrameProc,1,0);
+    SetWindowPos(list,nullptr,0,0,0,0,SWP_FRAMECHANGED|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+    HRGN outline=tabPopupRegion(width,height);
+    if(!SetWindowRgn(list,outline,TRUE))DeleteObject(outline);
+}
+
 LRESULT CALLBACK overflowListProc(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR){
     if(msg==WM_TIMER&&w==1&&!gMenuContext&&!gClosingOverflowRow){
         POINT cursor{};RECT button{},list{};
@@ -1524,10 +1646,10 @@ void showTabList(RECT anchor,int context=-1,bool focusList=true,HWND reuse=nullp
     RECT work=monitor.rcWork;int rowHeight=px(34);
     int width=std::min<int>(px(context>=0?184:330),work.right-work.left);
     int space=std::max(anchor.top-work.top,work.bottom-anchor.bottom);
-    int height=std::min<int>((context>=0?4:(int)gOverflowRows.size()+3)*rowHeight+2,space);
+    int height=std::min<int>((context>=0?4:(int)gOverflowRows.size()+3)*rowHeight+2*px(TAB_POPUP_RADIUS),space);
     int x=std::clamp<int>(context>=0?anchor.left:anchor.right-width,work.left,work.right-width);
     int y=anchor.bottom+height<=work.bottom?anchor.bottom:anchor.top-height;
-    HWND list=reuse?reuse:CreateWindowExW(WS_EX_TOOLWINDOW,L"LISTBOX",context>=0?L"标签操作":L"隐藏的接口标签",WS_POPUP|WS_BORDER|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS,
+    HWND list=reuse?reuse:CreateWindowExW(WS_EX_TOOLWINDOW,L"LISTBOX",context>=0?L"标签操作":L"隐藏的接口标签",WS_POPUP|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS,
         x,y,width,height,gWindow,nullptr,gInstance,nullptr);
     if(!list){gMenuContext.reset();gOverflowRows.clear();return;}
     if(reuse){
@@ -1544,7 +1666,7 @@ void showTabList(RECT anchor,int context=-1,bool focusList=true,HWND reuse=nullp
             SendMessageW(list,LB_ADDSTRING,0,(LPARAM)action);
     }else for(const auto* action:{L"关闭当前标签页",L"关闭其他标签页",L"关闭全部标签页"})
         SendMessageW(list,LB_ADDSTRING,0,(LPARAM)action);
-    SetWindowRgn(list,CreateRoundRectRgn(0,0,width+1,height+1,px(10),px(10)),TRUE);
+    applyPopupFrame(list,width,height);
     if(!reuse){
         ShowWindow(list,focusList?SW_SHOW:SW_SHOWNOACTIVATE);
         if(focusList)SetFocus(list);else SetTimer(list,1,32,nullptr);
@@ -1718,7 +1840,13 @@ string effectiveRequestUrl(const ApiRequest& request) {
     return buildRequestUrl(snapshot);
 }
 void showEffectiveRequestUrl(const ApiRequest& request) {
-    wstring effective=toWide(effectiveRequestUrl(request));if(textOf(gUrl)==effective)return;
+    string address=effectiveRequestUrl(request);
+    auto env=gData.environmentHosts.find(gData.activeEnvironment);
+    if(env!=gData.environmentHosts.end()){
+        auto resolved=resolveEnvironmentUrl(address,env->second);
+        if(!resolved.empty())address=resolved.substr(env->second.size());
+    }
+    wstring effective=toWide(address);if(textOf(gUrl)==effective)return;
     bool wasLoading=gLoadingEditor;gLoadingEditor=true;setText(gUrl,effective);gLoadingEditor=wasLoading;
 }
 template<class Request>
@@ -1991,15 +2119,15 @@ void showResponsePage() {
 }
 void loadEditor() {
     captureView();gLoadingEditor=true;auto tab=selectedTab();bool active=tab!=nullptr;
-    for(HWND control:{gRequestTabs,gMethod,gUrlFrame,gUrl,gSave,gSaveMore,gSend,gCancel,gEditorTabs,gSummary,gResponseTabs})EnableWindow(control,active);
+    for(HWND control:{gRequestTabs,gMethod,gUrlFrame,gUrlHost,gUrl,gSave,gSaveMore,gSend,gCancel,gEditorTabs,gSummary,gResponseTabs})EnableWindow(control,active);
     setVisible(gEmptyTitle,!active);setVisible(gEmptyHelp,!active);setVisible(gEmptyNewRequest,!active);
-    for(HWND control:{gMethod,gUrlFrame,gUrl,gSaveMore,gEditorTabs,gKvList,gBodyType,gFormat,gCompress,gBody,gValidation,gSummary,gResponseTabs,gResponseBody,gResponseHeaders,gBodyNone,gResponseMode,gResponseModeDivider,gResponseFind})setVisible(control,active);
+    for(HWND control:{gMethod,gUrlFrame,gUrlHost,gUrl,gSaveMore,gEditorTabs,gKvList,gBodyType,gFormat,gCompress,gBody,gValidation,gSummary,gResponseTabs,gResponseBody,gResponseHeaders,gBodyNone,gResponseMode,gResponseModeDivider,gResponseFind})setVisible(control,active);
     EnableWindow(gSave,TRUE);setVisible(gSave,true);
     if(!active){gDisplayedTab.reset();setVisible(gResponseFindPanel,false);setVisible(gFindStatus,false);setVisible(gSend,false);setVisible(gCancel,false);setText(gUrl,L"");setText(gResponseBody,L"");gLoadingEditor=false;return;}
     gEditorPage=tab->editorPage;gResponsePage=tab->responsePage;gResponseFindVisible=tab->findVisible;gResponseFindQuery=tab->findQuery;gResponseFindPosition=tab->findPosition;
     TabCtrl_SetCurSel(gEditorTabs,gEditorPage);TabCtrl_SetCurSel(gResponseTabs,gResponsePage);setText(gResponseFindEdit,tab->findQuery);setText(gFindStatus,tab->findStatus);
     auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;normalizeStoredUrlQuery(r);
-    selectComboText(gMethod,toWide(r.method));setText(gUrl,toWide(effectiveRequestUrl(r)));
+    selectComboText(gMethod,toWide(r.method));showEffectiveRequestUrl(r);
     int type=0;const char* types[]={"None","JSON","Form URL Encoded","Multipart Form Data","Raw"};for(int i=0;i<5;++i)if(r.bodyType==types[i])type=i;SendMessageW(gBodyType,CB_SETCURSEL,type,0);setText(gBody,toWide(r.body));updateBodyAppearance();
     updateResponseSummary();setValidationText(tab->validation);setVisible(gSend,!tab->sending);setVisible(gCancel,tab->sending);
     showEditorPage();showResponsePage();gDisplayedTab=tab;gLoadingEditor=false;
@@ -2682,10 +2810,175 @@ void editListCell(int row,int column,bool keyboard) {
 }
 void toggleEntry(int row){ListView_SetCheckState(gKvList,row,ListView_GetCheckState(gKvList,row)==FALSE);}
 
+void refreshEnvironmentButton() {
+    setText(gEnvironment,gData.activeEnvironment.empty()?L"选择环境":toWide(gData.activeEnvironment));
+    const auto current=gData.environmentHosts.find(gData.activeEnvironment);
+    wstring details=current==gData.environmentHosts.end()?L"使用接口原地址":toWide(current->first+" · "+current->second);
+    TOOLINFOW tip{sizeof(tip)};tip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tip.hwnd=gWindow;tip.uId=(UINT_PTR)gEnvironment;
+    tip.lpszText=details.data();SendMessageW(gSaveTooltip,TTM_UPDATETIPTEXTW,0,(LPARAM)&tip);
+    setText(gUrlHost,current==gData.environmentHosts.end()?L"选择 Host":toWide(current->second));
+    if(auto tab=selectedTab())showEffectiveRequestUrl(tab->caseSnapshot?*tab->caseSnapshot:*tab->request);
+    RECT client{};GetClientRect(gWindow,&client);layout(client.right,client.bottom);
+    InvalidateRect(gEnvironment,nullptr,FALSE);
+}
+
+void openEnvironmentPage(bool adding) {
+    showEnvironmentPage(gInstance,gWindow,gData,adding,gServices.saveEnvironments);
+    refreshEnvironmentButton();
+    updateDirtyStatus();
+}
+
+struct ToolbarMenuRow {
+    UINT command;
+    wstring label,host;
+    bool current=false;
+    bool enabled=true;
+    bool separator=false;
+    bool addressEntry=false;
+    int height() const {return px(34);}
+};
+HWND gToolbarList{};
+std::vector<ToolbarMenuRow> gToolbarRows;
+using ToolbarAction=void (*)(const ToolbarMenuRow&);
+
+void drawToolbarMenuRow(const DRAWITEMSTRUCT& item) {
+    if(item.itemID>=gToolbarRows.size())return;
+    const auto& row=gToolbarRows[item.itemID];
+    HDC dc=item.hDC;
+    int state=SaveDC(dc);
+    RECT rect=item.rcItem;
+    FillRect(dc,&rect,gWhiteBrush);
+    if(row.separator){RECT line=rect;line.bottom=line.top+1;FillRect(dc,&line,gBorderBrush);}
+    RECT hover=rect;InflateRect(&hover,-px(4),-px(2));
+    if(row.enabled&&(item.itemState&ODS_SELECTED))fillRoundRect(dc,hover,COLOR_HOVER,6);
+    int cy=(rect.top+rect.bottom)/2;
+    rect.left+=px(14);rect.right-=px(12);
+    SetBkMode(dc,TRANSPARENT);SelectObject(dc,gUiFont);
+    if(row.addressEntry&&row.command!=2){
+        RECT mark=rect;mark.right=mark.left+px(18);
+        SetTextColor(dc,row.current?RGB(116,87,196):COLOR_SECONDARY);
+        DrawTextW(dc,row.current?L"●":L"○",1,&mark,DT_SINGLELINE|DT_VCENTER);
+        rect.left=mark.right+px(4);
+        if(!row.host.empty()){
+            RECT name=rect;name.left=name.right-(name.right-name.left)/3;
+            SetTextColor(dc,COLOR_SECONDARY);
+            DrawTextW(dc,row.label.c_str(),-1,&name,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+            rect.right=name.left-px(8);
+        }
+        SetTextColor(dc,COLOR_PRIMARY);
+        DrawTextW(dc,(row.host.empty()?row.label:row.host).c_str(),-1,&rect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+        RestoreDC(dc,state);return;
+    }
+    if(row.current){
+        RECT check=rect;check.left=check.right-px(16);
+        SetTextColor(dc,RGB(106,80,178));
+        DrawTextW(dc,L"✓",1,&check,DT_SINGLELINE|DT_RIGHT|DT_VCENTER);
+    }
+    rect.right-=px(22);
+    if(!row.host.empty()){
+        RECT badge{rect.left,cy-px(9),rect.left+px(20),cy+px(9)};
+        drawEnvironmentBadge(dc,badge,row.label);
+        rect.left=badge.right+px(7);
+    }
+    SetTextColor(dc,row.enabled?(row.host.empty()?COLOR_SECONDARY:COLOR_PRIMARY):RGB(155,163,175));
+    DrawTextW(dc,row.label.c_str(),-1,&rect,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX|DT_END_ELLIPSIS);
+    RestoreDC(dc,state);
+}
+
+LRESULT CALLBACK toolbarListProc(HWND list,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR data){
+    if(msg==WM_KILLFOCUS){PostMessageW(list,WM_CLOSE,0,0);return 0;}
+    if(msg==WM_KEYDOWN&&w==VK_ESCAPE){DestroyWindow(list);return 0;}
+    if(msg==WM_MOUSEMOVE||msg==WM_LBUTTONUP||(msg==WM_KEYDOWN&&w==VK_RETURN)){
+        int index;
+        if(msg==WM_KEYDOWN)index=(int)SendMessageW(list,LB_GETCURSEL,0,0);
+        else{
+            LRESULT hit=SendMessageW(list,LB_ITEMFROMPOINT,0,l);
+            if(HIWORD(hit))return 0;
+            index=LOWORD(hit);
+        }
+        if(index<0||static_cast<size_t>(index)>=gToolbarRows.size())return 0;
+        if(msg==WM_MOUSEMOVE){
+            if(index!=SendMessageW(list,LB_GETCURSEL,0,0))SendMessageW(list,LB_SETCURSEL,index,0);
+            return 0;
+        }
+        if(gToolbarRows[index].enabled){
+            auto row=gToolbarRows[index];
+            DestroyWindow(list);
+            reinterpret_cast<ToolbarAction>(data)(row);
+        }
+        return 0;
+    }
+    if(msg==WM_NCDESTROY){gToolbarList=nullptr;gToolbarRows.clear();RemoveWindowSubclass(list,toolbarListProc,id);}
+    return DefSubclassProc(list,msg,w,l);
+}
+
+void showToolbarMenu(HWND anchor,std::vector<ToolbarMenuRow> rows,ToolbarAction action){
+    if(gToolbarList)DestroyWindow(gToolbarList);
+    if(gOverflowList)DestroyWindow(gOverflowList);
+    RECT button{};GetWindowRect(anchor,&button);
+    MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromWindow(anchor,MONITOR_DEFAULTTONEAREST),&monitor);
+    RECT work=monitor.rcWork;
+    int width=px(184),height=2*px(TAB_POPUP_RADIUS);
+    for(const auto& row:rows)height+=row.height();
+    if(anchor==gEnvironmentMenu){
+        RECT selector{};GetWindowRect(gEnvironment,&selector);
+        width=button.right-selector.left;
+        HDC dc=GetDC(anchor);auto font=SelectObject(dc,gUiFont);
+        for(const auto& row:rows){
+            SIZE label{};GetTextExtentPoint32W(dc,row.label.c_str(),static_cast<int>(row.label.size()),&label);
+            int padding=14+12+22+(row.host.empty()?0:27)+2*TAB_POPUP_RADIUS;
+            width=std::max(width,static_cast<int>(label.cx)+px(padding));
+        }
+        SelectObject(dc,font);ReleaseDC(anchor,dc);
+        width=std::min(width,px(240));
+    }
+    if(anchor==gUrlHost)width=px(470);
+    width=std::min<int>(width,work.right-work.left);
+    height=std::min<int>(height,std::max(work.bottom-button.bottom,button.top-work.top));
+    int x=std::clamp<int>(anchor==gUrlHost?button.left:button.right-width,work.left,work.right-width);
+    int y=button.bottom+height<=work.bottom?button.bottom:button.top-height;
+    HWND list=CreateWindowExW(WS_EX_TOOLWINDOW,L"LISTBOX",textOf(anchor).c_str(),WS_POPUP|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWVARIABLE|LBS_HASSTRINGS,
+        x,y,width,height,gWindow,nullptr,gInstance,nullptr);
+    if(!list)return;
+    gToolbarList=list;gToolbarRows=std::move(rows);
+    SetWindowSubclass(list,toolbarListProc,1,reinterpret_cast<DWORD_PTR>(action));
+    applyFont(list);applyPopupFrame(list,width,height);
+    int selected=0;
+    for(const auto& row:gToolbarRows){
+        auto index=SendMessageW(list,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(row.label.c_str()));
+        SendMessageW(list,LB_SETITEMHEIGHT,index,row.height());
+        if(row.current)selected=static_cast<int>(index);
+    }
+    SendMessageW(list,LB_SETCURSEL,selected,0);ShowWindow(list,SW_SHOW);SetFocus(list);
+}
+
+void showEnvironmentMenu(bool fromAddress=false) {
+    constexpr UINT original=1,add=2,firstEnvironment=3;
+    std::vector<ToolbarMenuRow> rows={{original,L"使用接口原地址",{},gData.activeEnvironment.empty()}};
+    UINT id=firstEnvironment;
+    for(const auto& [name,host]:gData.environmentHosts)
+        rows.push_back({id++,toWide(name),toWide(host),name==gData.activeEnvironment});
+    rows.push_back({add,L"添加环境…",{},false,true,true});
+    for(auto& row:rows)row.addressEntry=fromAddress;
+    showToolbarMenu(fromAddress?gUrlHost:gEnvironmentMenu,std::move(rows),[](const ToolbarMenuRow& row){
+        if(row.command==add){openEnvironmentPage(true);return;}
+        EnvironmentSettings next=gData;
+        next.activeEnvironment=row.command==original?string{}:toUtf8(row.label);
+        if(next.activeEnvironment==gData.activeEnvironment)return;
+        if(!gServices.saveEnvironments(next)){
+            MessageBoxW(gWindow,L"环境切换保存失败，请检查目录权限后重试。",L"切换环境",MB_OK|MB_ICONWARNING);return;
+        }
+        gData.activeEnvironment=next.activeEnvironment;
+        refreshEnvironmentButton();updateDirtyStatus();
+    });
+}
+
 RequestSnapshot snapshotCurrent() {
     commitCellEditor();saveEditor();auto tab=selectedTab();auto& r=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
     RequestSnapshot snapshot{r.method,r.url,r.query,r.headers,r.bodyType,r.body,r.formFields};
     ParsedUrlQuery draft=parseUrlQuery(r.url);if(draft.hasQuery&&!draft.complete)snapshot.query.clear();
+    auto environment=gData.environmentHosts.find(gData.activeEnvironment);
+    if(environment!=gData.environmentHosts.end())snapshot.url=resolveEnvironmentUrl(snapshot.url,environment->second);
     return snapshot;
 }
 bool matchesResponse(const TabState& tab,const RequestSnapshot& current) {
@@ -2815,7 +3108,7 @@ void cancelCurrent() {
     updateResponseSummary();
 }
 void moveFocus(HWND from,bool backwards) {
-    std::vector<HWND> order={gSearch,gClearSearch,gAddFolder,gTree,gRequestTabs,gTabOverflow,gSave,gSaveMore,gMethod,gUrl,gSend,gCancel,
+    std::vector<HWND> order={gSearch,gClearSearch,gAddFolder,gTree,gRequestTabs,gTabOverflow,gEnvironment,gEnvironmentMenu,gMethod,gUrlHost,gUrl,gSend,gCancel,gSave,gSaveMore,
         gEditorTabs,gBodyType,gFormat,gCompress,gKvList,gBody,gResponseTabs,gResponseMode,gResponseFind,
         gResponseFindEdit,gResponseFindPrev,gResponseFindNext,gResponseFindClose,gResponseBody,gResponseHeaders};
     order.erase(std::remove_if(order.begin(),order.end(),[](HWND control){return !control||!IsWindowVisible(control)||!IsWindowEnabled(control);}),order.end());
@@ -2896,6 +3189,7 @@ void selectRequestMethod(const wchar_t* method) {
     refreshRequestTabs();scheduleSave();InvalidateRect(gMethod,nullptr,TRUE);
 }
 LRESULT CALLBACK requestToolbarButtonProc(HWND h,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+    if(message==WM_ERASEBKGND&&(h==gUrlHost||h==gSave||h==gSaveMore||h==gEnvironment||h==gEnvironmentMenu))return 1;
     if(message==WM_MOUSEMOVE&&IsWindowEnabled(h)&&gRequestToolbarHot!=h){
         HWND previous=gRequestToolbarHot;gRequestToolbarHot=h;
         if(previous)InvalidateRect(previous,nullptr,FALSE);InvalidateRect(h,nullptr,FALSE);
@@ -2955,15 +3249,19 @@ void createControls() {
     SendMessageW(gMethod,CB_SETCURSEL,0,0);sizeMethodDropdown();
     SetWindowSubclass(gMethod,dropdownProc,17,0);
     gUrlFrame=child(L"STATIC",L"",SS_OWNERDRAW|WS_CLIPSIBLINGS,IDC_URL_FRAME);
+    gUrlHost=child(L"BUTTON",L"选择 Host",BS_OWNERDRAW,IDC_URL_HOST);
+    SetWindowPos(gUrlFrame,HWND_BOTTOM,0,0,0,0,SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE);
     const wchar_t* urlClass=gRichEditModule?MSFTEDIT_CLASS:L"EDIT";
     gUrl=child(urlClass,L"",ES_MULTILINE|ES_AUTOHSCROLL,IDC_URL);
     if(gRichEditModule){SendMessageW(gUrl,EM_SETTEXTMODE,TM_PLAINTEXT|TM_MULTILEVELUNDO,0);SendMessageW(gUrl,EM_SETEVENTMASK,0,ENM_CHANGE);}
     applyFont(gUrl,gCodeFont);SendMessageW(gUrl,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(0,0));SetWindowSubclass(gUrl,urlProc,6,0);
+    gEnvironment=child(L"BUTTON",L"选择环境",BS_OWNERDRAW,IDC_ENVIRONMENT);
+    gEnvironmentMenu=child(L"BUTTON",L"管理环境",BS_OWNERDRAW,IDC_ENVIRONMENT_MENU);
     gSave=child(L"BUTTON",L"保存",BS_OWNERDRAW,IDC_SAVE);gSaveMore=child(L"BUTTON",L"更多保存选项",BS_OWNERDRAW,IDC_SAVE_MORE);
     gSaveTooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,gWindow,nullptr,gInstance,nullptr);
     TOOLINFOW saveTool{sizeof(saveTool)};saveTool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;saveTool.hwnd=gWindow;saveTool.uId=(UINT_PTR)gSave;saveTool.lpszText=(LPWSTR)L"保存全部接口、用例及目录修改 (Ctrl+S)";SendMessageW(gSaveTooltip,TTM_ADDTOOLW,0,(LPARAM)&saveTool);
     gSend=child(L"BUTTON",L"发送",BS_OWNERDRAW,IDC_SEND);gCancel=child(L"BUTTON",L"取消",BS_OWNERDRAW,IDC_CANCEL);
-    for(HWND button:{gSave,gSaveMore,gSend,gCancel})SetWindowSubclass(button,requestToolbarButtonProc,13,0);
+    for(HWND button:{gUrlHost,gEnvironment,gEnvironmentMenu,gSave,gSaveMore,gSend,gCancel})SetWindowSubclass(button,requestToolbarButtonProc,13,0);
     gEditorTabs=child(WC_TABCONTROLW,L"",TCS_TABS|TCS_SINGLELINE|TCS_FIXEDWIDTH,IDC_EDITOR_TABS);SendMessageW(gEditorTabs,TCM_SETITEMSIZE,0,MAKELPARAM(px(SECTION_TAB_WIDTH),px(30)));for(auto label:{L"Params",L"Headers",L"Body"}){TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=(LPWSTR)label;TabCtrl_InsertItem(gEditorTabs,TabCtrl_GetItemCount(gEditorTabs),&item);}
     SetWindowSubclass(gEditorTabs,sectionTabsProc,11,0);
     gKvList=child(WC_LISTVIEWW,L"",LVS_REPORT|LVS_SINGLESEL|WS_CLIPSIBLINGS,IDC_KV_LIST);ListView_SetExtendedListViewStyle(gKvList,LVS_EX_DOUBLEBUFFER|LVS_EX_CHECKBOXES|LVS_EX_LABELTIP);addListColumns(gKvList,true);
@@ -2999,6 +3297,7 @@ void createControls() {
     for(HWND control:{gResponseFindPanel,gFindStatus})setVisible(control,false);
     auto tooltip=[&](HWND control,const wchar_t* label){TOOLINFOW tool{sizeof(tool)};tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tool.hwnd=gWindow;tool.uId=(UINT_PTR)control;tool.lpszText=(LPWSTR)label;SendMessageW(gSaveTooltip,TTM_ADDTOOLW,0,(LPARAM)&tool);};
     tooltip(gSend,L"发送请求 (Ctrl+Enter)");tooltip(gUrl,L"请求地址 (Ctrl+L)");tooltip(gResponseFind,L"查找响应 (Ctrl+F)，Enter 下一个，Shift+Enter 上一个，Esc 关闭");
+    tooltip(gEnvironment,L"切换请求所用的 API Host");tooltip(gEnvironmentMenu,L"管理环境");
     tooltip(gMethod,L"选择 HTTP 请求方法");tooltip(gSaveMore,L"更多保存选项");tooltip(gCancel,L"取消当前请求");
     tooltip(gResponseMode,L"响应显示方式：格式化 / 原始");
     tooltip(gSummary,L"");
@@ -3048,15 +3347,23 @@ void layout(int width,int height,int previousPanelHeight) {
     move(gSearchEmpty,8,92,sidebar-16,24);move(gClearSearch,(sidebar-88)/2,122,88,30);
     constexpr int requestRowTop=REQUEST_BAR_TOP;constexpr int rowHeight=REQUEST_BAR_HEIGHT;constexpr int commandGap=10;constexpr int saveWidth=88;constexpr int saveMoreWidth=24;constexpr int sendWidth=96;
     // Workspace actions stay fixed while request tabs scroll inside their own viewport.
-    int tabViewportWidth=contentW-saveWidth-saveMoreWidth-4;
+    constexpr int environmentWidth=120,manageWidth=32;
+    int tabViewportWidth=contentW-environmentWidth-manageWidth-4;
     gRequestTabViewportX=px(contentX);gRequestTabViewportWidth=px(tabViewportWidth);
     gRequestTabContentWidth=std::max(gRequestTabContentWidth,gRequestTabViewportWidth);
     move(gRequestTabs,contentX-dip(gTabClipStart),0,dip(gRequestTabContentWidth),REQUEST_TAB_HEIGHT);
-    int sendX=contentX+contentW-sendWidth;int saveMoreX=contentX+contentW-saveMoreWidth;int saveX=saveMoreX-saveWidth;int urlX=contentX+106;int urlWidth=sendX-commandGap-urlX;
-    move(gMethod,contentX,requestRowTop,106,260);move(gUrlFrame,urlX,requestRowTop,urlWidth,rowHeight);move(gUrl,urlX+12,requestRowTop+6,urlWidth-24,rowHeight-12);
+    int saveMoreX=contentX+contentW-saveMoreWidth;int saveX=saveMoreX-saveWidth;int sendX=saveX-commandGap-sendWidth;int urlX=contentX+106;int urlWidth=sendX-commandGap-urlX;
+    move(gMethod,contentX,requestRowTop,106,260);move(gUrlFrame,urlX,requestRowTop,urlWidth,rowHeight);auto host=textOf(gUrlHost);HDC dc=GetDC(gUrlHost);auto old=SelectObject(dc,gUiFont);SIZE extent{};
+    GetTextExtentPoint32W(dc,host.c_str(),static_cast<int>(host.size()),&extent);
+    SelectObject(dc,old);ReleaseDC(gUrlHost,dc);
+    int hostWidth=std::min(dip(extent.cx)+18,urlWidth/2);
+    move(gUrlHost,urlX+4,requestRowTop+4,hostWidth,rowHeight-8);
+    move(gUrl,urlX+hostWidth+10,requestRowTop+6,urlWidth-hostWidth-18,rowHeight-12);
     move(gSend,sendX,requestRowTop,sendWidth,rowHeight);move(gCancel,sendX,requestRowTop,sendWidth,rowHeight);
     int editorTop=REQUEST_EDITOR_TOP;int editorHeight=editorPanelHeight(height);move(gEditorTabs,contentX,editorTop,TabCtrl_GetItemCount(gEditorTabs)*SECTION_TAB_WIDTH+8,36);
-    move(gSave,saveX,(REQUEST_TAB_HEIGHT-28)/2,saveWidth,28);move(gSaveMore,saveMoreX,(REQUEST_TAB_HEIGHT-28)/2,saveMoreWidth,28);
+    move(gEnvironment,contentX+contentW-environmentWidth-manageWidth,TAB_ACTION_TOP,environmentWidth,TAB_ACTION_HEIGHT);
+    move(gEnvironmentMenu,contentX+contentW-manageWidth,TAB_ACTION_TOP,manageWidth,TAB_ACTION_HEIGHT);
+    move(gSave,saveX,requestRowTop,saveWidth,rowHeight);move(gSaveMore,saveMoreX,requestRowTop,saveMoreWidth,rowHeight);
     const int bodyToolbarTop=editorTop+39;
     // A native drop-down list uses its font-defined closed height and ignores
     // the requested 30-DIP height. Center that shorter control in the same
@@ -3148,8 +3455,10 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         TreeView_SetBkColor(gTree,COLOR_SIDEBAR);TreeView_SetTextColor(gTree,COLOR_PRIMARY);TreeView_SetLineColor(gTree,COLOR_BORDER);TreeView_SetItemHeight(gTree,px(30));
         ListView_SetBkColor(gKvList,RGB(255,255,255));ListView_SetTextColor(gKvList,COLOR_PRIMARY);ListView_SetTextBkColor(gKvList,CLR_NONE);
         ListView_SetBkColor(gResponseHeaders,RGB(255,255,255));ListView_SetTextColor(gResponseHeaders,COLOR_PRIMARY);ListView_SetTextBkColor(gResponseHeaders,CLR_NONE);
-        wstring loadSource;gServices.loadData(gData,loadSource);if(gData.folders.empty()){auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name="默认目录";gData.folders.push_back(std::move(folder));}
-        normalizeWorkspaceUrlQueries(gData);
+        wstring loadSource;gServices.loadData(gData,loadSource);
+        if(!gServices.loadEnvironments(gData))MessageBoxW(h,L"环境配置读取或迁移失败，请检查配置文件及目录权限。",L"环境管理",MB_OK|MB_ICONWARNING);
+        if(gData.folders.empty()){auto folder=std::make_unique<ApiFolder>();folder->id=newId();folder->name="默认目录";gData.folders.push_back(std::move(folder));}
+        refreshEnvironmentButton();normalizeWorkspaceUrlQueries(gData);
         gSavedContent=WorkspaceContent::from(gData);
         rebuildTree();if(!gData.folders.empty()){for(auto& folder:gData.folders)if(auto request=firstRequestIn(*folder)){openRequest(request);break;}}refreshRequestTabs();loadEditor();return 0;
     }
@@ -3180,7 +3489,13 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         else if((HWND)l==gFindStatus)SetTextColor(dc,!gResponseFindQuery.empty()&&gResponseMatches.empty()?RGB(185,28,28):(gResponseFindWrapped?COLOR_ACCENT:COLOR_SECONDARY));
         else if((HWND)l==gBodyNone||(HWND)l==gEmptyHelp)SetTextColor(dc,COLOR_SECONDARY);
         else SetTextColor(dc,COLOR_PRIMARY);return (LRESULT)gWhiteBrush;}
-    case WM_DRAWITEM:if(((DRAWITEMSTRUCT*)l)->CtlType==ODT_LISTBOX&&((DRAWITEMSTRUCT*)l)->hwndItem==gOverflowList){drawOverflowRow(*(DRAWITEMSTRUCT*)l);return TRUE;}drawButton((DRAWITEMSTRUCT*)l);return TRUE;
+    case WM_MEASUREITEM:{
+        auto item=reinterpret_cast<MEASUREITEMSTRUCT*>(l);
+        if(item->CtlType==ODT_LISTBOX&&gToolbarList){item->itemHeight=px(34);return TRUE;}
+        break;
+    }
+    case WM_DRAWITEM:if(((DRAWITEMSTRUCT*)l)->CtlType==ODT_LISTBOX&&((DRAWITEMSTRUCT*)l)->hwndItem==gToolbarList){drawBufferedItem(*(DRAWITEMSTRUCT*)l,drawToolbarMenuRow);return TRUE;}
+        if(((DRAWITEMSTRUCT*)l)->CtlType==ODT_LISTBOX&&((DRAWITEMSTRUCT*)l)->hwndItem==gOverflowList){drawOverflowRow(*(DRAWITEMSTRUCT*)l);return TRUE;}drawButton((DRAWITEMSTRUCT*)l);return TRUE;
     case WM_COMMAND: {
         int id=LOWORD(w),notification=HIWORD(w);
         if(id==IDC_RESPONSE_FIND_EDIT&&notification==EN_CHANGE&&!gLoadingEditor){
@@ -3192,7 +3507,18 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         if(id==IDC_URL&&notification==EN_CHANGE&&!gLoadingEditor){
             if(auto tab=selectedTab()){
                 auto& request=tab->caseSnapshot?*tab->caseSnapshot:*tab->request;
-                acceptEditedUrl(textOf(gUrl),request);saveEditor();scheduleSave();
+                auto input=textOf(gUrl);
+                if(!gData.activeEnvironment.empty()&&!input.empty()){
+                    auto originEnd=request.url.find("://");
+                    bool pastedAbsolute=input.find(L"://")!=wstring::npos&&input.find(L"://")==input.find_first_of(L":/?#");
+                    if(!pastedAbsolute&&originEnd!=string::npos&&originEnd==request.url.find_first_of(":/?#")){
+                        auto origin=request.url.substr(0,request.url.find_first_of("/?#",originEnd+3));
+                        input=toWide(origin)+(input.front()==L'/'?L"":L"/")+input;
+                    }
+                    acceptEditedUrl(input,request);
+                    if(pastedAbsolute)showEffectiveRequestUrl(request);
+                }else acceptEditedUrl(input,request);
+                saveEditor();scheduleSave();
             }
         }
         if(id==IDC_BODY&&notification==EN_CHANGE&&!gLoadingEditor&&!gStylingBody){saveEditor();scheduleJsonRecheck();scheduleSave();if(!gBodyImeComposing)SetTimer(gWindow,BODY_STYLE_TIMER,160,nullptr);}
@@ -3209,6 +3535,9 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDC_RESPONSE_FIND_CLOSE:if(notification==BN_CLICKED)showResponseFind(false);break;
         case IDC_ADD_FOLDER:if(notification==BN_CLICKED)showCreateMenu();break;
         case IDC_EMPTY_NEW_REQUEST:if(notification==BN_CLICKED)addRequest(gSelectedFolder);break;
+        case IDC_URL_HOST:if(notification==BN_CLICKED)showEnvironmentMenu(true);break;
+        case IDC_ENVIRONMENT:if(notification==BN_CLICKED)showEnvironmentMenu();break;
+        case IDC_ENVIRONMENT_MENU:if(notification==BN_CLICKED)openEnvironmentPage(false);break;
         case IDC_SAVE:if(notification==BN_CLICKED)saveNow(true);break;
         case IDC_METHOD:if(notification==CBN_SELCHANGE&&!gLoadingEditor)selectRequestMethod(selectedComboText(gMethod).c_str());break;
         case IDC_SEND:sendCurrent();break;case IDC_CANCEL:cancelCurrent();break;
@@ -3217,7 +3546,13 @@ LRESULT CALLBACK windowProc(HWND h,UINT message,WPARAM w,LPARAM l) {
         case IDC_COMPRESS:if(notification==BN_CLICKED)formatCurrentJson(true);break;
         case IDC_CLEAR_SEARCH:setText(gSearch,L"");rebuildTree();SetFocus(gSearch);break;
         case IDC_TAB_OVERFLOW:if(notification==BN_CLICKED)showTabOverflow();break;
-        case IDC_SAVE_MORE:{HMENU menu=CreatePopupMenu();auto tab=selectedTab();AppendMenuW(menu,tab&&!tab->requestCase?MF_STRING:MF_GRAYED,IDM_SAVE_CASE,L"保存用例");RECT r{};GetWindowRect(gSaveMore,&r);TrackPopupMenu(menu,TPM_RIGHTBUTTON,r.left,r.bottom,0,h,nullptr);DestroyMenu(menu);break;}
+        case IDC_SAVE_MORE:{
+            if(notification!=BN_CLICKED)break;
+            auto tab=selectedTab();
+            std::vector<ToolbarMenuRow> rows{{IDM_SAVE_CASE,L"保存用例",{},false,tab&&!tab->requestCase}};
+            showToolbarMenu(gSaveMore,std::move(rows),[](const ToolbarMenuRow&){saveCurrentAsCase();});
+            break;
+        }
         case IDM_SAVE_CASE:saveCurrentAsCase();break;
         case IDM_FOLDER_ADD_REQUEST:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Folder)addRequest((ApiFolder*)gTreeSelection->value);break;
         case IDM_FOLDER_ADD_CHILD:if(gTreeSelection&&gTreeSelection->kind==NodeRef::Kind::Folder)addFolder((ApiFolder*)gTreeSelection->value);break;

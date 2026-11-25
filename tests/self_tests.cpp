@@ -115,7 +115,7 @@ int main() {
     check(!listCheckboxStateChanged(0x2002,0x2003)&&!listCheckboxStateChanged(0,0),"selection and empty state notifications do not mimic checkbox changes");
 
     auto tempRoot=std::filesystem::temp_directory_path()/std::filesystem::path(L"FeatherApi-SelfTests")/toWide(newId());
-    auto dataPath=tempRoot/L"data.json";AppData stored;stored.sidebarWidth=275;stored.requestPanelHeight=360;
+    auto dataPath=tempRoot/L"data.json";AppData stored;stored.environmentHosts={{"QA","https://qa.test:8443"}};stored.activeEnvironment="QA";stored.sidebarWidth=275;stored.requestPanelHeight=360;
     auto storedFolder=std::make_unique<ApiFolder>();storedFolder->id=newId();storedFolder->name="测试目录";storedFolder->expanded=false;
     storedFolder->requests.push_back(cloneRequest(original));stored.folders.push_back(std::move(storedFolder));
     stored.folders[0]->requests[0]->headers.push_back({true,"X-Long",toUtf8(longField)});
@@ -126,6 +126,14 @@ int main() {
     check(loaded.folders[0]->requests[0]->headers.back().value==toUtf8(longField),"storage preserves long Unicode fields");
     HANDLE locked=CreateFileW(dataPath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
     check(locked!=INVALID_HANDLE_VALUE,"storage target locks for failure test");
+    check(loaded.environmentHosts.empty(),"workspace file contains no environment settings");
+    check(saveEnvironmentSettings(stored,dataPath.wstring()),"environment save succeeds while workspace is locked");
+    EnvironmentSettings diskEnvironments;
+    check(loadEnvironmentSettings(diskEnvironments,dataPath.wstring())&&diskEnvironments.environmentHosts==stored.environmentHosts&&diskEnvironments.activeEnvironment=="QA","standalone environments restore hosts and selection");
+    auto legacyPath=tempRoot/L"legacy.json";
+    {std::ofstream legacy(legacyPath);legacy<<R"({"Settings":{"Environments":[{"Name":"old","Host":"http://old.test"}],"ActiveEnvironment":"old"}})";}
+    AppData legacyWorkspace;check(loadAppDataFromPath(legacyPath.wstring(),legacyWorkspace)&&loadEnvironmentSettings(legacyWorkspace,legacyPath.wstring())&&legacyWorkspace.activeEnvironment=="old","legacyWorkspace settings migrate on first load");
+    check(saveEnvironmentSettings(EnvironmentSettings{},legacyPath.wstring())&&loadAppDataFromPath(legacyPath.wstring(),legacyWorkspace)&&loadEnvironmentSettings(legacyWorkspace,legacyPath.wstring())&&legacyWorkspace.environmentHosts.empty(),"deleted environments stay deleted when legacyWorkspace settings still exist");
     if(locked!=INVALID_HANDLE_VALUE){stored.sidebarWidth=310;check(!saveAppDataToPath(stored,dataPath.wstring()),"save reports replacement failure");CloseHandle(locked);
         AppData preserved;check(loadAppDataFromPath(dataPath.wstring(),preserved)&&preserved.sidebarWidth==275,"failed save preserves previous data");
         check(saveAppDataToPath(stored,dataPath.wstring()),"save retry succeeds after unlocking");}
@@ -286,10 +294,14 @@ int main() {
     cancel=true;RequestSnapshot preCancelled;preCancelled.method="GET";preCancelled.url="http://127.0.0.1:1/";auto preCancelledResult=executeHttp(preCancelled,cancel);cancel=false;
     check(preCancelledResult.cancelled&&!preCancelledResult.transportSuccess&&preCancelledResult.rawBody=="请求已取消。"&&preCancelledResult.prettyBody==preCancelledResult.rawBody,"HTTP honors cancellation before opening a connection");
 
+    check(resolveEnvironmentUrl("/api?q=1#x","https://qa.test:8443")=="https://qa.test:8443/api?q=1#x"&&
+          resolveEnvironmentUrl("users","https://qa.test")=="https://qa.test/users"&&
+          resolveEnvironmentUrl("http://old.test?q=1","https://qa.test")=="https://qa.test/?q=1"&&
+          resolveEnvironmentUrl("https://old.test/path","")=="https://old.test/path","environment URL resolution retains path and query");
     LoopbackExchange loopback;
     check(winsockReady&&loopback.start(),"HTTP loopback server starts");
     if(loopback.port!=0){
-        RequestSnapshot live;live.method="POST";live.url="http://127.0.0.1:"+std::to_string(loopback.port)+"/echo#client";live.query={{true,"q","a b"}};live.bodyType="Raw";live.body="payload";live.headers={{true,"X-Request-Test","native"},{true,"X-Multi","one"},{true,"X-Multi","two"}};
+        RequestSnapshot live;live.method="POST";live.url=resolveEnvironmentUrl("https://old.invalid/echo#client","http://127.0.0.1:"+std::to_string(loopback.port));live.query={{true,"q","a b"}};live.bodyType="Raw";live.body="payload";live.headers={{true,"X-Request-Test","native"},{true,"X-Multi","one"},{true,"X-Multi","two"}};
         live.headers.push_back({true,"X-Long",longHeader});
         auto liveResult=executeHttp(live,cancel);
         if(loopback.worker.joinable())loopback.worker.join();

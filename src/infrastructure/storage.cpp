@@ -2,6 +2,7 @@
 #include "domain/normalization.h"
 #include "json/detail/value.h"
 #include "platform/identity.h"
+#include "platform/encoding.h"
 #include "platform/windows.h"
 #include <shlobj.h>
 #include <filesystem>
@@ -80,11 +81,63 @@ void writeFolder(std::ostream& out,const ApiFolder& f){out<<"{\"Id\":";escape(ou
 
 }
 
+static void readEnvironments(const Json& settings,EnvironmentSettings& loaded) {
+        if(auto environments=settings.getInsensitive("Environments");environments&&environments->array()){
+            for(const auto& entry:*environments->array()){
+                auto name=getStoredText(entry,"Name"),host=getStoredText(entry,"Host");
+                if(!name.empty()&&!host.empty())loaded.environmentHosts.emplace(name,host);
+            }
+        }
+        auto active=getStoredText(settings,"ActiveEnvironment");
+        if(loaded.environmentHosts.count(active))loaded.activeEnvironment=active;
+}
+
+static std::filesystem::path environmentFile(const wstring& workspace) {
+    std::filesystem::path path(workspace);
+    if(path.filename()==L"data.json")return path.parent_path()/L"environments.json";
+    return path+=L".environments.json";
+}
+
+bool saveEnvironmentSettings(const EnvironmentSettings& data,const wstring& workspace) {
+    if(workspace.empty())return false;
+    auto path=environmentFile(workspace);
+    std::error_code ec;std::filesystem::create_directories(path.parent_path(),ec);
+    auto temporary=path;temporary+=L"."+toWide(newId())+L".tmp";
+    std::ofstream out(temporary,std::ios::binary|std::ios::trunc);
+    if(!out)return false;
+    out<<"{\"ActiveEnvironment\":";
+    escape(out,data.activeEnvironment);out<<",\"Environments\":[";
+    bool first=true;
+    for(const auto& [name,host]:data.environmentHosts){
+        if(!first)out<<',';first=false;
+        out<<"{\"Name\":";escape(out,name);out<<",\"Host\":";escape(out,host);out<<'}';
+    }
+    out<<"]}";out.close();
+    if(out&&MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))return true;
+    std::filesystem::remove(temporary,ec);return false;
+}
+
+bool loadEnvironmentSettings(EnvironmentSettings& data,const wstring& workspace) {
+    if(workspace.empty())return false;
+    auto path=environmentFile(workspace);
+    std::error_code ec;
+    if(!std::filesystem::exists(path,ec))
+        return !ec&&(data.environmentHosts.empty()||saveEnvironmentSettings(data,workspace));
+    std::ifstream input(path,std::ios::binary);
+    if(!input)return false;
+    string source((std::istreambuf_iterator<char>(input)),{});
+    Json root;if(!Parser(source).parse(root)||!root.object())return false;
+    auto entries=root.getInsensitive("Environments");if(!entries||!entries->array())return false;
+    EnvironmentSettings loaded;readEnvironments(root,loaded);data=std::move(loaded);return true;
+}
+
 bool loadAppDataFromPath(const wstring& path,AppData& data) {
     std::ifstream input(std::filesystem::path(path),std::ios::binary);if(!input)return false;
     string source((std::istreambuf_iterator<char>(input)),{});if(source.size()>=3&&(unsigned char)source[0]==0xEF&&(unsigned char)source[1]==0xBB&&(unsigned char)source[2]==0xBF)source.erase(0,3);
     Json root;if(!Parser(source).parse(root)||!root.object())return false;AppData loaded;
     if(auto settings=root.getInsensitive("Settings")){if(auto p=settings->getInsensitive("SidebarWidth"))loaded.sidebarWidth=std::clamp(p->integer(320),180,420);if(auto p=settings->getInsensitive("RequestPanelHeight"))loaded.requestPanelHeight=std::max(180,p->integer(330));
+        readEnvironments(*settings,loaded);
+        loaded.hasLegacyEnvironments=!loaded.environmentHosts.empty();
         loaded.requestPanelHeightManual=getStoredBool(*settings,"RequestPanelHeightManual",loaded.requestPanelHeight!=330);
     }
     if(auto folders=root.getInsensitive("Folders");folders&&folders->array())for(const auto& folder:*folders->array())loaded.folders.push_back(readFolder(folder));
@@ -92,6 +145,11 @@ bool loadAppDataFromPath(const wstring& path,AppData& data) {
 }
 
 bool saveAppDataToPath(const AppData& data,const wstring& filePath) {
+    // Keep the only legacy copy intact if migration previously failed.
+    if(data.hasLegacyEnvironments){
+        std::error_code error;
+        if(!std::filesystem::exists(environmentFile(filePath),error)&&(error||!saveEnvironmentSettings(data,filePath)))return false;
+    }
     auto path=std::filesystem::path(filePath);std::error_code ec;std::filesystem::create_directories(path.parent_path(),ec);
     auto temporary=path;temporary+=L".tmp";std::ofstream out(temporary,std::ios::binary|std::ios::trunc);if(!out)return false;
     out<<"{\"Settings\":{\"SidebarWidth\":"<<data.sidebarWidth<<",\"RequestPanelHeight\":"<<data.requestPanelHeight<<",\"RequestPanelHeightManual\":"<<(data.requestPanelHeightManual?"true":"false")<<"},\"Folders\":[";

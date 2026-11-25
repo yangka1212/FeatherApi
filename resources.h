@@ -1,3 +1,12 @@
 #pragma once
 
 #define IDI_FEATHERAPI 101
+#define IDD_ENV_PAGE 210
+#define IDC_ENV_LIST 211
+#define IDC_ENV_ADD 212
+#define IDC_ENV_NAME 213
+#define IDC_ENV_HOST 214
+#define IDC_ENV_DELETE 215
+#define IDC_ENV_MESSAGE 216
+#define IDC_ENV_TITLE 217
+#define IDC_ENV_LIST_TITLE 218
